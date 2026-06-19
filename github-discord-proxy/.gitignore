@@ -1,0 +1,7 @@
+# The real config holds the Discord webhook URL and the GitHub secret.
+.config
+config.ini
+*.local.ini
+
+__pycache__/
+*.pyc

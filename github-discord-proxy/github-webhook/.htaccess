@@ -1,0 +1,21 @@
+# Deploy this directory into your Apache document root. The webhook endpoint is
+# then https://your-host/github-webhook/index.cgi
+#
+# This relies on the host allowing these directives in .htaccess and having CGI
+# enabled. If a request returns the script's source as text, the host restricts
+# .htaccess overrides; ask the host to allow Options=ExecCGI and FileInfo for
+# this directory, which is a server setting they control.
+
+# Run index.cgi as a CGI program.
+Options +ExecCGI
+AddHandler cgi-script .cgi
+
+# Also accept https://your-host/github-webhook/ as the endpoint.
+DirectoryIndex index.cgi
+
+# The config lives next to this file as .config. Deny web access to it.
+# (Apache 2.4 syntax.) The file's 0400 owner-only permission is the second
+# layer: the plain Apache user cannot read it.
+<Files ".config">
+    Require all denied
+</Files>
