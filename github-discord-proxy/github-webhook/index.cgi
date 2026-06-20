@@ -42,6 +42,8 @@ class Config:
             # permission error here means the CGI is not running as that owner.
             raise SystemExit(f"cannot read config {path}: {error}")
         self.discord_webhook = parser.get("discord", "webhook_url")
+        self.username = parser.get("discord", "username", fallback="")
+        self.avatar_url = parser.get("discord", "avatar_url", fallback="")
         self.secret = parser.get("github", "secret", fallback="").encode()
         self.authors = self._lower_list(parser.get("github", "authors", fallback=""))
         self.orgs = self._lower_list(parser.get("github", "orgs", fallback=""))
@@ -81,6 +83,10 @@ def signature_ok(config, raw_body, header_value):
 
 def post_to_discord(config, content):
     payload = {"content": content}
+    if config.username:
+        payload["username"] = config.username
+    if config.avatar_url:
+        payload["avatar_url"] = config.avatar_url
     if config.suppress_embeds:
         payload["flags"] = SUPPRESS_EMBEDS
     request = urllib.request.Request(

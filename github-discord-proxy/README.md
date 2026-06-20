@@ -151,6 +151,10 @@ for a starting point.
 `[discord]`
 
 - `webhook_url` — the Discord incoming webhook to post to.
+- `username` — the name to show on each message. Empty uses the name set on the
+  webhook in Discord.
+- `avatar_url` — the URL of an image to show as the avatar on each message. Empty
+  uses the picture set on the webhook in Discord.
 
 `[github]`
 
