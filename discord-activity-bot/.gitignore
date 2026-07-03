@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local shells can load this before running the scanner.
+.env
+*.local
+
+# Generated reports.
+report*.html
+
+# Raw Discord API snapshots can contain private server data.
+raw-discord*.json
+raw-snapshots/
