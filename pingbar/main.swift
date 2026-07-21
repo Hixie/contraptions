@@ -29,6 +29,12 @@ let historyLength = gridSide * gridSide
 /// How long the pulse animation on a newly landed poor or lost sample runs.
 let pulseDuration: TimeInterval = 0.8
 
+/// The screen-edge warning appears once more than this many grid slots are red.
+let screenWarningThreshold = 4
+
+let preferencesDomain = "local.pingbar"
+let screenWarningEnabledPreferenceKey = "screenWarningEnabled"
+
 // MARK: - Samples
 
 enum Sample {
@@ -128,11 +134,174 @@ final class Pinger {
     }
 }
 
+// MARK: - Screen warning
+
+func screenWarningIntensity(redDotCount: Int) -> CGFloat {
+    guard redDotCount > screenWarningThreshold else { return 0 }
+    let warningRange = historyLength - screenWarningThreshold
+    return min(1, CGFloat(redDotCount - screenWarningThreshold) / CGFloat(warningRange))
+}
+
+private final class ScreenWarningView: NSView {
+    var intensity: CGFloat = 0 {
+        didSet {
+            if intensity != oldValue {
+                needsDisplay = true
+            }
+        }
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard intensity > 0, let context = NSGraphicsContext.current?.cgContext else {
+            return
+        }
+
+        let edgeDepth = min(bounds.width, bounds.height) * (0.09 + 0.19 * intensity)
+        let edgeOpacity = 0.11 + 0.34 * intensity
+        let outerColor = NSColor(srgbRed: 0.42, green: 0.0, blue: 0.01,
+                                 alpha: edgeOpacity)
+        let shoulderColor = NSColor(srgbRed: 0.55, green: 0.0, blue: 0.01,
+                                    alpha: edgeOpacity * 0.35)
+        let clearColor = NSColor(srgbRed: 0.55, green: 0.0, blue: 0.01, alpha: 0)
+        let colors = [outerColor.cgColor, shoulderColor.cgColor, clearColor.cgColor]
+        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                        colors: colors as CFArray,
+                                        locations: [0, 0.28, 1]) else {
+            return
+        }
+
+        draw(gradient, in: NSRect(x: bounds.minX, y: bounds.minY,
+                                  width: edgeDepth, height: bounds.height),
+             from: CGPoint(x: bounds.minX, y: bounds.midY),
+             to: CGPoint(x: bounds.minX + edgeDepth, y: bounds.midY),
+             using: context)
+        draw(gradient, in: NSRect(x: bounds.maxX - edgeDepth, y: bounds.minY,
+                                  width: edgeDepth, height: bounds.height),
+             from: CGPoint(x: bounds.maxX, y: bounds.midY),
+             to: CGPoint(x: bounds.maxX - edgeDepth, y: bounds.midY),
+             using: context)
+        draw(gradient, in: NSRect(x: bounds.minX, y: bounds.minY,
+                                  width: bounds.width, height: edgeDepth),
+             from: CGPoint(x: bounds.midX, y: bounds.minY),
+             to: CGPoint(x: bounds.midX, y: bounds.minY + edgeDepth),
+             using: context)
+        draw(gradient, in: NSRect(x: bounds.minX, y: bounds.maxY - edgeDepth,
+                                  width: bounds.width, height: edgeDepth),
+             from: CGPoint(x: bounds.midX, y: bounds.maxY),
+             to: CGPoint(x: bounds.midX, y: bounds.maxY - edgeDepth),
+             using: context)
+    }
+
+    private func draw(_ gradient: CGGradient, in rect: NSRect,
+                      from start: CGPoint, to end: CGPoint,
+                      using context: CGContext) {
+        context.saveGState()
+        context.clip(to: rect)
+        context.drawLinearGradient(gradient, start: start, end: end, options: [])
+        context.restoreGState()
+    }
+}
+
+private final class ScreenWarningController: NSObject {
+    private struct Overlay {
+        let panel: NSPanel
+        let warningView: ScreenWarningView
+    }
+
+    private var intensity: CGFloat = 0
+    private var overlays: [Overlay] = []
+
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    func update(redDotCount: Int) {
+        intensity = screenWarningIntensity(redDotCount: redDotCount)
+        guard intensity > 0 else {
+            overlays.forEach { $0.panel.orderOut(nil) }
+            return
+        }
+
+        if overlays.isEmpty {
+            rebuildOverlays()
+            return
+        }
+
+        overlays.forEach {
+            $0.warningView.intensity = intensity
+            $0.panel.orderFrontRegardless()
+        }
+    }
+
+    @objc private func screenParametersChanged() {
+        rebuildOverlays()
+    }
+
+    private func rebuildOverlays() {
+        overlays.forEach {
+            $0.panel.orderOut(nil)
+            $0.panel.close()
+        }
+        overlays.removeAll()
+
+        guard intensity > 0 else { return }
+
+        for screen in NSScreen.screens {
+            let contentRect = NSRect(origin: .zero, size: screen.frame.size)
+            let warningView = ScreenWarningView(frame: contentRect)
+            warningView.intensity = intensity
+
+            let panel = NSPanel(contentRect: contentRect,
+                                styleMask: [.borderless, .nonactivatingPanel],
+                                backing: .buffered,
+                                defer: false,
+                                screen: screen)
+            panel.contentView = warningView
+            panel.backgroundColor = .clear
+            panel.isOpaque = false
+            panel.hasShadow = false
+            panel.ignoresMouseEvents = true
+            panel.hidesOnDeactivate = false
+            panel.isMovable = false
+            panel.isMovableByWindowBackground = false
+            panel.isExcludedFromWindowsMenu = true
+            panel.isReleasedWhenClosed = false
+            panel.animationBehavior = .none
+            panel.level = .statusBar
+            var collectionBehavior: NSWindow.CollectionBehavior = [
+                .canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary,
+            ]
+            if #available(macOS 13.0, *) {
+                collectionBehavior.insert(.canJoinAllApplications)
+            }
+            panel.collectionBehavior = collectionBehavior
+            panel.orderFrontRegardless()
+
+            overlays.append(Overlay(panel: panel, warningView: warningView))
+        }
+    }
+}
+
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let pinger = Pinger()
+    private let screenWarning = ScreenWarningController()
+    private let preferences = UserDefaults(suiteName: preferencesDomain) ?? .standard
+    private var screenWarningEnabled = true
 
     private var history: [Sample?] = Array(repeating: nil, count: historyLength)
     private var nextSlot = 0
@@ -142,6 +311,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pulseStart: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        preferences.register(defaults: [screenWarningEnabledPreferenceKey: true])
+        screenWarningEnabled = preferences.bool(forKey: screenWarningEnabledPreferenceKey)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.toolTip = "Waiting for the first ping to \(host)"
         let menu = NSMenu()
@@ -158,6 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         history[nextSlot] = sample
         newestSlot = nextSlot
         nextSlot = (nextSlot + 1) % historyLength
+        updateScreenWarning()
         switch sample {
         case .reply(let milliseconds):
             statusItem.button?.toolTip = String(format: "%@: %.1f ms", host, milliseconds)
@@ -170,6 +342,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             startPulse()
         }
+    }
+
+    private func updateScreenWarning() {
+        let redDotCount = history.reduce(into: 0) { count, sample in
+            if severity(of: sample) == .bad {
+                count += 1
+            }
+        }
+        screenWarning.update(redDotCount: screenWarningEnabled ? redDotCount : 0)
+    }
+
+    @objc private func toggleScreenWarning(_ sender: NSMenuItem) {
+        screenWarningEnabled.toggle()
+        preferences.set(screenWarningEnabled, forKey: screenWarningEnabledPreferenceKey)
+        sender.state = screenWarningEnabled ? .on : .off
+        updateScreenWarning()
     }
 
     private func startPulse() {
@@ -254,6 +442,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(withTitle: "Lost: \(lost) of the last \(recorded)",
                          action: nil, keyEquivalent: "")
         }
+        menu.addItem(.separator())
+        let screenWarningItem = NSMenuItem(title: "Show Screen Vignette",
+                                           action: #selector(toggleScreenWarning(_:)),
+                                           keyEquivalent: "")
+        screenWarningItem.target = self
+        screenWarningItem.state = screenWarningEnabled ? .on : .off
+        menu.addItem(screenWarningItem)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit pingbar",
                               action: #selector(NSApplication.terminate(_:)),

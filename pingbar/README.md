@@ -18,9 +18,16 @@ healthy connection is visually quiet. When a new sample is orange or red, the
 circle pulses (starts slightly enlarged and shrinks to its normal size) as it
 lands, so a degraded or dead connection draws attention on every update.
 
+When five or more of the nine circles are red, a click-through red-black
+vignette appears around every screen. Each additional red circle increases both
+the vignette's opacity and how far it reaches into the screen. The center stays
+clear, and the effect disappears as soon as the number of red circles falls
+back to four.
+
 Hover over the grid for the latest result. Click it for a small menu with the
 latest reply time, the average over the current buffer, the loss count, and a
-Quit item.
+Quit item. The checked **Show Screen Vignette** menu item controls the
+full-screen warning. Its setting is remembered across launches.
 
 ## How it samples
 
