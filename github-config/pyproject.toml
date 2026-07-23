@@ -1,0 +1,27 @@
+[project]
+name = "github-config"
+version = "0.1.0"
+description = "Export, compare, and apply GitHub organization configuration."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyNaCl>=1.5,<2",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.17,<2",
+  "ruff>=0.12,<1",
+  "types-PyYAML>=6",
+]
+
+[project.scripts]
+github-config = "github_config.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["github_config*"]
