@@ -298,6 +298,10 @@ private final class ScreenWarningController: NSObject {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var latestResultMenuItem: NSMenuItem!
+    private var averageMenuItem: NSMenuItem!
+    private var lostMenuItem: NSMenuItem!
+    private var screenWarningMenuItem: NSMenuItem!
     private let pinger = Pinger()
     private let screenWarning = ScreenWarningController()
     private let preferences = UserDefaults(suiteName: preferencesDomain) ?? .standard
@@ -317,7 +321,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.toolTip = "Waiting for the first ping to \(host)"
         let menu = NSMenu()
         menu.delegate = self
+        menu.addItem(withTitle: "Ping to \(host)", action: nil, keyEquivalent: "")
+        latestResultMenuItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        averageMenuItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        lostMenuItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        menu.addItem(.separator())
+        screenWarningMenuItem = NSMenuItem(title: "Show Screen Vignette",
+                                           action: #selector(toggleScreenWarning(_:)),
+                                           keyEquivalent: "")
+        screenWarningMenuItem.target = self
+        menu.addItem(screenWarningMenuItem)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit pingbar",
+                              action: #selector(NSApplication.terminate(_:)),
+                              keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
         statusItem.menu = menu
+        updateMenuItems()
         redraw(pulseProgress: nil)
         pinger.onSample = { [weak self] sample in
             self?.record(sample)
@@ -336,6 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .lost:
             statusItem.button?.toolTip = "\(host): no reply within \(pingDeadlineSeconds) s"
         }
+        updateMenuItems()
         if severity(of: sample) == .good {
             stopPulse()
             redraw(pulseProgress: nil)
@@ -415,17 +437,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        menu.addItem(withTitle: "Ping to \(host)", action: nil, keyEquivalent: "")
+        updateMenuItems()
+    }
+
+    private func updateMenuItems() {
         if let newest = newestSlot, let sample = history[newest] {
             switch sample {
             case .reply(let milliseconds):
-                menu.addItem(withTitle: String(format: "Last reply: %.1f ms", milliseconds),
-                             action: nil, keyEquivalent: "")
+                latestResultMenuItem.title = String(format: "Last reply: %.1f ms", milliseconds)
             case .lost:
-                menu.addItem(withTitle: "Last ping: no reply", action: nil, keyEquivalent: "")
+                latestResultMenuItem.title = "Last ping: no reply"
             }
         }
+        latestResultMenuItem.isHidden = newestSlot == nil
+
         let replies = history.compactMap { sample -> Double? in
             if case .reply(let milliseconds)? = sample { return milliseconds }
             return nil
@@ -433,28 +458,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let recorded = history.compactMap { $0 }.count
         if !replies.isEmpty {
             let average = replies.reduce(0, +) / Double(replies.count)
-            menu.addItem(withTitle: String(format: "Average: %.1f ms over %d replies",
-                                           average, replies.count),
-                         action: nil, keyEquivalent: "")
+            averageMenuItem.title = String(format: "Average: %.1f ms over %d replies",
+                                           average, replies.count)
         }
+        averageMenuItem.isHidden = replies.isEmpty
+
         let lost = recorded - replies.count
         if lost > 0 {
-            menu.addItem(withTitle: "Lost: \(lost) of the last \(recorded)",
-                         action: nil, keyEquivalent: "")
+            lostMenuItem.title = "Lost: \(lost) of the last \(recorded)"
         }
-        menu.addItem(.separator())
-        let screenWarningItem = NSMenuItem(title: "Show Screen Vignette",
-                                           action: #selector(toggleScreenWarning(_:)),
-                                           keyEquivalent: "")
-        screenWarningItem.target = self
-        screenWarningItem.state = screenWarningEnabled ? .on : .off
-        menu.addItem(screenWarningItem)
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit pingbar",
-                              action: #selector(NSApplication.terminate(_:)),
-                              keyEquivalent: "q")
-        quit.target = NSApp
-        menu.addItem(quit)
+        lostMenuItem.isHidden = lost == 0
+        screenWarningMenuItem.state = screenWarningEnabled ? .on : .off
     }
 }
 

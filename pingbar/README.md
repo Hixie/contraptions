@@ -26,8 +26,9 @@ back to four.
 
 Hover over the grid for the latest result. Click it for a small menu with the
 latest reply time, the average over the current buffer, the loss count, and a
-Quit item. The checked **Show Screen Vignette** menu item controls the
-full-screen warning. Its setting is remembered across launches.
+Quit item. These values continue to update as new samples arrive while the menu
+is open. The checked **Show Screen Vignette** menu item controls the full-screen
+warning. Its setting is remembered across launches.
 
 ## How it samples
 
