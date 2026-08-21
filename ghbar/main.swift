@@ -1691,15 +1691,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dynamicStart: NSMenuItem!
     private var dynamicEnd: NSMenuItem!
     private var openItem: NSMenuItem!
+    private var bannerItem: NSMenuItem!
     private var footerItem: NSMenuItem!
     private var settingsWindow: SettingsWindowController?
     private var latest: MonitorState = .unconfigured
     private var dynamicSignature: String?
+    private let banner = BannerWindowController()
+    private var lastHealth: Health?
+    private var lastFailure: String?
+    private let demonstratesBanner: Bool
 
-    init(lock: InstanceLock, settings: Settings, registersLoginItem: Bool) {
+    init(lock: InstanceLock, settings: Settings, registersLoginItem: Bool,
+         demonstratesBanner: Bool) {
         self.lock = lock
         self.settings = settings
         self.registersLoginItem = registersLoginItem
+        self.demonstratesBanner = demonstratesBanner
         super.init()
     }
 
@@ -1723,7 +1730,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             object: nil
         )
         applySettings()
-        if settings.repository == nil {
+        if demonstratesBanner {
+            demonstrateBanner()
+        } else if settings.repository == nil {
             openSettings(nil)
         }
     }
@@ -1795,6 +1804,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let newItem = menu.addItem(withTitle: "New Indicator",
                                    action: #selector(newIndicator(_:)), keyEquivalent: "n")
         newItem.target = self
+        newItem.keyEquivalentModifierMask = [.command]
+        // The banner is behind Option, since waiting for a branch to break is
+        // no way to show anybody what it looks like. It is an alternate of the
+        // item above rather than an item that is hidden and unhidden: AppKit
+        // swaps alternates as the modifier is pressed and released, whereas
+        // anything this app hides for itself can only be decided once, when
+        // the menu is asked for its contents. An alternate has to follow its
+        // twin immediately and carry the same key equivalent, differing only
+        // in the modifiers, which also gives it Command-Option-N.
+        bannerItem = menu.addItem(withTitle: "Drop the Banner",
+                                  action: #selector(dropBanner(_:)), keyEquivalent: "n")
+        bannerItem.target = self
+        bannerItem.keyEquivalentModifierMask = [.command, .option]
+        bannerItem.isAlternate = true
+        bannerItem.toolTip = "Hang the banner now: the failure the branch is carrying if it has one, and an invented one if it does not."
 
         menu.addItem(.separator())
         footerItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
@@ -1822,6 +1846,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         latest = state
         updateStatusItem()
         refreshMenuContents()
+        if case .ready(let status) = state {
+            considerBanner(status)
+        }
+    }
+
+    /// Drops the banner when the branch turns red, and again if it is still
+    /// red but has broken in a new way. Nothing is dropped for the first
+    /// answer GitHub gives: a branch that was already red when the indicator
+    /// started has not just turned, and a login should not fill the screen
+    /// with banners for every indicator that comes back with it.
+    private func considerBanner(_ status: BranchStatus) {
+        let failing = status.checks.filter { $0.state == .failing }.map(\.name).sorted()
+        let signature = ([status.sha] + failing).joined(separator: "\u{1}")
+        let previous = lastHealth
+        let previousFailure = lastFailure
+        lastHealth = status.health
+        lastFailure = signature
+        guard status.health == .failing, let previous else { return }
+        guard previous != .failing || signature != previousFailure else { return }
+        guard !demonstratesBanner else { return }
+        // A bullet rather than a middot: the label is letterspaced far enough
+        // that a middot disappears into the gaps around it.
+        banner.show(bannerMessage(subject: "\(status.repository.slug) • \(status.branch)",
+                                  failing: failing,
+                                  unlisted: status.unreadableCheckCount),
+                    from: statusItem?.button)
+    }
+
+    /// What the banner would say right now. A branch that is failing supplies
+    /// its own bad news; one that is not has some invented for it, which is
+    /// the only way to show the banner to anybody on demand.
+    private func currentBannerMessage() -> BannerMessage {
+        let subject = settings.repository.map { "\($0.slug) • \(settings.branch)" }
+            ?? "owner/repository · main"
+        if let status = shownStatus, status.health == .failing {
+            let failing = status.checks.filter { $0.state == .failing }.map(\.name).sorted()
+            return bannerMessage(subject: subject, failing: failing,
+                                 unlisted: status.unreadableCheckCount)
+        }
+        return bannerMessage(
+            subject: subject,
+            failing: ["Coverage Check", "Runner Tests (3/8)", "Deploy to Staging"],
+            unlisted: 0)
+    }
+
+    @objc private func dropBanner(_ sender: Any?) {
+        banner.show(currentBannerMessage(), from: statusItem?.button)
+    }
+
+    /// Hangs a banner immediately so the effect can be looked at, then quits.
+    private func demonstrateBanner() {
+        let message = currentBannerMessage()
+        // A status item made a moment ago has not been placed in the bar yet,
+        // so the banner waits for the turn of the run loop in which it is.
+        DispatchQueue.main.async { [weak self] in
+            self?.banner.show(message, from: self?.statusItem?.button) {
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     /// The newest result worth showing, which is the last one that arrived
@@ -2065,11 +2148,12 @@ struct Options {
     var branch: String?
     var once = false
     var registersLoginItem = true
+    var demonstratesBanner = false
 }
 
 let usage = """
 usage: \(applicationName) [--instance N] [--repo OWNER/NAME] [--branch BRANCH]
-              [--once] [--no-startup]
+              [--once] [--banner] [--no-startup]
 
   --instance N   run as indicator N rather than the lowest free number
   --repo R       track this repository, and remember it for this indicator
@@ -2077,6 +2161,8 @@ usage: \(applicationName) [--instance N] [--repo OWNER/NAME] [--branch BRANCH]
   --once         report the branch on standard output and exit, without
                  touching the menu bar; exits 0 when the branch is passing,
                  1 when it is failing, and 2 otherwise
+  --banner       hang the red banner straight away and quit when it has
+                 rolled back up, to see what it looks like
   --no-startup   leave the login item alone for this run
 """
 
@@ -2111,6 +2197,9 @@ func parseOptions() -> Options {
             options.branch = value
         case "--once":
             options.once = true
+        case "--banner":
+            options.demonstratesBanner = true
+            options.registersLoginItem = false
         case "--no-startup":
             options.registersLoginItem = false
         case "--help", "-h":
@@ -2203,7 +2292,8 @@ if let branch = options.branch {
 
 let application = NSApplication.shared
 let appDelegate = AppDelegate(lock: instanceLock, settings: instanceSettings,
-                              registersLoginItem: options.registersLoginItem)
+                              registersLoginItem: options.registersLoginItem,
+                              demonstratesBanner: options.demonstratesBanner)
 application.delegate = appDelegate
 application.setActivationPolicy(.accessory)
 application.run()

@@ -3,8 +3,10 @@ INSTALL_DIR = $(HOME)/.local/bin
 AGENT_DIR = $(HOME)/Library/LaunchAgents
 AGENT_PREFIX = local.ghbar
 
-$(BINARY): main.swift
-	swiftc -O -o $(BINARY) main.swift
+SOURCES = main.swift banner.swift
+
+$(BINARY): $(SOURCES)
+	swiftc -O -o $(BINARY) $(SOURCES)
 
 run: $(BINARY)
 	./$(BINARY)
