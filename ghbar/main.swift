@@ -183,6 +183,17 @@ final class InstanceLock {
         self.inode = inode
     }
 
+    deinit {
+        if descriptor >= 0 {
+            close(descriptor)
+        }
+    }
+
+    private func release() {
+        close(descriptor)
+        descriptor = -1
+    }
+
     static var directory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/\(applicationName)",
@@ -261,6 +272,10 @@ final class InstanceLock {
         for number in 1...maximumInstances {
             switch claim(number) {
             case .claimed(let lock):
+                if LoginItem.isRunning(instance: number) {
+                    lock.release()
+                    continue
+                }
                 return .claimed(lock)
             case .busy:
                 continue
@@ -310,6 +325,30 @@ enum LoginItem {
 
     static func isCurrentProcessManaged(instance: Int) -> Bool {
         ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == label(instance: instance)
+    }
+
+    static func isRunning(instance: Int) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["print", "gui/\(getuid())/\(label(instance: instance))"]
+        process.standardInput = FileHandle.nullDevice
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return text.split(separator: "\n").contains {
+            $0.trimmingCharacters(in: .whitespaces) == "state = running"
+        }
     }
 
     /// Writes the agent, pointing it at the running executable. Returns a
