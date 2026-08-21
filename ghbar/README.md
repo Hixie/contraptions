@@ -261,11 +261,13 @@ keeps a login from starting a second copy of an indicator you already have.
 
 ## Starting at login, and stopping
 
-Every launch writes `~/Library/LaunchAgents/local.ghbar.N.plist`, a launchd
-agent that starts that indicator again at the next login. Several indicators
-mean several agents, one per number, and every one of them starts at login.
-The agent points at wherever the program was run from, so running the copy in
-`~/.local/bin` is what registers that copy.
+Every ordinary launch writes `~/Library/LaunchAgents/local.ghbar.N.plist` and
+hands the indicator over to that launchd agent. The handoff makes launchd
+responsible for the running indicator immediately, rather than only after the
+next login, so it can start the indicator again after an abnormal exit.
+Several indicators mean several agents, one per number, and every one of them
+starts at login. The agent points at wherever the program was run from, so
+running the copy in `~/.local/bin` is what registers that copy.
 
 **Disable and Quit** deletes that indicator's agent, stops its launchd job, and
 exits. The indicator stops coming back at login. Its settings stay behind, so

@@ -7,9 +7,9 @@ import AppKit
 //
 // Several indicators can run side by side. Each one owns an instance number,
 // and that number picks its settings, its lock file, and its launchd agent, so
-// the indicators never share state. Every launch writes the agent that starts
-// that instance again at the next login; the Disable and Quit menu item
-// removes the agent and exits.
+// the indicators never share state. Every ordinary launch hands the running
+// instance to its launchd agent, which also starts it at the next login; the
+// Disable and Quit menu item removes the agent and exits.
 
 // MARK: - Constants
 
@@ -193,7 +193,7 @@ final class InstanceLock {
         directory.appendingPathComponent("instance-\(number).lock").path
     }
 
-    private static func attempt(_ number: Int) -> Attempt {
+    private static func attempt(_ number: Int, waiting: Bool = false) -> Attempt {
         do {
             try FileManager.default.createDirectory(at: directory,
                                                     withIntermediateDirectories: true)
@@ -207,7 +207,8 @@ final class InstanceLock {
         }
         // Keeps a spawned indicator from inheriting the lock.
         _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        let operation = waiting ? LOCK_EX : LOCK_EX | LOCK_NB
+        guard flock(descriptor, operation) == 0 else {
             let reason = errno
             close(descriptor)
             return reason == EWOULDBLOCK
@@ -223,8 +224,8 @@ final class InstanceLock {
         return .took(descriptor: descriptor, inode: details.st_ino)
     }
 
-    static func claim(_ number: Int) -> Outcome {
-        switch attempt(number) {
+    static func claim(_ number: Int, waiting: Bool = false) -> Outcome {
+        switch attempt(number, waiting: waiting) {
         case .took(let descriptor, let inode):
             return .claimed(InstanceLock(number: number, descriptor: descriptor, inode: inode))
         case .busy:
@@ -276,10 +277,15 @@ final class InstanceLock {
 
 // MARK: - Login item
 
-/// The launchd user agent that starts one instance at login. Writing the file
-/// is enough: launchd reads ~/Library/LaunchAgents at login and starts every
-/// agent it finds there that asks to run at load.
+/// The launchd user agent that owns one instance. An ordinary process writes
+/// and loads the agent, then exits after its launchd copy starts waiting for
+/// the instance lock.
 enum LoginItem {
+    private struct LaunchctlResult {
+        let status: Int32
+        let error: String
+    }
+
     static var directory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
@@ -302,12 +308,20 @@ enum LoginItem {
         FileManager.default.fileExists(atPath: plistURL(instance: instance).path)
     }
 
+    static func isCurrentProcessManaged(instance: Int) -> Bool {
+        ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == label(instance: instance)
+    }
+
     /// Writes the agent, pointing it at the running executable. Returns a
     /// message when the file could not be written.
     static func register(instance: Int) -> String? {
         let job: [String: Any] = [
             "Label": label(instance: instance),
-            "ProgramArguments": [executablePath, "--instance", String(instance)],
+            "ProgramArguments": [
+                executablePath,
+                "--instance", String(instance),
+                "--launchd",
+            ],
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
         ]
@@ -322,6 +336,51 @@ enum LoginItem {
         } catch {
             return error.localizedDescription
         }
+    }
+
+    /// Loads a newly written agent. The launchd copy waits for the current
+    /// process to release the instance lock, so a successful return means this
+    /// process can exit.
+    static func start(instance: Int) -> String? {
+        let domain = "gui/\(getuid())"
+        let service = "\(domain)/\(label(instance: instance))"
+        if runLaunchctl(["print", service]).status == 0 {
+            let result = runLaunchctl(["bootout", service])
+            guard result.status == 0 else {
+                return result.error.isEmpty
+                    ? "launchctl bootout exited with status \(result.status)"
+                    : result.error
+            }
+        }
+        let result = runLaunchctl([
+            "bootstrap", domain, plistURL(instance: instance).path,
+        ])
+        guard result.status == 0 else {
+            return result.error.isEmpty
+                ? "launchctl exited with status \(result.status)"
+                : result.error
+        }
+        return nil
+    }
+
+    private static func runLaunchctl(_ arguments: [String]) -> LaunchctlResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        let errors = Pipe()
+        process.standardError = errors
+        do {
+            try process.run()
+        } catch {
+            return LaunchctlResult(status: -1, error: error.localizedDescription)
+        }
+        let data = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let message = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return LaunchctlResult(status: process.terminationStatus, error: message)
     }
 
     /// Removes the agent and stops the job. When launchd is the parent of this
@@ -1712,8 +1771,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
-        if registersLoginItem, let problem = LoginItem.register(instance: lock.number) {
-            report("could not write the login item: \(problem)")
+        if registersLoginItem {
+            if let problem = LoginItem.register(instance: lock.number) {
+                report("could not write the login item: \(problem)")
+            } else if !LoginItem.isCurrentProcessManaged(instance: lock.number) {
+                if let problem = LoginItem.start(instance: lock.number) {
+                    report("could not start the login item: \(problem)")
+                } else {
+                    NSApp.terminate(nil)
+                    return
+                }
+            }
         }
         buildStatusItem()
         monitor.onChange = { [weak self] state in
@@ -2149,6 +2217,7 @@ struct Options {
     var once = false
     var registersLoginItem = true
     var demonstratesBanner = false
+    var waitsForInstance = false
 }
 
 let usage = """
@@ -2202,12 +2271,18 @@ func parseOptions() -> Options {
             options.registersLoginItem = false
         case "--no-startup":
             options.registersLoginItem = false
+        case "--launchd":
+            options.registersLoginItem = false
+            options.waitsForInstance = true
         case "--help", "-h":
             print(usage)
             exit(0)
         default:
             fail("unknown option \(argument)")
         }
+    }
+    if options.waitsForInstance, options.instance == nil {
+        fail("--launchd requires --instance")
     }
     return options
 }
@@ -2266,7 +2341,14 @@ if options.once {
     runOnce(options: options)
 }
 
-let claim = options.instance.map(InstanceLock.claim) ?? InstanceLock.claimLowestFree()
+ProcessInfo.processInfo.automaticTerminationSupportEnabled = true
+ProcessInfo.processInfo.disableAutomaticTermination(
+    "ghbar keeps a menu bar indicator available."
+)
+
+let claim = options.instance.map {
+    InstanceLock.claim($0, waiting: options.waitsForInstance)
+} ?? InstanceLock.claimLowestFree()
 let instanceLock: InstanceLock
 switch claim {
 case .claimed(let lock):

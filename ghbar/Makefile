@@ -4,9 +4,11 @@ AGENT_DIR = $(HOME)/Library/LaunchAgents
 AGENT_PREFIX = local.ghbar
 
 SOURCES = main.swift banner.swift
+INFO_PLIST = Info.plist
 
-$(BINARY): $(SOURCES)
-	swiftc -O -o $(BINARY) $(SOURCES)
+$(BINARY): $(SOURCES) $(INFO_PLIST)
+	swiftc -O -Xlinker -sectcreate -Xlinker __TEXT \
+	  -Xlinker __info_plist -Xlinker $(INFO_PLIST) -o $(BINARY) $(SOURCES)
 
 run: $(BINARY)
 	./$(BINARY)
