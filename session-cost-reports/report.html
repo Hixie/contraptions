@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session costs</title>
+  <style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff;
+    --fg: #202124;
+    --muted: #666;
+    --line: #ddd;
+    --one: #429aff;
+    --two: #efb44d;
+    --three: #56b884;
+    --four: #db75ad;
+    --five: #e88158;
+    --six: #4fada7;
+  }
+  @media (prefers-color-scheme:dark) {
+    :root {
+      --bg: #181818;
+      --fg: #eee;
+      --muted: #aaa;
+      --line: #444;
+      --one: #77acd5;
+      --two: #d99c58;
+      --three: #71bb8b;
+      --four: #bd7b9c;
+      --five: #dd9974;
+      --six: #64a7a2;
+    }
+  }
+  * {
+    box-sizing: border-box;
+  }
+  body {
+    margin: 0 auto;
+    padding: 24px 16px;
+    max-width: 940px;
+    font: 14px/1.45 system-ui,sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  h1 {
+    font-size: 21px;
+    font-weight: 600;
+    margin: 0 0 6px;
+  }
+  p {
+    margin: 8px 0;
+  }
+  .muted {
+    color: var(--muted);
+  }
+  .legend {
+    columns: 240px;
+    column-gap: 20px;
+    margin: 18px 0;
+    font-size: 12px;
+  }
+  .key {
+    display: grid;
+    gap: 5px;
+    break-inside: avoid;
+    margin-bottom: 12px;
+  }
+  .key-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .swatch {
+    flex: 0 0 16px;
+    height: 12px;
+    display: inline-block;
+  }
+  .key-track {
+    height: 8px;
+    background: var(--line);
+  }
+  .key-fill {
+    display: block;
+    height: 100%;
+  }
+  .axis {
+    display: flex;
+    justify-content: space-between;
+    margin: 0 124px 8px 0;
+    color: var(--muted);
+    font-size: 12px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 5px;
+  }
+  details {
+    margin-bottom: 9px;
+  }
+  summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 5px 0;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+  .label {
+    display: flex;
+    gap: 12px;
+    justify-content: space-between;
+    margin-bottom: 5px;
+  }
+  .title {
+    overflow-wrap: anywhere;
+  }
+  .total {
+    flex: 0 0 112px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .share {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .bar-space {
+    margin-right: 124px;
+    min-height: 18px;
+  }
+  .bar {
+    height: 18px;
+    display: flex;
+  }
+  .segment {
+    min-width: 0;
+    overflow: hidden;
+    text-align: center;
+    font-size: 12px;
+  }
+  .pattern {
+    background-image: repeating-linear-gradient(135deg,transparent,transparent
+      3px,var(--bg) 3px,var(--bg) 4px);
+  }
+  .detail {
+    padding: 8px 12px;
+    border-left: 2px solid var(--line);
+    margin: 5px 0 12px;
+  }
+  .detail-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    font-variant-numeric: tabular-nums;
+  }
+  .detail p {
+    overflow-wrap: anywhere;
+  }
+  a {
+    color: var(--one);
+  }
+  footer {
+    margin-top: 24px;
+    border-top: 1px solid var(--line);
+    padding-top: 12px;
+  }
+  @media (max-width:480px) {
+    body {
+      padding: 16px 12px;
+    }
+    h1 {
+      font-size: 19px;
+    }
+  }
+  </style>
+  <h1 id="heading"></h1>
+  <p id="period" class="muted"></p>
+  <p id="summary"></p>
+  <div id="legend" class="legend"
+    aria-label="Footer emoji totals and percentages of total priced usage"></div>
+  <div id="axis" class="axis" aria-label="API-equivalent dollars"></div>
+  <main id="sessions" aria-label="Sessions ordered by cost"></main>
+  <footer>
+    <p id="notes"></p>
+    <p><a href="sessions.csv">CSV</a> · <a href="report.json">Report data and reset evidence</a> · <a href="requests.jsonl">Request ledger</a></p>
+    <p id="pricing" class="muted"></p>
+    <p id="conventions" class="muted"></p>
+  </footer>
+  <!-- deno-fmt-ignore -->
+  <script id="data" type="application/json">REPORT_DATA</script>
+  <script>
+  (() => {
+    const report = JSON.parse(document.getElementById("data").textContent);
+    const money = (x) =>
+      new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
+        .format(x);
+    const number = (x) => new Intl.NumberFormat("en-US").format(x);
+    const percent = (x) =>
+      x === null ? "N/A" : x > 0 && x < .1 ? "<0.1%" : `${x.toFixed(1)}%`;
+    const display = (x) => x === "none" ? "No footer" : x;
+    const create = (tag, text, cls) => {
+      const e = document.createElement(tag);
+      if (text !== undefined) e.textContent = text;
+      if (cls) e.className = cls;
+      return e;
+    };
+    const states = Object.keys(report.summary.segments).sort((a, b) =>
+      a === "none"
+        ? 1
+        : b === "none"
+        ? -1
+        : report.summary.segments[b] - report.summary.segments[a]
+    );
+    const order = [
+      "🧱",
+      "🐤",
+      "🦚",
+      "🟠",
+      "🔴",
+      "✅",
+      "🪻",
+      "🚨",
+      "⏳",
+    ];
+    states.forEach((s) => {
+      if (s !== "none" && !order.includes(s)) order.push(s);
+    });
+    const colors = ["--one", "--two", "--three", "--four", "--five", "--six"];
+    function decorate(el, state) {
+      el.style.backgroundColor = state === "none"
+        ? "var(--muted)"
+        : `var(${colors[order.indexOf(state) % 6]})`;
+      if (order.indexOf(state) >= 6) el.classList.add("pattern");
+    }
+    const selection = report.window.selection || "last";
+    const periodName = selection === "current"
+      ? "Current window so far"
+      : selection === "custom"
+      ? "Custom interval"
+      : "Last completed window";
+    document.title = `${report.service} session costs · ${periodName}`;
+    document.getElementById("heading").textContent = `${
+      report.service === "codex" ? "Codex" : "Claude"
+    } session costs · ${money(report.summary.window_total)} priced usage`;
+    document.getElementById("period").textContent =
+      `${periodName}: ${report.window.local_start} to ${report.window.local_end}` +
+      (selection === "current"
+        ? ` · Recorded reset: ${report.window.local_reset}`
+        : "");
+    document.getElementById("summary").textContent =
+      `${report.summary.session_count} sessions · ${
+        money(report.summary.subagent_total)
+      } from subagents (${
+        percent(report.summary.subagent_percent_of_total)
+      } of total) · API-equivalent USD`;
+    states.forEach((state) => {
+      const key = create("div", undefined, "key");
+      const label = create("div", undefined, "key-label");
+      const swatch = create("span", undefined, "swatch");
+      decorate(swatch, state);
+      label.append(
+        swatch,
+        create(
+          "span",
+          `${display(state)} ${money(report.summary.segments[state])} (${
+            percent(report.summary.segment_percent_of_total[state])
+          } of total)`,
+        ),
+      );
+      const track = create("div", undefined, "key-track");
+      track.setAttribute("aria-hidden", "true");
+      const fill = create("span", undefined, "key-fill");
+      fill.style.width = `${
+        report.summary.segment_percent_of_total[state] ?? 0
+      }%`;
+      decorate(fill, state);
+      track.append(fill);
+      key.append(label, track);
+      document.getElementById("legend").append(key);
+    });
+    const maximum = Math.max(1, ...report.sessions.map((s) => s.window));
+    [0, .5, 1].forEach((f) =>
+      document.getElementById("axis").append(create("span", money(maximum * f)))
+    );
+    report.sessions.forEach((s) => {
+      const details = create("details");
+      const summary = create("summary");
+      const label = create("div", undefined, "label");
+      const amount = create("span", undefined, "total");
+      amount.append(
+        create("span", money(s.window)),
+        create(
+          "span",
+          s.percent_of_total === null
+            ? "No priced total"
+            : `${percent(s.percent_of_total)} of total`,
+          "share",
+        ),
+      );
+      label.append(
+        create("span", s.title, "title"),
+        amount,
+      );
+      summary.append(label);
+      const space = create("div", undefined, "bar-space");
+      const bar = create("div", undefined, "bar");
+      bar.style.width = `${s.window / maximum * 100}%`;
+      bar.setAttribute("role", "img");
+      bar.setAttribute(
+        "aria-label",
+        states.filter((k) => s.segments[k] > 0).map((k) =>
+          `${display(k)}: ${money(s.segments[k])}, ${
+            percent(s.segment_percent_of_session[k])
+          } of session`
+        ).join("; ") || "No recorded cost",
+      );
+      states.forEach((state) => {
+        const value = s.segments[state] || 0;
+        if (!value) return;
+        const seg = create(
+          "span",
+          value / maximum > .06 && state !== "none" ? display(state) : "",
+          "segment",
+        );
+        seg.style.width = `${value / s.window * 100}%`;
+        decorate(seg, state);
+        bar.append(seg);
+      });
+      space.append(bar);
+      if (!s.window) space.append(create("span", "No recorded cost", "muted"));
+      summary.append(space);
+      details.append(summary);
+      const info = create("div", undefined, "detail");
+      function row(name, value) {
+        const r = create("div", undefined, "detail-row");
+        r.append(create("span", name), create("span", value));
+        info.append(r);
+      }
+      states.filter((k) => s.segments[k] > 0).forEach((k) =>
+        row(
+          display(k),
+          `${money(s.segments[k])} · ${
+            percent(s.segment_percent_of_session[k])
+          } of session`,
+        )
+      );
+      row(
+        "Subagents",
+        `${money(s.subagent_window)} · ${
+          percent(s.subagent_percent_of_session)
+        } of session`,
+      );
+      row("Priced requests", number(s.requests));
+      if (s.unpriced_requests) {
+        row("Unpriced requests", number(s.unpriced_requests));
+        row("Unpriced input tokens", number(s.unpriced_tokens.input_tokens || 0));
+        row(
+          "Unpriced output tokens",
+          number(s.unpriced_tokens.output_tokens || 0),
+        );
+      }
+      info.append(
+        create(
+          "p",
+          `Title source: ${s.title_rule.replaceAll("_", " ")}`,
+          "muted",
+        ),
+        create("p", `Session: ${s.id}`, "muted"),
+      );
+      details.append(info);
+      document.getElementById("sessions").append(details);
+    });
+    document.getElementById("notes").textContent =
+      `Open a session for its breakdown. ${report.summary.unpriced_requests} requests have no verified model price and are excluded from dollar totals and percentage denominators. Shares of total refer to this service and report window. Footer breakdowns show shares of each session. These API-equivalent estimates are not invoices or quota percentages.`;
+    const pricing = document.getElementById("pricing");
+    pricing.append(
+      document.createTextNode(`Rates checked ${report.rates_checked}. `),
+    );
+    const link = create("a", "Published pricing");
+    link.href = report.price_source;
+    pricing.append(link);
+    const conventions = document.getElementById("conventions");
+    const conventionLink = create("a", "FOOTER LINE and status emoji convention");
+    conventionLink.href = report.convention_source;
+    conventions.append(conventionLink);
+    document.documentElement.dataset.ready = "true";
+  })();
+  </script>
+</html>
