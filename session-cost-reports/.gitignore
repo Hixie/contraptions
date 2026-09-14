@@ -1,0 +1,4 @@
+__pycache__/
+.ruff_cache/
+# Generated reports, reset history, and local validation records.
+reports/
