@@ -123,9 +123,26 @@ other account, it prints `unknown` rather than a name that would be wrong.
 
 By the time `link` runs, the second account has normally written a session
 file or two of its own, plus whatever small files the app creates at
-startup.  Each entry is moved into the shared directory.  An entry whose
-name is already taken in the shared directory is set aside instead of
-being written over, so the copy that has your history in it always wins.
+startup.  If it has been used on this machine before, it has a whole
+history of its own.  Each entry is moved into the shared directory.
+Session files are named after their session, so two accounts' sessions
+never collide.  An entry whose name is already taken in the shared
+directory is set aside instead of being written over, and `link` names
+each entry it sets aside.
+
+Besides one file per session, each account keeps a few files of its own,
+and these can collide when both accounts have been used:
+
+- `archived-sessions.idx` lists the sessions that are archived.  `link`
+  merges the second account's list into the shared one as well as setting
+  it aside, so a session archived under either account stays archived.
+  Without the merge, the shared list would leave out every session
+  archived under the second account.
+- `scheduled-tasks.json` holds the account's scheduled tasks.  It is not
+  merged.  The shared directory keeps the first account's tasks, and any
+  the second account had are only in the set-aside copy.
+- Anything else `link` names is set aside the same way, and the first
+  account's copy is the one the shared directory keeps.
 
 The directory it is set aside in is made fresh for each run, named after
 the original with `.superseded.` and six random characters on the end:
@@ -184,12 +201,19 @@ Verified on a real switch between two accounts:
 - `pgrep -f` does not reliably match the app's executable path, and
   reported the app as absent while it was plainly running.  The check in
   this script matches a captured `ps` listing instead.
+- A switch where both accounts already had a history of their own, 218
+  sessions and 45.  All 45 of the second account's sessions came across,
+  and with the two `archived-sessions.idx` lists merged, the app listed
+  the second account's 36 archived sessions as archived, not active.
 
 Not verified, and worth knowing:
 
 - Whether the app re-reads the session directory while running, or only
   at startup.  The instructions above say to quit and reopen the app,
   which is correct either way.
+- Whether the app goes by `archived-sessions.idx` or by the `isArchived`
+  flag that each session file also carries, when the two disagree.  With
+  the lists merged they agree, so the question does not come up.
 - Whether future versions of the app keep this layout.  Nothing here is a
   published interface, and a version that changes where the session list
   lives will break this script.  `status` will show it: the entry counts

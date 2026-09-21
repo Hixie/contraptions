@@ -105,6 +105,41 @@ describe() {
   done
 }
 
+# Merge the archived-session list at $2, set aside from the new account, into
+# the shared list at $1, so that a session archived under either account stays
+# archived.  The app writes this file as {"v":1,"archived":[...]} with the ids
+# sorted, and the merged list is written the same way, through a temporary file
+# and a rename.  Prints how many ids were added.  Exits with a message on
+# standard error, writing nothing, when either file is not in that form.
+merge_archived() {
+  SHARED="$1" ASIDE="$2" python3 -c '
+import json, os, sys, tempfile
+
+def archived(path):
+    try:
+        index = json.load(open(path))
+    except (OSError, ValueError) as e:
+        sys.exit("cannot read %s: %s" % (path, e))
+    if (not isinstance(index, dict) or sorted(index) != ["archived", "v"]
+            or index["v"] != 1 or not isinstance(index["archived"], list)
+            or not all(isinstance(i, str) for i in index["archived"])):
+        sys.exit("%s is not in the form this script expects" % path)
+    return set(index["archived"])
+
+shared = os.environ["SHARED"]
+have = archived(shared)
+added = archived(os.environ["ASIDE"]) - have
+if added:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(shared),
+                               prefix=".archived-sessions.idx.")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"v": 1, "archived": sorted(have | added)}, f,
+                  separators=(",", ":"))
+    os.replace(tmp, shared)
+print(len(added))
+'
+}
+
 # Whether the desktop app is running.  This matches the app's executable path
 # in a captured process listing.  "pgrep -f" does not reliably match that path,
 # and has reported the app as absent while it was running.
@@ -194,13 +229,15 @@ case "${1-}" in
         continue
       fi
       # By the time this runs, the new account normally has a session or two of
-      # its own here.  Each entry moves into the shared directory.  An entry
-      # whose name is already taken there is set aside instead, which keeps the
-      # copy the old account built up.  The directory it is set aside in is
-      # made fresh for each run, so a second switch between the same two
-      # accounts does not write over what the first one set aside.
+      # its own here, and a whole history if it has been used before.  Each
+      # entry moves into the shared directory.  Session files are named after
+      # their session, so they do not collide.  An entry whose name is already
+      # taken there is set aside instead, which keeps the copy the old account
+      # built up.  The directory it is set aside in is made fresh for each run,
+      # so a second switch between the same two accounts does not write over
+      # what the first one set aside.
       if [ -d "$src" ]; then
-        moved=0 kept=0 aside=""
+        moved=0 kept=0 aside="" names=""
         for entry in "$src"/* "$src"/.[!.]*; do
           [ -e "$entry" ] || continue
           name="$(basename "$entry")"
@@ -210,13 +247,28 @@ case "${1-}" in
             fi
             mv "$entry" "$aside/$name"
             kept=$((kept + 1))
+            names="$names $name"
           else
             mv "$entry" "$tgt/$name"
             moved=$((moved + 1))
           fi
         done
         [ "$moved" -gt 0 ] && echo "  $d: moved $moved entries into the shared directory"
-        [ "$kept" -gt 0 ] && echo "  $d: set $kept already-present entries aside in $aside"
+        [ "$kept" -gt 0 ] && echo "  $d: set $kept already-present entries aside in $aside:$names"
+        # Each account keeps its own archived-sessions.idx, the list of the
+        # sessions it has archived, so when both accounts have archived
+        # something the name is taken.  Setting the new account's list aside
+        # would leave its archived sessions out of the shared list, so it is
+        # merged in as well.
+        idx=archived-sessions.idx
+        if [ -n "$aside" ] && [ -f "$aside/$idx" ]; then
+          if added="$(merge_archived "$tgt/$idx" "$aside/$idx")"; then
+            echo "  $d: added $added archived sessions to the shared $idx"
+          else
+            echo "  $d: $idx was set aside but not merged, so the shared list" >&2
+            echo "      is missing the sessions archived under the new account." >&2
+          fi
+        fi
         if ! rmdir "$src" 2>/dev/null; then
           echo "  $d: $src is not empty, refusing to replace it" >&2
           continue
