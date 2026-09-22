@@ -11,12 +11,20 @@
 # name, find nothing there, and show an empty sidebar.  The transcripts are not
 # account-scoped -- they are in ~/.claude/projects/<directory>/<session>.jsonl
 # and are untouched by a switch -- so nothing is lost; only the index is
-# missing.  This script points the new account's directory at the old one, so
-# both accounts read one shared list and switching back needs no further work.
+# missing.  This script moves the list into the directory of the account the
+# app is logged in as, after each switch.
 #
-#   ./account-switch.sh status   # which account is recorded, which is live
-#   ./account-switch.sh record   # while still logged in as the old account
-#   ./account-switch.sh link     # after logging in as the new account
+# The app opens that directory with O_NOFOLLOW, so it cannot be a symbolic link
+# to another account's directory.  An earlier version of this script made one;
+# the app then read the list through the link but failed every save with
+# ENOTDIR, and sessions started under the new account were lost when the app
+# quit.  "move" removes such links, and "recover", run after "move", rebuilds
+# the lost sessions from the app's log and the transcripts.
+#
+#   ./account-switch.sh status    # which account is recorded, which is live
+#   ./account-switch.sh record    # once, logged in as the account with the list
+#   ./account-switch.sh move      # after each switch to another account
+#   ./account-switch.sh recover [--apply|--verify]
 #
 # The account this script acts on comes from the app's own config.json, in the
 # key "lastKnownAccountUuid", together with the <account>/<org> directory the
@@ -59,7 +67,16 @@ if not account:
     sys.exit("the app config has no lastKnownAccountUuid; is the app logged in?")
 
 # The organization is the subdirectory the app made under the account when it
-# logged in.  Normally there is exactly one; take the newest if there are more.
+# logged in, and the app writes to it at every login.  While it switches
+# accounts, the app can also make a directory pairing the account it is leaving
+# with the organization it is going to, so take the newest.  A symbolic link
+# counts by what it leads to, if anything.
+def modified(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return os.lstat(path).st_mtime
+
 parent = os.path.join(support, "claude-code-sessions", account)
 try:
     orgs = [d for d in os.listdir(parent) if uuid.match(d)]
@@ -67,7 +84,7 @@ except OSError:
     orgs = []
 if not orgs:
     sys.exit("no organization directory under %s; open the app once first" % parent)
-orgs.sort(key=lambda d: os.stat(os.path.join(parent, d)).st_mtime, reverse=True)
+orgs.sort(key=lambda d: modified(os.path.join(parent, d)), reverse=True)
 
 print(account, orgs[0])
 '
@@ -94,7 +111,8 @@ describe() {
   for d in "${DIRS[@]}"; do
     p="$SUPPORT/$d/$acct/$org"
     if [ -L "$p" ]; then
-      printf '  %s: symlink to %s\n' "$d" "$(readlink "$p")"
+      printf '  %s: symlink to %s; the app cannot save through it\n' \
+        "$d" "$(readlink "$p")"
     elif [ -d "$p" ]; then
       printf '  %s: %s entries, %s\n' "$d" \
         "$(find "$p" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" \
@@ -105,39 +123,39 @@ describe() {
   done
 }
 
-# Merge the archived-session list at $2, set aside from the new account, into
-# the shared list at $1, so that a session archived under either account stays
-# archived.  The app writes this file as {"v":1,"archived":[...]} with the ids
-# sorted, and the merged list is written the same way, through a temporary file
-# and a rename.  Prints how many ids were added.  Exits with a message on
-# standard error, writing nothing, when either file is not in that form.
-merge_archived() {
-  SHARED="$1" ASIDE="$2" python3 -c '
-import json, os, sys, tempfile
+# Every symbolic link at an account's directory in tree $1, and where it
+# leads, one per line.  An earlier version of this script made them.
+links() {
+  local link
+  for link in "$SUPPORT/$1"/*/*; do
+    [ -L "$link" ] && printf '%s\t%s\n' "$link" "$(cd "$link" 2>/dev/null && pwd -P)"
+  done
+  return 0
+}
 
-def archived(path):
-    try:
-        index = json.load(open(path))
-    except (OSError, ValueError) as e:
-        sys.exit("cannot read %s: %s" % (path, e))
-    if (not isinstance(index, dict) or sorted(index) != ["archived", "v"]
-            or index["v"] != 1 or not isinstance(index["archived"], list)
-            or not all(isinstance(i, str) for i in index["archived"])):
-        sys.exit("%s is not in the form this script expects" % path)
-    return set(index["archived"])
-
-shared = os.environ["SHARED"]
-have = archived(shared)
-added = archived(os.environ["ASIDE"]) - have
-if added:
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(shared),
-                               prefix=".archived-sessions.idx.")
-    with os.fdopen(fd, "w") as f:
-        json.dump({"v": 1, "archived": sorted(have | added)}, f,
-                  separators=(",", ":"))
-    os.replace(tmp, shared)
-print(len(added))
-'
+# Move each entry of directory $1 into directory $2, merging directories that
+# both have.  An entry whose name is already taken is set aside instead, at
+# the same relative path ($3) under a directory made from the template in
+# $aside_template on first use and named in $aside.  Counts go in $moved and
+# the set-aside paths in $kept.  Returns non-zero if anything fails to move.
+merge_into() {
+  local src="$1" dst="$2" rel="$3" entry name
+  for entry in "$src"/* "$src"/.[!.]*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name="${entry##*/}"
+    if [ -d "$entry" ] && [ ! -L "$entry" ] && [ -d "$dst/$name" ] && [ ! -L "$dst/$name" ]; then
+      merge_into "$entry" "$dst/$name" "$rel$name/" && rmdir "$entry" || return 1
+    elif [ -e "$dst/$name" ] || [ -L "$dst/$name" ]; then
+      if [ -z "$aside" ]; then
+        aside="$(mktemp -d "$aside_template")" || return 1
+      fi
+      mkdir -p "$aside/$rel" && mv "$entry" "$aside/$rel$name" || return 1
+      kept="$kept $rel$name"
+    else
+      mv "$entry" "$dst/$name" || return 1
+      moved=$((moved + 1))
+    fi
+  done
 }
 
 # Whether the desktop app is running.  This matches the app's executable path
@@ -174,6 +192,14 @@ case "${1-}" in
       echo "Live account: could not be determined." >&2
       exit 1
     fi
+    for d in "${DIRS[@]}"; do
+      links "$d" | while IFS=$'\t' read -r link target; do
+        echo
+        echo "Symbolic link at $link"
+        echo "  leads to ${target:-nothing}; the app cannot save through it."
+        echo "  Run 'move' with the app quit to remove it."
+      done
+    done
     ;;
 
   record)
@@ -187,107 +213,118 @@ case "${1-}" in
     describe "$acct" "$org"
     ;;
 
-  link)
-    [ -f "$STATE" ] || { echo "No recorded old account; run 'record' first." >&2; exit 1; }
+  move)
+    [ -f "$STATE" ] || { echo "No recorded account; run 'record' first." >&2; exit 1; }
     if app_is_running; then
       echo "The Claude app is running.  Quit it completely first: it rewrites" >&2
-      echo "these files as it goes, and this step moves some of them." >&2
+      echo "these files as it goes, and this step moves them." >&2
       exit 1
     fi
     read -r old_acct old_org old_email < "$STATE"
     pair="$(live_pair)" || exit 1
     read -r acct org <<< "$pair"
-    if [ "$acct" = "$old_acct" ] && [ "$org" = "$old_org" ]; then
-      echo "The app is still logged in as the recorded account ($old_email)."
-      echo "Log in as the other account first, open the app once so it creates"
-      echo "its directory, then quit the app and rerun this."
-      exit 0
-    fi
-    echo "Old account: $old_email ($old_acct)"
-    echo "New account: $(cached_email "$acct") ($acct)"
-    ready=0
+    email="$(cached_email "$acct")"
+    echo "From: $old_email ($old_acct)"
+    echo "To:   $email ($acct)"
+    holding=0 moves=0 failed=0
     for d in "${DIRS[@]}"; do
-      tgt="$SUPPORT/$d/$old_acct/$old_org"
-      src="$SUPPORT/$d/$acct/$org"
-      if [ ! -d "$tgt" ]; then
-        echo "  $d: old directory missing, skipping"
-        continue
-      fi
-      if [ -L "$src" ]; then
-        echo "  $d: already a symlink to $(readlink "$src")"
-        ready=$((ready + 1))
-        continue
-      fi
-      # Both paths reaching the same directory means an earlier run linked this
-      # pair of accounts the other way round.  Every entry below would then be
-      # moved onto itself and set aside as a duplicate, emptying the directory
-      # that holds the sessions.
-      if [ -d "$src" ] &&
-         [ "$(cd "$src" && pwd -P)" = "$(cd "$tgt" && pwd -P)" ]; then
-        echo "  $d: the recorded and the live directory are one directory;" >&2
-        echo "      these two accounts are already sharing a session list." >&2
-        continue
-      fi
-      # By the time this runs, the new account normally has a session or two of
-      # its own here, and a whole history if it has been used before.  Each
-      # entry moves into the shared directory.  Session files are named after
-      # their session, so they do not collide.  An entry whose name is already
-      # taken there is set aside instead, which keeps the copy the old account
-      # built up.  The directory it is set aside in is made fresh for each run,
-      # so a second switch between the same two accounts does not write over
-      # what the first one set aside.
-      if [ -d "$src" ]; then
-        moved=0 kept=0 aside="" names=""
-        for entry in "$src"/* "$src"/.[!.]*; do
-          [ -e "$entry" ] || continue
-          name="$(basename "$entry")"
-          if [ -e "$tgt/$name" ]; then
-            if [ -z "$aside" ]; then
-              aside="$(mktemp -d "$src.superseded.XXXXXX")" || exit 1
-            fi
-            mv "$entry" "$aside/$name"
-            kept=$((kept + 1))
-            names="$names $name"
-          else
-            mv "$entry" "$tgt/$name"
-            moved=$((moved + 1))
-          fi
-        done
-        [ "$moved" -gt 0 ] && echo "  $d: moved $moved entries into the shared directory"
-        [ "$kept" -gt 0 ] && echo "  $d: set $kept already-present entries aside in $aside:$names"
-        # Each account keeps its own archived-sessions.idx, the list of the
-        # sessions it has archived, so when both accounts have archived
-        # something the name is taken.  Setting the new account's list aside
-        # would leave its archived sessions out of the shared list, so it is
-        # merged in as well.
-        idx=archived-sessions.idx
-        if [ -n "$aside" ] && [ -f "$aside/$idx" ]; then
-          if added="$(merge_archived "$tgt/$idx" "$aside/$idx")"; then
-            echo "  $d: added $added archived sessions to the shared $idx"
-          else
-            echo "  $d: $idx was set aside but not merged, so the shared list" >&2
-            echo "      is missing the sessions archived under the new account." >&2
-          fi
+      to="$SUPPORT/$d/$acct/$org"
+      # The list is wherever the recorded directory leads.
+      list="$(cd "$SUPPORT/$d/$old_acct/$old_org" 2>/dev/null && pwd -P)"
+      # A symbolic link to the list, made by an earlier version of this
+      # script, holds no data, and the app cannot save through it.
+      while IFS=$'\t' read -r link target; do
+        if [ -n "$list" ] && [ "$target" = "$list" ]; then
+          rm "$link" && echo "  $d: removed the symlink at $link"
         fi
-        if ! rmdir "$src" 2>/dev/null; then
-          echo "  $d: $src is not empty, refusing to replace it" >&2
+      done < <(links "$d")
+      if [ -L "$to" ]; then
+        echo "  $d: $to is a symlink that does not lead to the list; leaving it alone" >&2
+        failed=1
+        continue
+      fi
+      if [ -z "$list" ]; then
+        echo "  $d: nothing recorded, skipping"
+        continue
+      fi
+      if [ "$list" = "$(cd "$to" 2>/dev/null && pwd -P)" ]; then
+        echo "  $d: already with the signed-in account"
+        holding=$((holding + 1))
+        continue
+      fi
+      # By the time this runs, the signed-in account normally has a file or
+      # two of its own here, and a whole history if it has been used before.
+      # Each entry moves into the list.  Session files are named after their
+      # session, so they do not collide.  An entry whose name is already taken
+      # is set aside instead, which keeps the list's copy.  The directory it is
+      # set aside in is made fresh for each run, so a later switch does not
+      # write over what this one set aside.
+      if [ -d "$to" ]; then
+        moved=0 kept="" aside="" aside_template="$to.superseded.XXXXXX"
+        if ! merge_into "$to" "$list" ""; then
+          echo "  $d: could not move everything out of $to; the list is unchanged" >&2
+          failed=1
+          continue
+        fi
+        [ "$moved" -gt 0 ] && echo "  $d: merged $moved of the signed-in account's entries"
+        [ -n "$kept" ] && echo "  $d: set entries aside in $aside:$kept"
+        if ! rmdir "$to"; then
+          echo "  $d: $to is not empty, refusing to replace it" >&2
+          failed=1
           continue
         fi
       fi
-      mkdir -p "$(dirname "$src")"
-      ln -s "$tgt" "$src"
-      echo "  $d: linked"
-      ready=$((ready + 1))
+      if ! { mkdir -p "$(dirname "$to")" && mv "$list" "$to"; }; then
+        echo "  $d: could not move $list to $to" >&2
+        failed=1
+        continue
+      fi
+      echo "  $d: moved"
+      holding=$((holding + 1)) moves=$((moves + 1))
     done
-    if [ "$ready" -eq 0 ]; then
-      echo "No session list was linked; the session list has not moved." >&2
+    if [ "$holding" -gt 0 ]; then
+      printf '%s %s %s\n' "$acct" "$org" "$email" > "$STATE"
+    fi
+    if [ "$failed" -ne 0 ]; then
+      echo "Not everything was moved; see the messages above." >&2
       exit 1
     fi
-    echo "Now open the Claude app again."
+    if [ "$holding" -eq 0 ]; then
+      echo "No session list was found to move." >&2
+      exit 1
+    fi
+    if [ "$moves" -eq 0 ]; then
+      echo "The session list is already with the account the app is logged in"
+      echo "as.  After a switch, open the app once so it creates its directory,"
+      echo "then quit the app and rerun this."
+    else
+      echo "Recorded $email as the account holding the list."
+      echo "Now open the Claude app again."
+    fi
+    ;;
+
+  recover)
+    [ -f "$STATE" ] || { echo "No recorded account; run 'record' first." >&2; exit 1; }
+    read -r old_acct old_org old_email < "$STATE"
+    pair="$(live_pair)" || exit 1
+    read -r acct org <<< "$pair"
+    dir="$SUPPORT/claude-code-sessions/$acct/$org"
+    if [ "$acct $org" != "$old_acct $old_org" ] || [ -L "$dir" ] || [ ! -d "$dir" ] ||
+       [ -n "$(links claude-code-sessions)" ]; then
+      echo "The session list is not in place with the account the app is logged" >&2
+      echo "in as.  Quit the app and run 'move' first." >&2
+      exit 1
+    fi
+    if [ "${2-}" = "--apply" ] && app_is_running; then
+      echo "The Claude app is running.  Quit it completely first: it would" >&2
+      echo "write its own copies of these sessions over the recovered ones." >&2
+      exit 1
+    fi
+    python3 "$(dirname "$0")/recover-sessions.py" "$dir" ${2+"$2"}
     ;;
 
   *)
-    echo "usage: $0 status|record|link" >&2
+    echo "usage: $0 status|record|move|recover [--apply|--verify]" >&2
     exit 1
     ;;
 esac
