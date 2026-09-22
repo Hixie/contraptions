@@ -13,6 +13,7 @@ The first time you switch:
 3. Quit the app completely (⌘Q).
 4. Run `./account-switch.sh move`.
 5. Open the app.
+6. File any sessions `move` lists into sidebar groups, or ask Claude to.
 
 Every time after that, to any account:
 
@@ -21,6 +22,7 @@ Every time after that, to any account:
 2. Quit the app completely (⌘Q).
 3. Run `./account-switch.sh move`.
 4. Open the app.
+5. File any sessions `move` lists into sidebar groups, or ask Claude to.
 
 If you ever switched with the old `link` command, do this once first:
 
@@ -100,6 +102,7 @@ were intact.  `recover`, described below, rebuilds the lost entries.
 ./account-switch.sh status    # who is recorded, who is signed in
 ./account-switch.sh record    # once, signed in as the account holding the list
 ./account-switch.sh move      # after each switch to another account
+./account-switch.sh groups    # what each account has filed in sidebar groups
 ```
 
 The whole procedure:
@@ -210,8 +213,9 @@ directories can be removed by hand.
 
 If the signed-in account's directory turns out not to be empty after the
 moves, `move` says so and leaves it alone rather than replacing it.  When
-nothing at all could be moved, `move` says so and exits with a failure
-status rather than telling you to reopen the app.
+anything could not be moved, `move` says so, exits with a failure status,
+and leaves the recorded account as it was, so running `move` again
+carries on where it stopped.
 
 `move` also undoes the layout the earlier version of this script left
 behind.  That version made symbolic links from other accounts'
@@ -220,11 +224,54 @@ removes every one it finds, in any account's directory, before anything
 else.  It does so even when the list is already with the signed-in
 account.  If the recorded directory is itself such a link, `move` carries
 the directory the link leads to.  A link at the signed-in account's
-directory that leads anywhere else is left alone, and `move` reports it
-and fails.  `status` lists every link it finds.
+directory that leads anywhere else is left alone: `move` checks for one
+in both trees before changing anything, and stops if it finds one.
+`status` lists every link it finds.
 
 `test-move.sh` runs `move` through these cases in a scratch home
 directory, with the check for a running app stubbed out.
+
+## Sidebar groups
+
+The Code tab's sidebar groups are not in the session directory, so `move`
+does not carry them.  The claude.ai page that draws the sidebar keeps
+them in its own local storage, under the key `dframe-store`, as a map
+from `<account>/<org>` to that account's groups and the sessions filed
+in each.  So each account keeps its own groups.  Switching back to an
+account brings its groups back, with the sessions it had filed in them,
+because sessions are filed by identifier and the identifiers do not
+change when the list moves.
+
+The page also keeps a record of which session is filed in which group,
+and the app copies that record into its `claude_desktop_config.json`,
+under `preferences.epitaxyPrefs["dframe-group-scopes"]`.  A group with
+nothing filed in it is not in that record.
+
+`groups` reads that record, changing nothing, and lists what each
+account has filed in groups.  If the record cannot be read, or is not in
+the form expected, it says so and fails.  A config with no record at all
+is taken to mean that nothing has been filed in a group on this machine.
+
+After moving the list, `move` lists the sessions the previous account had
+filed in groups that the signed-in account has not filed the same way,
+leaving out sessions that no longer exist.  If it cannot read the record,
+it says so and still succeeds, because the list has already moved.
+
+A script cannot file sessions in groups.  The tools that create groups
+and file sessions in them belong to the running app, which gives them
+only to the Claude sessions it hosts, and `move` runs while the app is
+quit.  So file the listed sessions in the sidebar yourself, making any
+group that is missing, or ask Claude in a Code session in the app to do
+it.  Those tools file Code sessions; any other kind of item in the list
+has to be filed by hand.  In the default permission mode, Claude asks
+before moving each session.
+
+`move` does not copy groups between accounts.  The page syncs
+`dframe-store` to the account's settings on claude.ai, and merges the
+server's copy back into it, so groups written into local storage from
+outside could be replaced.  Writing to that storage, a LevelDB database,
+from outside also risks the app treating it as corrupt and discarding
+all of it, including drafts and settings.
 
 ## Recovering sessions the app failed to save
 
@@ -367,7 +414,25 @@ Verified on a real switch between two accounts:
   `move` forgotten, and the links the earlier version left, including a
   recorded directory that is itself a link and a link at another account
   while the list is already in place.  It checks that a link to an
-  unrelated directory is left alone.
+  unrelated directory is left alone, that a link found in one tree stops
+  the move before anything changes and that a rerun then completes, and
+  that `move` lists only the group filings the signed-in account lacks,
+  naming the account the list came from.
+- Where sidebar groups are kept.  On the machine this was written for,
+  the groups the app's own sidebar tools reported for each account
+  matched `dframe-store` in local storage.  The filings, and not the
+  empty groups, matched the record in `claude_desktop_config.json`,
+  which included a group created an hour before.  The first account's
+  group was still there after switching to the second and back.  That
+  the page syncs `dframe-store` with claude.ai and merges the server's
+  copy is from reading the page's code, not from observation.
+- Claude recreated the second account's one group in the first account
+  with its sidebar tools, and `groups` then showed the filing in both.
+  `test-groups.py` checks `groups` on made-up records: the order within
+  a group, titles taken from the session directory rather than a backup
+  of it, items that are not Code sessions, empty groups left out, only
+  missing filings listed after a switch, and records it cannot read or
+  does not recognize.
 - `move` and then `recover --apply` on the machine where the failure
   happened.  `move` removed the two links, and `recover` wrote the 81
   missing sessions and updated 23.  On relaunch the app loaded all 1163

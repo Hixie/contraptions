@@ -24,7 +24,12 @@
 #   ./account-switch.sh status    # which account is recorded, which is live
 #   ./account-switch.sh record    # once, logged in as the account with the list
 #   ./account-switch.sh move      # after each switch to another account
+#   ./account-switch.sh groups    # each account's sidebar groups
 #   ./account-switch.sh recover [--apply|--verify]
+#
+# Sidebar groups are kept per account by the app and on claude.ai, not in the
+# session directory, so "move" does not carry them; it lists the sessions the
+# previous account had filed in groups, so they can be filed again in the app.
 #
 # The account this script acts on comes from the app's own config.json, in the
 # key "lastKnownAccountUuid", together with the <account>/<org> directory the
@@ -226,11 +231,31 @@ case "${1-}" in
     email="$(cached_email "$acct")"
     echo "From: $old_email ($old_acct)"
     echo "To:   $email ($acct)"
-    holding=0 moves=0 failed=0
+    # The account the list comes from, for listing its sidebar groups: the
+    # recorded one, unless the recorded directory is a link to another.
+    holding=0 moves=0 failed=0 from="$old_acct/$old_org"
+    # A symbolic link at the signed-in account's directory that leads anywhere
+    # but the list cannot be replaced.  Every tree is checked before any is
+    # changed, so that a switch is not left half done.
+    for d in "${DIRS[@]}"; do
+      to="$SUPPORT/$d/$acct/$org"
+      list="$(cd "$SUPPORT/$d/$old_acct/$old_org" 2>/dev/null && pwd -P)"
+      if [ -L "$to" ] && { [ -z "$list" ] || [ "$(cd "$to" 2>/dev/null && pwd -P)" != "$list" ]; }; then
+        echo "  $d: $to is a symlink that does not lead to the list" >&2
+        failed=1
+      fi
+    done
+    if [ "$failed" -ne 0 ]; then
+      echo "Nothing was moved.  Remove the link, then rerun this." >&2
+      exit 1
+    fi
     for d in "${DIRS[@]}"; do
       to="$SUPPORT/$d/$acct/$org"
       # The list is wherever the recorded directory leads.
       list="$(cd "$SUPPORT/$d/$old_acct/$old_org" 2>/dev/null && pwd -P)"
+      if [ "$d" = claude-code-sessions ] && [ -n "$list" ]; then
+        from="$(basename "$(dirname "$list")")/$(basename "$list")"
+      fi
       # A symbolic link to the list, made by an earlier version of this
       # script, holds no data, and the app cannot save through it.
       while IFS=$'\t' read -r link target; do
@@ -238,11 +263,6 @@ case "${1-}" in
           rm "$link" && echo "  $d: removed the symlink at $link"
         fi
       done < <(links "$d")
-      if [ -L "$to" ]; then
-        echo "  $d: $to is a symlink that does not lead to the list; leaving it alone" >&2
-        failed=1
-        continue
-      fi
       if [ -z "$list" ]; then
         echo "  $d: nothing recorded, skipping"
         continue
@@ -282,25 +302,41 @@ case "${1-}" in
       echo "  $d: moved"
       holding=$((holding + 1)) moves=$((moves + 1))
     done
-    if [ "$holding" -gt 0 ]; then
-      printf '%s %s %s\n' "$acct" "$org" "$email" > "$STATE"
-    fi
     if [ "$failed" -ne 0 ]; then
-      echo "Not everything was moved; see the messages above." >&2
+      echo "Not everything was moved; see the messages above.  The recorded" >&2
+      echo "account is unchanged, so rerunning this carries on from here." >&2
       exit 1
     fi
     if [ "$holding" -eq 0 ]; then
       echo "No session list was found to move." >&2
       exit 1
     fi
+    printf '%s %s %s\n' "$acct" "$org" "$email" > "$STATE"
     if [ "$moves" -eq 0 ]; then
       echo "The session list is already with the account the app is logged in"
       echo "as.  After a switch, open the app once so it creates its directory,"
       echo "then quit the app and rerun this."
     else
       echo "Recorded $email as the account holding the list."
+      who="${from%%/*}"
+      if [ "$from" = "$old_acct/$old_org" ] && [ "$old_email" != unknown ]; then
+        who="$old_email"
+      fi
+      if ! groups="$(python3 "$(dirname "$0")/sidebar-groups.py" "$SUPPORT" "$from" "$acct/$org")"; then
+        echo "Could not list the sidebar groups $who had; see the message above."
+      elif [ -n "$groups" ]; then
+        echo
+        echo "Sidebar groups stay with each account.  $who had filed these sessions"
+        echo "in groups, and this account has not:"
+        sed 's/^/  /' <<< "$groups"
+        echo "File them in the app, making any group that is missing, or ask Claude to."
+      fi
       echo "Now open the Claude app again."
     fi
+    ;;
+
+  groups)
+    python3 "$(dirname "$0")/sidebar-groups.py" "$SUPPORT"
     ;;
 
   recover)
@@ -324,7 +360,7 @@ case "${1-}" in
     ;;
 
   *)
-    echo "usage: $0 status|record|move|recover [--apply|--verify]" >&2
+    echo "usage: $0 status|record|move|groups|recover [--apply|--verify]" >&2
     exit 1
     ;;
 esac
