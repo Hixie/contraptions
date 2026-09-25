@@ -11,6 +11,13 @@ def has_usage(usage):
                for value in usage.values())
 
 
+def request_key(line, path, line_number):
+    key = (line.get('message') or {}).get('id')
+    if not key or key == '<synthetic>':
+        key = line.get('uuid') or f'{path}:{line_number}'
+    return key
+
+
 def read(projects, desktop, start, end, asof, title_sources):
     PROJECTS, DESKTOP, START, END, ASOF = projects, desktop, start, end, asof
     metadata = {}
@@ -105,9 +112,7 @@ def read(projects, desktop, start, end, asof, title_sources):
                         user_events[uid] = event
             if typ != 'assistant' or not ts:
                 continue
-            key = m.get('id')
-            if not key or key == '<synthetic>':
-                key = x.get('uuid') or f'{path}:{line_number}'
+            key = request_key(x, path, line_number)
             model = m.get('model') or '<unknown>'
             cli_models[model] += 1
             r = requests.setdefault(key, {
@@ -115,7 +120,7 @@ def read(projects, desktop, start, end, asof, title_sources):
                 'model': model, 'usage': {}, 'owners': set(), 'tail': '',
                 'tail_ts': 0, 'stop': None, 'blocks': set(), 'agent': agent,
             })
-            r['owners'].add((sid, agent or '', raw_sid))
+            r['owners'].add((sid, agent or '', raw_sid, path_index))
             r['ts'] = min(r['ts'], ts)
             r['end'] = max(r['end'], ts)
             r['blocks'].add(x.get('uuid') or (path_index, line_number))
@@ -145,11 +150,12 @@ def read(projects, desktop, start, end, asof, title_sources):
             created(o[0]) > r['ts'] + 2,
             created(o[0]) or r['ts'],
             o[0] != o[2],
-            o[0], o[1],
+            o[0], o[1], o[3],
         ))
-        sid, agent, raw = owners[0]
+        sid, agent, raw, source = owners[0]
         r['sid'] = sid
         r['agent'] = agent or None
+        r['source'] = str(paths[source])
         r['block_count'] = len(r.pop('blocks'))
         r['footer'] = footer(r['tail']) if r['stop'] in ['end_turn', 'stop_sequence'] else None
         if len({o[0] for o in owners}) > 1:
@@ -290,6 +296,7 @@ def read(projects, desktop, start, end, asof, title_sources):
         normalized.append({'response_id': r['id'], 'session_id': r['sid'],
             'timestamp': r['end'], 'model': r['model'], 'usage': r['usage'],
             'footer': state, 'footer_source': source, 'subagent': bool(r['agent']),
+            'source': r['source'],
             'turn_id': str(request_turn[r['id']]), 'tier': r['usage'].get('speed', 'default')})
     active = {sid for sid, times in activity.items() if any(START <= t < END for t in times)}
     active |= {sid for sid, meta in metadata.items() if START <= stamp(meta.get('lastActivityAt')) < END}

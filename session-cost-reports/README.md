@@ -27,7 +27,11 @@ directory named for its window's closing time, containing:
 - `sessions.csv`: session totals, percentages, and cost and percentage columns
   for each footer emoji.
 - `report.json`: session data, title provenance, totals, and reset evidence.
-- `requests.jsonl`: the individual usage records behind the totals.
+- `requests.jsonl`: the individual usage records behind the totals, each with
+  the path of the transcript it came from.
+- `breakdown.csv` (Claude only): the cost attributed to each kind of context
+  content and each kind of action, described under
+  [Where the cost went](#where-the-cost-went).
 
 `reports/latest.json` points to the reports produced by the latest invocation
 and identifies each as `last`, `current`, or `custom`. It also records any
@@ -187,6 +191,72 @@ events. When source information is missing, the report labels an inferred choice
 rather than claiming verified user authorship. Original assigned or fork titles
 are retained when the requested history cannot be recovered.
 
+## Where the cost went
+
+Claude reports include a section that attributes cost to what each request
+carried and what it did. It is useful for finding recurring overhead, such as
+instruction files that every session loads or reads, tool calls that
+instructions require on every turn, and repeated failures.
+
+Every request sends the whole conversation so far, so content added early is
+paid for again by every later request until the conversation is compacted.
+The **context** view divides each request's input cost among the content in
+that request's context:
+
+- Recorded cache reads cover the beginning of the context, cache writes cover
+  what follows, and uncached input covers the end. Each block is charged the
+  rate of the part that covered it.
+- The increase in recorded input between consecutive requests is the number of
+  tokens added between them. That increase is divided among the added blocks in
+  proportion to their length. The first request's input is divided between the
+  recorded system prompt, the blocks before it, and a remainder for the tool
+  definitions. Current Claude Code versions record the tool definitions only
+  after the first request; when they do, the system prompt and the remainder
+  are divided again in proportion to the recorded sizes.
+- Thinking blocks show little or no text in transcripts. Their size is the
+  request's recorded thinking tokens or, in transcripts without that count, its
+  output tokens minus the other output. Local transcripts show that the next
+  request's input grows by the full output, thinking included.
+- Lines that Claude Code writes to a transcript again are counted once.
+- Transcripts are read a second time for this section. Claude Code moves a
+  transcript to another project directory when its session's working directory
+  changes; a moved transcript is found in its new directory. The cost of a
+  transcript that disappears during the run is shown as "Transcript removed
+  during the run".
+- A recorded compaction starts a new context. If the context shrinks without
+  one, the blocks are scaled down proportionally.
+- Attachments count only when the transcript records that they were rendered
+  to the model. Transcripts from Claude Code versions that do not record this
+  count every attachment except the prompt snapshot and deferred tool records.
+
+Categories include instruction files (automatically loaded `CLAUDE.md` and
+similar files, skill bodies, and Markdown files in the Claude configuration
+directory or named `CLAUDE.md`, `AGENTS.md`, or `SKILL.md` that the Read tool
+or a command such as `cat`, `sed`, or `head` printed), tool results and tool
+calls by tool and file or command name, failed tool calls by tool and exit code
+or first line, thinking, attachments by type, and the system prompt and tool
+definitions. The context view sums to the report's input cost.
+
+The **actions** view assigns each request's whole cost, output included, to
+the tool calls it made, divided equally among them. A request that follows a
+failed tool call is assigned to that failure instead, so the cost of recovering
+from each kind of failure is visible. Requests that made no tool call are
+replies. The actions view sums to the report total. For each action, it also
+counts the requests that took it and the requests that took no other action,
+with the full cost of the latter. Those requests were made only for that
+action; the others also made other tool calls.
+
+Many repositories are checked out several times in parallel, so the same file
+appears under several paths. `--normalize-parallel-worktrees` replaces each path
+component of one or two digits or capital letters, such as `/B0/`, and each such
+dotted suffix, such as the `.Z` of `labs.Z/`, with `/.../` in the breakdown's
+labels. `~/dev/labs.Z/AGENTS.md` and `~/dev/labs.B0/AGENTS.md` then share the
+label `~/dev/labs/.../AGENTS.md`.
+
+Both views show each item's share of the report total and the number of
+sessions that incurred it. The HTML shows the largest items in each category;
+`breakdown.csv` lists all of them. Codex reports do not include this section.
+
 ## Verification
 
 ```sh
@@ -196,4 +266,5 @@ python3 -m unittest -v
 The tests cover current and completed windows, reset boundaries and deadline
 jitter, fractional timestamps, percentage denominators and empty reports,
 pricing, streaming/fork deduplication, older Codex records, title provenance,
-resumed subagents, footer parsing, malformed files, and report escaping.
+resumed subagents, footer parsing, malformed files, report escaping, and the
+attribution of cost to context content and actions.

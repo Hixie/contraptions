@@ -159,6 +159,46 @@
   a {
     color: var(--one);
   }
+  h2 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 28px 0 6px;
+  }
+  h3 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 20px 0 6px;
+  }
+  .table-scroll {
+    overflow-x: auto;
+  }
+  .items {
+    width: 100%;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+  }
+  .items th {
+    font-weight: 600;
+    color: var(--muted);
+    font-size: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .items th, .items td {
+    padding: 3px 0 3px 16px;
+    text-align: right;
+    white-space: nowrap;
+    vertical-align: baseline;
+  }
+  .items th:first-child, .items td:first-child {
+    padding-left: 0;
+    text-align: left;
+    white-space: normal;
+  }
+  .item-label {
+    overflow-wrap: anywhere;
+    font-family: ui-monospace,monospace;
+    font-size: 12px;
+  }
   footer {
     margin-top: 24px;
     border-top: 1px solid var(--line);
@@ -180,9 +220,26 @@
     aria-label="Footer emoji totals and percentages of total priced usage"></div>
   <div id="axis" class="axis" aria-label="API-equivalent dollars"></div>
   <main id="sessions" aria-label="Sessions ordered by cost"></main>
+  <section id="breakdown" hidden>
+    <h2>Where the cost went</h2>
+    <p class="muted">Every request sends the whole conversation so far. The
+      first view divides the input cost of each request among the content it
+      carried, at the rate that request paid for each part: cache reads, cache
+      writes, or uncached input. Token counts for individual blocks are
+      estimated from their length and scaled to match the recorded totals. The
+      second view assigns the whole cost of each request, output included, to
+      the tool calls it made, divided equally among them; a request that
+      follows a failed tool call is assigned to that failure instead. For
+      each action, the last columns count the requests that made no other
+      tool call, and give their full cost.</p>
+    <h3 id="context-heading"></h3>
+    <div id="context"></div>
+    <h3 id="actions-heading"></h3>
+    <div id="actions"></div>
+  </section>
   <footer>
     <p id="notes"></p>
-    <p><a href="sessions.csv">CSV</a> · <a href="report.json">Report data and reset evidence</a> · <a href="requests.jsonl">Request ledger</a></p>
+    <p><a href="sessions.csv">CSV</a> · <a href="report.json">Report data and reset evidence</a> · <a href="requests.jsonl">Request ledger</a><span id="breakdown-link" hidden> · <a href="breakdown.csv">Cost breakdown</a></span></p>
     <p id="pricing" class="muted"></p>
     <p id="conventions" class="muted"></p>
   </footer>
@@ -350,6 +407,14 @@
           percent(s.subagent_percent_of_session)
         } of session`,
       );
+      if (s.breakdown && s.window) {
+        Object.entries(s.breakdown.context).slice(0, 5).forEach(([k, v]) =>
+          row(
+            `Context: ${k}`,
+            `${money(v)} · ${percent(v / s.window * 100)} of session`,
+          )
+        );
+      }
       row("Priced requests", number(s.requests));
       if (s.unpriced_requests) {
         row("Unpriced requests", number(s.unpriced_requests));
@@ -370,6 +435,96 @@
       details.append(info);
       document.getElementById("sessions").append(details);
     });
+    const breakdown = report.summary.breakdown;
+    if (breakdown) {
+      const lenses = {
+        context: "Context carried by each request",
+        actions: "What each request did",
+      };
+      Object.entries(lenses).forEach(([lens, heading]) => {
+        const data = breakdown[lens];
+        document.getElementById(`${lens}-heading`).textContent =
+          `${heading}: ${money(data.total)} (${
+            percent(data.percent_of_total)
+          } of total)`;
+        const scale = Math.max(
+          1e-9,
+          ...data.categories.map((c) => c.percent_of_total ?? 0),
+        );
+        data.categories.forEach((c) => {
+          const details = create("details");
+          const summary = create("summary");
+          const label = create("div", undefined, "label");
+          const amount = create("span", undefined, "total");
+          amount.append(
+            create("span", money(c.cost)),
+            create("span", `${percent(c.percent_of_total)} of total`, "share"),
+          );
+          label.append(
+            create(
+              "span",
+              `${c.category} · ${number(c.sessions)} sessions`,
+              "title",
+            ),
+            amount,
+          );
+          const space = create("div", undefined, "bar-space");
+          const bar = create("div", undefined, "bar");
+          bar.style.width = `${(c.percent_of_total ?? 0) / scale * 100}%`;
+          bar.style.backgroundColor = "var(--one)";
+          bar.setAttribute("aria-hidden", "true");
+          space.append(bar);
+          summary.append(label, space);
+          details.append(summary);
+          const info = create("div", undefined, "detail");
+          const columns = [
+            ["Cost", (item) => money(item.cost)],
+            ["Share", (item) => percent(item.percent_of_total)],
+            ["Sessions", (item) => number(item.sessions)],
+          ];
+          if (lens === "actions") {
+            columns.push(
+              ["Requests", (item) => number(item.requests)],
+              [
+                "Did nothing else",
+                (item) =>
+                  `${number(item.sole_requests)} (${
+                    percent(item.sole_requests / item.requests * 100)
+                  })`,
+              ],
+              ["Their cost", (item) => money(item.sole_cost)],
+            );
+          }
+          const scroller = create("div", undefined, "table-scroll");
+          const table = create("table", undefined, "items");
+          const head = create("tr");
+          head.append(create("th", lens === "actions" ? "Action" : "Content"));
+          columns.forEach(([name]) => head.append(create("th", name)));
+          table.append(head);
+          c.items.slice(0, 40).forEach((item) => {
+            const r = create("tr");
+            r.append(create("td", item.label, "item-label"));
+            columns.forEach(([, value]) => r.append(create("td", value(item))));
+            table.append(r);
+          });
+          scroller.append(table);
+          info.append(scroller);
+          if (c.items.length > 40) {
+            info.append(
+              create(
+                "p",
+                `${number(c.items.length - 40)} smaller items are in breakdown.csv.`,
+                "muted",
+              ),
+            );
+          }
+          details.append(info);
+          document.getElementById(lens).append(details);
+        });
+      });
+      document.getElementById("breakdown").hidden = false;
+      document.getElementById("breakdown-link").hidden = false;
+    }
     document.getElementById("notes").textContent =
       `Open a session for its breakdown. ${report.summary.unpriced_requests} requests have no verified model price and are excluded from dollar totals and percentage denominators. Shares of total refer to this service and report window. Footer breakdowns show shares of each session. These API-equivalent estimates are not invoices or quota percentages.`;
     const pricing = document.getElementById("pricing");

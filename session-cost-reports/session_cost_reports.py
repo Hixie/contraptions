@@ -9,6 +9,7 @@ import sys
 import sqlite3
 from zoneinfo import ZoneInfo
 
+import claude_context
 import claude_reader
 import codex_reader
 from reporting import (aggregate, claude_logs, compact_quotas, iso,
@@ -45,6 +46,9 @@ def main(argv=None):
     parser.add_argument('--as-of', help='ISO timestamp; defaults to now')
     parser.add_argument('--codex-window', nargs=2, metavar=('START', 'END'), help='Explicit ISO bounds when reset records are unavailable')
     parser.add_argument('--claude-window', nargs=2, metavar=('START', 'END'), help='Explicit ISO bounds when reset records are unavailable')
+    parser.add_argument('--normalize-parallel-worktrees', action='store_true',
+                        help='In Claude cost breakdowns, replace path components that name parallel checkouts, '
+                             'such as /B0/ or the .Z of labs.Z/, with /.../')
     parser.add_argument('--rates', type=Path, default=Path(__file__).with_name('rates.json'), help='Versioned USD-per-million-token price catalog')
     args = parser.parse_args(argv)
     if args.window and (args.claude_window or args.codex_window):
@@ -93,7 +97,11 @@ def main(argv=None):
                         records, names, diagnostics = claude_reader.read(root.expanduser() / 'projects',
                             home / 'Library/Application Support/Claude/claude-code-sessions',
                             window['start'], window['end'], asof, titles)
-                    report = aggregate(service, records, names, window, catalog, diagnostics)
+                    breakdown = None
+                    if service == 'claude':
+                        breakdown = claude_context.attribute(records, catalog, home, root,
+                                                             args.normalize_parallel_worktrees)
+                    report = aggregate(service, records, names, window, catalog, diagnostics, breakdown)
                     directory = save_report(output, report, records, zone)
                     summary = report['summary']
                     reports.append({'service': service, 'window': selection, 'path': str(directory), 'total': summary['window_total']})

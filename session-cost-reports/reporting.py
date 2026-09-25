@@ -296,23 +296,20 @@ def codex_titles(active, index, filemeta, metadata, calls, first_turn):
     return names
 
 
-def price(service, record, catalog):
-    model, usage = record['model'], record['usage']
+def model_rates(service, model, catalog):
     models = catalog['services'][service]['models']
     rates = models.get(model)
+    if rates is not None and 'alias' in rates:
+        rates = models[rates['alias']]
+    return rates
+
+
+def claude_unit_prices(record, catalog):
+    """USD per token for each part of a Claude request, or None if unpriced."""
+    rates = model_rates('claude', record['model'], catalog)
     if rates is None:
         return None
-    if 'alias' in rates:
-        rates = models[rates['alias']]
-    if service == 'codex':
-        i, cached, write, out = [usage.get(k, 0) or 0 for k in ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens')]
-        if i < cached + write:
-            raise ValueError(f"{record['response_id']}: cached input exceeds total input")
-        long = bool(rates.get('long_context_threshold') and i > rates['long_context_threshold'])
-        value = ((i - cached - write) * rates['input'] + cached * rates['cached'] + write * rates['write']) * (2 if long else 1)
-        value += out * rates['output'] * (1.5 if long else 1)
-        multiplier = rates.get('fast_multiplier', 2) if record.get('tier') in ('priority', 'fast') else .5 if record.get('tier') in ('batch', 'flex') else 1
-        return value / 1e6 * multiplier
+    usage = record['usage']
     creation = usage.get('cache_creation_input_tokens', 0) or 0
     cache = usage.get('cache_creation') or {}
     one = cache.get('ephemeral_1h_input_tokens', 0) or 0
@@ -321,14 +318,38 @@ def price(service, record, catalog):
         five = creation
     elif one + five != creation:
         raise ValueError(f"{record['response_id']}: inconsistent Claude cache token counts")
-    value = sum((usage.get(k, 0) or 0) * rates[p] for k, p in (('input_tokens', 'input'), ('output_tokens', 'output'), ('cache_read_input_tokens', 'cached')))
-    value += five * rates['write_5m'] + one * rates['write_1h']
+    write = (five * rates['write_5m'] + one * rates['write_1h']) / (five + one) if five + one else rates['write_5m']
     multiplier = rates.get('fast_multiplier', 2) if usage.get('speed') == 'fast' else 1
     multiplier *= 1.1 if usage.get('inference_geo') == 'us' else 1
-    return value / 1e6 * multiplier + ((usage.get('server_tool_use') or {}).get('web_search_requests') or 0) * .01
+    return {'input': rates['input'] * multiplier / 1e6, 'read': rates['cached'] * multiplier / 1e6,
+            'write': write * multiplier / 1e6, 'output': rates['output'] * multiplier / 1e6}
 
 
-def aggregate(service, records, names, window, catalog, diagnostics):
+def price(service, record, catalog):
+    if service == 'claude':
+        unit = claude_unit_prices(record, catalog)
+        if unit is None:
+            return None
+        usage = record['usage']
+        value = sum((usage.get(k, 0) or 0) * unit[p] for k, p in (
+            ('input_tokens', 'input'), ('cache_read_input_tokens', 'read'),
+            ('cache_creation_input_tokens', 'write'), ('output_tokens', 'output')))
+        return value + ((usage.get('server_tool_use') or {}).get('web_search_requests') or 0) * .01
+    rates = model_rates(service, record['model'], catalog)
+    if rates is None:
+        return None
+    usage = record['usage']
+    i, cached, write, out = [usage.get(k, 0) or 0 for k in ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens')]
+    if i < cached + write:
+        raise ValueError(f"{record['response_id']}: cached input exceeds total input")
+    long = bool(rates.get('long_context_threshold') and i > rates['long_context_threshold'])
+    value = ((i - cached - write) * rates['input'] + cached * rates['cached'] + write * rates['write']) * (2 if long else 1)
+    value += out * rates['output'] * (1.5 if long else 1)
+    multiplier = rates.get('fast_multiplier', 2) if record.get('tier') in ('priority', 'fast') else .5 if record.get('tier') in ('batch', 'flex') else 1
+    return value / 1e6 * multiplier
+
+
+def aggregate(service, records, names, window, catalog, diagnostics, breakdown=None):
     sessions = {sid: {'id': sid, 'title': title, 'title_rule': rule, 'window': 0,
                      'subagent_window': 0, 'segments': Counter(), 'models': Counter(),
                      'requests': 0, 'unpriced_requests': 0, 'unpriced_tokens': Counter()}
@@ -356,10 +377,13 @@ def aggregate(service, records, names, window, catalog, diagnostics):
     total = sum(s['window'] for s in ordered)
     subagents = sum(s['subagent_window'] for s in ordered)
     for s in ordered:
+        if breakdown:
+            parts = breakdown.get(s['id'], {})
+            s['breakdown'] = {lens: dict(rollup(parts.get(lens, {})).most_common()) for lens in LENSES}
         s['percent_of_total'] = percent(s['window'], total)
         s['subagent_percent_of_session'] = percent(s['subagent_window'], s['window'])
         s['segment_percent_of_session'] = {state: percent(value, s['window']) for state, value in s['segments'].items()}
-    return {'service': service, 'window': window, 'rates_checked': catalog['checked'],
+    report = {'service': service, 'window': window, 'rates_checked': catalog['checked'],
             'price_source': catalog['services'][service]['source'],
             'convention_source': CONVENTION_SOURCE, 'sessions': ordered,
             'summary': {'session_count': len(ordered), 'window_total': total,
@@ -369,6 +393,50 @@ def aggregate(service, records, names, window, catalog, diagnostics):
                         'priced_requests': sum(s['requests'] for s in ordered),
                         'unpriced_requests': sum(s['unpriced_requests'] for s in ordered),
                         'unpriced_models': unpriced_models, 'diagnostics': diagnostics}}
+    if breakdown:
+        report['summary']['breakdown'] = summarize_breakdown(breakdown, total)
+    return report
+
+
+LENSES = ('context', 'actions')
+# For each action: the requests that took it, those that took no other
+# action, and the cost of the latter.
+ACTION_DETAILS = ('requests', 'sole_requests', 'sole_cost')
+
+
+def rollup(costs):
+    categories = Counter()
+    for (category, _), value in costs.items():
+        categories[category] += value
+    return categories
+
+
+def summarize_breakdown(breakdown, total):
+    result = {}
+    for lens in LENSES:
+        costs, sessions, extra = Counter(), defaultdict(set), defaultdict(Counter)
+        for sid, parts in breakdown.items():
+            for key, value in parts[lens].items():
+                costs[key] += value
+                sessions[key].add(sid)
+            for name in ACTION_DETAILS if lens == 'actions' else ():
+                extra[name].update(parts[name])
+        categories = []
+        for category, value in rollup(costs).most_common():
+            keys = [k for k in costs if k[0] == category]
+            items = [{'label': k[1], 'cost': costs[k], 'percent_of_total': percent(costs[k], total),
+                      'sessions': len(sessions[k]), **{name: extra[name][k] for name in extra}}
+                     for k in sorted(keys, key=lambda k: (-costs[k], k[1]))]
+            categories.append({'category': category, 'cost': value, 'percent_of_total': percent(value, total),
+                               'sessions': len(set().union(*(sessions[k] for k in keys))), 'items': items})
+        lens_total = sum(costs.values())
+        result[lens] = {'total': lens_total, 'percent_of_total': percent(lens_total, total), 'categories': categories}
+    return result
+
+
+def spreadsheet_text(value):
+    # Prefix spreadsheet formulas while preserving text in JSON and HTML.
+    return "'" + value if value.lstrip().startswith(('=', '+', '-', '@')) else value
 
 
 def save_report(output, report, records, zone):
@@ -399,10 +467,19 @@ def save_report(output, report, records, zone):
             row.update({k: s['segments'].get(k, 0) for k in states})
             row.update({k + '_percent_of_session': percent(s['segments'].get(k, 0), s['window']) for k in states})
             row.update(unpriced_input_tokens=s['unpriced_tokens'].get('input_tokens', 0), unpriced_output_tokens=s['unpriced_tokens'].get('output_tokens', 0))
-            # Prefix spreadsheet formulas while preserving titles in JSON/HTML.
-            if row['title'].lstrip().startswith(('=', '+', '-', '@')):
-                row['title'] = "'" + row['title']
+            row['title'] = spreadsheet_text(row['title'])
             writer.writerow(row)
+    breakdown = report['summary'].get('breakdown')
+    if breakdown:
+        with (directory / 'breakdown.csv').open('w', newline='') as fp:
+            writer = csv.writer(fp)
+            writer.writerow(['lens', 'category', 'label', 'cost', 'percent_of_total', 'sessions', *ACTION_DETAILS])
+            for lens in LENSES:
+                for category in breakdown[lens]['categories']:
+                    for item in category['items']:
+                        writer.writerow([lens, spreadsheet_text(category['category']), spreadsheet_text(item['label']),
+                                         item['cost'], item['percent_of_total'], item['sessions'],
+                                         *(item.get(name, '') for name in ACTION_DETAILS)])
     template = Path(__file__).with_name('report.html').read_text()
     data = json.dumps(report, ensure_ascii=False, separators=(',', ':')).replace('<', '\\u003c')
     (directory / 'index.html').write_text(template.replace('REPORT_DATA', data))
