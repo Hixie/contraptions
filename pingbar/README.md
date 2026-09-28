@@ -32,10 +32,12 @@ warning. Its setting is remembered across launches.
 
 ## How it samples
 
-The app runs `/sbin/ping -n -c 1 -t 2 8.8.8.8`, one ping at a time, with a
-two second pause between the end of one ping and the start of the next. The
-two second deadline passed to ping is what defines a lost sample: if no reply
-arrives within it, the sample is recorded as lost and renders red. On a
+The app sends ICMP echo requests (pings) to 8.8.8.8 itself, one at a time,
+with a two second pause between the end of one ping and the start of the
+next. It uses the unprivileged ICMP socket that macOS offers to ordinary
+programs, the same mechanism `/sbin/ping` uses, rather than starting a `ping`
+process for each sample. A two second deadline defines a lost sample: if no
+reply arrives within it, the sample is recorded as lost and renders red. On a
 healthy connection this means a new sample roughly every two seconds, so the
 grid covers about the last twenty seconds; when the network is down each
 sample takes the full deadline, so the grid covers about the last
