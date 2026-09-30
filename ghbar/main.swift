@@ -1794,7 +1794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsWindow: SettingsWindowController?
     private var latest: MonitorState = .unconfigured
     private var dynamicSignature: String?
-    private let banner = BannerWindowController()
+    private let flyby = FlybyController()
     private var lastHealth: Health?
     private var lastFailure: String?
     private let demonstratesBanner: Bool
@@ -1912,7 +1912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    action: #selector(newIndicator(_:)), keyEquivalent: "n")
         newItem.target = self
         newItem.keyEquivalentModifierMask = [.command]
-        // The banner is behind Option, since waiting for a branch to break is
+        // The flyby is behind Option, since waiting for a branch to break is
         // no way to show anybody what it looks like. It is an alternate of the
         // item above rather than an item that is hidden and unhidden: AppKit
         // swaps alternates as the modifier is pressed and released, whereas
@@ -1920,12 +1920,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the menu is asked for its contents. An alternate has to follow its
         // twin immediately and carry the same key equivalent, differing only
         // in the modifiers, which also gives it Command-Option-N.
-        bannerItem = menu.addItem(withTitle: "Drop the Banner",
+        bannerItem = menu.addItem(withTitle: "Fly the Banner",
                                   action: #selector(dropBanner(_:)), keyEquivalent: "n")
         bannerItem.target = self
         bannerItem.keyEquivalentModifierMask = [.command, .option]
         bannerItem.isAlternate = true
-        bannerItem.toolTip = "Hang the banner now: the failure the branch is carrying if it has one, and an invented one if it does not."
+        bannerItem.toolTip = "Send the plane and its banner round now, whatever state the branch is in."
 
         menu.addItem(.separator())
         footerItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
@@ -1958,8 +1958,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Drops the banner when the branch turns red, and again if it is still
-    /// red but has broken in a new way. Nothing is dropped for the first
+    /// Flies the banner when the branch turns red, and again if it is still
+    /// red but has broken in a new way. Nothing is flown for the first
     /// answer GitHub gives: a branch that was already red when the indicator
     /// started has not just turned, and a login should not fill the screen
     /// with banners for every indicator that comes back with it.
@@ -1973,42 +1973,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard status.health == .failing, let previous else { return }
         guard previous != .failing || signature != previousFailure else { return }
         guard !demonstratesBanner else { return }
-        // A bullet rather than a middot: the label is letterspaced far enough
-        // that a middot disappears into the gaps around it.
-        banner.show(bannerMessage(subject: "\(status.repository.slug) • \(status.branch)",
-                                  failing: failing,
-                                  unlisted: status.unreadableCheckCount),
-                    from: statusItem?.button)
+        flyby.show(bannerText, from: statusItem?.button)
     }
 
-    /// What the banner would say right now. A branch that is failing supplies
-    /// its own bad news; one that is not has some invented for it, which is
-    /// the only way to show the banner to anybody on demand.
-    private func currentBannerMessage() -> BannerMessage {
-        let subject = settings.repository.map { "\($0.slug) • \(settings.branch)" }
-            ?? "owner/repository · main"
-        if let status = shownStatus, status.health == .failing {
-            let failing = status.checks.filter { $0.state == .failing }.map(\.name).sorted()
-            return bannerMessage(subject: subject, failing: failing,
-                                 unlisted: status.unreadableCheckCount)
-        }
-        return bannerMessage(
-            subject: subject,
-            failing: ["Coverage Check", "Runner Tests (3/8)", "Deploy to Staging"],
-            unlisted: 0)
-    }
+    /// What the banner says: the name shown in the menu bar, and that it is
+    /// red. It is short because it goes by quickly.
+    private var bannerText: String { "\(settings.displayName) is red" }
 
     @objc private func dropBanner(_ sender: Any?) {
-        banner.show(currentBannerMessage(), from: statusItem?.button)
+        flyby.show(bannerText, from: statusItem?.button)
     }
 
-    /// Hangs a banner immediately so the effect can be looked at, then quits.
+    /// Flies the banner immediately so the effect can be looked at, then quits.
     private func demonstrateBanner() {
-        let message = currentBannerMessage()
         // A status item made a moment ago has not been placed in the bar yet,
-        // so the banner waits for the turn of the run loop in which it is.
+        // so the flight waits for the turn of the run loop in which it is.
         DispatchQueue.main.async { [weak self] in
-            self?.banner.show(message, from: self?.statusItem?.button) {
+            guard let self else { return }
+            self.flyby.show(self.bannerText, from: self.statusItem?.button) {
                 NSApp.terminate(nil)
             }
         }
@@ -2269,8 +2251,8 @@ usage: \(applicationName) [--instance N] [--repo OWNER/NAME] [--branch BRANCH]
   --once         report the branch on standard output and exit, without
                  touching the menu bar; exits 0 when the branch is passing,
                  1 when it is failing, and 2 otherwise
-  --banner       hang the red banner straight away and quit when it has
-                 rolled back up, to see what it looks like
+  --banner       fly the plane and its banner straight away and quit when
+                 it has landed, to see what it looks like
   --no-startup   leave the login item alone for this run
 """
 
