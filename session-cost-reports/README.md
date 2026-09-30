@@ -1,8 +1,10 @@
 # Session cost reports
 
-Generate Claude and Codex cost reports for the current weekly quota window, the
-last completed window, or both, using local reset history. The default is the
-last completed window.
+Generate Claude and Codex cost reports for the current effective quota window,
+the last completed window, or both, using local reset history. The default is
+the last completed window. With one account, an effective window is the
+account's weekly window. With more than one account, reset boundaries from all
+detected account windows divide time into non-overlapping effective windows.
 
 Run from the `session-cost-reports` directory:
 
@@ -76,6 +78,9 @@ python3 session_cost_reports.py --home /path/to/copied-home
 # Supply known bounds if local reset evidence is unavailable.
 python3 session_cost_reports.py --service claude \
   --claude-window 2001-07-01T10:00:00-07:00 2001-07-08T10:00:00-07:00
+
+# Inspect the windows without generating or changing any reports.
+python3 session_cost_reports.py --service claude --window both --print-windows
 ```
 
 Use `--help` for all options. `--codex-home` and `--claude-home` select app data
@@ -88,6 +93,14 @@ Combining the two forms is an error. With `--window both`, each requested window
 is handled independently. If one lacks reset evidence, the other report can
 still be generated. The command records the missing window in `latest.json` and
 exits with a nonzero status.
+
+`--print-windows` prints every detected quota window and the effective window
+selected from them. For Claude, it also prints the observed account-switching
+intervals. The latest observed account has an unknown end until another account
+appears in the logs, even when that account has not yet reported a weekly-limit
+deadline. With explicit bounds, the command prints the specified window. It does
+not generate reports, create the output directory, or update
+`reset-history.json` or `latest.json`.
 
 `--timezone` controls displayed dates and timestamps supplied without an offset.
 The default is the machine's local timezone. Claude Desktop's log timestamps are
@@ -107,8 +120,27 @@ window duration is recorded in whole minutes.
 Claude Desktop records a weekly reset deadline when it reports a weekly limit.
 The command reads those messages in `Library/Logs/Claude/main*.log`, including
 their named timezone, and infers the opening time seven days before the
-deadline. Claude CLI transcripts alone do not necessarily contain this reset
-evidence. Neither service's boundaries are assumed to be calendar weeks.
+deadline. Authentication entries in the same logs identify the account whose
+limit was reported. The command keeps the detected weekly windows for different
+accounts separate, including when two accounts have the same reset time.
+Claude CLI transcripts alone do not necessarily contain this reset evidence.
+Neither service's boundaries are assumed to be calendar weeks.
+
+Detected windows from two accounts can overlap when their reset days differ.
+The report divides their union at every detected reset boundary. Each resulting
+effective window is therefore an interval during which the set of active
+account windows does not change. The intervals do not overlap. `current`
+selects the effective interval containing the observation time, and `last`
+selects the most recent completed effective interval. A multiple-account
+effective window can be shorter than seven days. All Claude requests in the
+selected interval are included, regardless of which account paid for them.
+This matches switching accounts while retaining one local transcript history.
+
+An account contributes no quota window until a retained log reports its weekly
+limit. Until then, selection uses the quota evidence it has, while
+`--print-windows` still identifies the account and when its current observed
+activity began. Explicit `--claude-window` bounds remain available when the logs
+do not establish the desired interval.
 
 `--window last` selects the most recent completed window supported by retained
 evidence. `--window current` selects the recorded window containing the current
@@ -116,10 +148,11 @@ time, or `--as-of` when supplied. Its costs stop at that observation time. The
 future reset deadline is shown separately. `--window both` generates these two
 reports separately, with a separate percentage denominator for each report.
 
-The exact selected dates are printed and included in every report. If no window
-matches the requested selection, the command explains how to pass explicit
-`--claude-window` or `--codex-window` bounds. It does not manufacture reset
-dates from the current day. An old retained window can remain the latest
+The exact selected dates are printed and included in every report. The report's
+window data includes the account-specific windows used to derive them. If no
+window matches the requested selection, the command explains how to pass
+explicit `--claude-window` or `--codex-window` bounds. It does not manufacture
+reset dates from the current day. An old retained window can remain the latest
 completed one when newer reset evidence is missing. Expired evidence cannot
 establish a current window.
 

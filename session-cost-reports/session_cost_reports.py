@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate local Claude and Codex reports for current or completed quota windows."""
+"""Generate local Claude and Codex reports for effective quota windows."""
 import argparse
 from datetime import datetime, timezone
 import json
@@ -13,7 +13,7 @@ import claude_context
 import claude_reader
 import codex_reader
 from reporting import (aggregate, claude_logs, compact_quotas, iso,
-                       select_window, save_report, scan_codex)
+                       detected_windows, select_window, save_report, scan_codex)
 
 
 def local_zone():
@@ -32,11 +32,44 @@ def moment(value, zone):
     return parsed.timestamp()
 
 
+def print_detected(service, observations, account_activity, asof, zone):
+    if account_activity:
+        print(f'{service} observed account activity:')
+        for activity in account_activity:
+            account = activity['account'][:8]
+            start = iso(activity['start'], zone)
+            if activity['end'] is None:
+                print(f'  account {account} (current): {start}; end unknown')
+            else:
+                print(f"  account {account}: {start} to {iso(activity['end'], zone)}")
+    print(f'{service} detected quota windows:')
+    windows = detected_windows(observations, service, asof)
+    if not windows:
+        print('  none')
+    for window in windows:
+        kinds = ', '.join(sorted({item.get('kind', 'quota deadline') for item in window['evidence']}))
+        account = window.get('account')
+        label = kinds + (f', account {account[:8]}' if account else '')
+        print(f"  {label}: {iso(window['start'], zone)} to {iso(window['end'], zone)}")
+
+
+def print_window(service, selection, window, zone):
+    print(f'{service} {selection}:')
+    if selection == 'custom':
+        print(f"  specified: {iso(window['start'], zone)} to {iso(window['end'], zone)}")
+        return
+    print(f"  effective: {iso(window['start'], zone)} to {iso(window['end'], zone)}")
+    if selection == 'current':
+        print(f"  recorded reset: {iso(window['reset'], zone)}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--service', choices=('both', 'claude', 'codex'), default='both')
     parser.add_argument('--window', choices=('current', 'last', 'both'),
                         help='Quota window to report: current usage so far, last completed, or both (default: last)')
+    parser.add_argument('--print-windows', action='store_true',
+                        help='Print detected, effective, or specified windows without generating reports')
     parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parent / 'reports')
     parser.add_argument('--home', type=Path, help='Home directory containing local app data; overrides environment defaults')
     parser.add_argument('--codex-home', type=Path, help='Overrides HOME/.codex and CODEX_HOME')
@@ -57,29 +90,39 @@ def main(argv=None):
     zone = ZoneInfo(args.timezone) if args.timezone else local_zone()
     log_zone = ZoneInfo(args.claude_log_timezone) if args.claude_log_timezone else local_zone()
     asof = moment(args.as_of, zone) if args.as_of else datetime.now(timezone.utc).timestamp()
-    catalog = json.loads(args.rates.read_text())
+    catalog = None if args.print_windows else json.loads(args.rates.read_text())
     output = args.output.expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    if not args.print_windows:
+        output.mkdir(parents=True, exist_ok=True)
     state = output / 'reset-history.json'
-    observations = json.loads(state.read_text()) if state.exists() else []
     services = ('claude', 'codex') if args.service == 'both' else (args.service,)
+    needs_history = not args.print_windows or any(
+        getattr(args, service + '_window') is None for service in services)
+    observations = json.loads(state.read_text()) if needs_history and state.exists() else []
     reports, errors = [], []
     for service in services:
-        print(f'Reading {service} history...', flush=True)
         try:
-            if service == 'codex':
-                root = args.codex_home or (home / '.codex' if args.home else Path(os.environ.get('CODEX_HOME', str(home / '.codex'))))
-                data, fresh, index, calls = scan_codex(root.expanduser(), asof)
-            else:
-                root = args.claude_home or (home / '.claude' if args.home else Path(os.environ.get('CLAUDE_CONFIG_DIR', str(home / '.claude'))))
-                fresh, titles = claude_logs(home / 'Library/Logs/Claude', log_zone, asof)
-            scope = str(root.expanduser().resolve())
-            if service == 'claude':
-                scope += '|' + str(home.resolve())
-            for observation in fresh:
-                observation['scope'] = scope
-            observations = compact_quotas(observations + fresh)
             override = getattr(args, service + '_window')
+            account_activity = []
+            if args.print_windows and override:
+                fresh = []
+            else:
+                print(f'Reading {service} history...', flush=True)
+                if service == 'codex':
+                    root = args.codex_home or (home / '.codex' if args.home else Path(os.environ.get('CODEX_HOME', str(home / '.codex'))))
+                    data, fresh, index, calls = scan_codex(root.expanduser(), asof)
+                else:
+                    root = args.claude_home or (home / '.claude' if args.home else Path(os.environ.get('CLAUDE_CONFIG_DIR', str(home / '.claude'))))
+                    fresh, titles, account_activity = claude_logs(home / 'Library/Logs/Claude', log_zone, asof)
+                scope = str(root.expanduser().resolve())
+                if service == 'claude':
+                    scope += '|' + str(home.resolve())
+                for observation in fresh:
+                    observation['scope'] = scope
+                observations = compact_quotas(observations + fresh)
+            service_observations = [q for q in observations if q.get('scope') == scope] if not override else []
+            if args.print_windows and not override:
+                print_detected(service, service_observations, account_activity, asof, zone)
             selections = ('custom',) if override else ('last', 'current') if args.window == 'both' else (args.window or 'last',)
             for selection in selections:
                 try:
@@ -90,7 +133,10 @@ def main(argv=None):
                         window = {'start': start, 'end': end, 'selection': 'custom',
                                   'basis': 'explicit command-line bounds', 'evidence': []}
                     else:
-                        window = select_window([q for q in observations if q.get('scope') == scope], service, asof, selection)
+                        window = select_window(service_observations, service, asof, selection)
+                    if args.print_windows:
+                        print_window(service, selection, window, zone)
+                        continue
                     if service == 'codex':
                         records, names, diagnostics = codex_reader.read(data, window['start'], window['end'], index, calls)
                     else:
@@ -117,10 +163,13 @@ def main(argv=None):
                     errors.append(f'{service} {selection}: {error}')
                     print(errors[-1], file=sys.stderr)
             if service == 'codex':
-                del data
+                if not (args.print_windows and override):
+                    del data
         except (ValueError, OSError, KeyError, sqlite3.Error) as error:
             errors.append(f'{service}: {error}')
             print(errors[-1], file=sys.stderr)
+    if args.print_windows:
+        return 1 if errors else 0
     temp = state.with_suffix('.tmp')
     temp.write_text(json.dumps(observations, indent=2) + '\n')
     temp.replace(state)

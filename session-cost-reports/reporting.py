@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import ast
+import bisect
 import csv
 import json
 import re
@@ -74,46 +75,85 @@ def jsonlines(path):
 def compact_quotas(observations):
     by_reset = {}
     for q in observations:
-        key = (q.get('scope'), q['service'], q['reset'], q['duration'])
+        stream = q.get('kind') if q['service'] == 'codex' else None
+        key = (q.get('scope'), q['service'], q['reset'], q['duration'],
+               stream, q.get('account'))
         old = by_reset.get(key)
         if old is None or q['observed'] < old['observed']:
             by_reset[key] = q
     return sorted(by_reset.values(), key=lambda q: q['observed'])
 
 
-def select_window(observations, service, asof, selection='last'):
-    if selection not in ('last', 'current'):
-        raise ValueError(f'unknown window selection: {selection}')
-    groups = []
-    for q in compact_quotas(observations):
-        if q['service'] != service or q['observed'] > asof or q['reset'] <= q['observed']:
+def detected_windows(observations, service, asof):
+    records = [q for q in compact_quotas(observations)
+               if q['service'] == service and q['observed'] <= asof
+               and q['reset'] > q['observed']]
+    attributed = {(q.get('scope'), q['reset'], q['duration'])
+                  for q in records if q.get('account')}
+    account_groups = defaultdict(list)
+    for q in records:
+        # Retain legacy accountless observations in reset-history so an
+        # historical --as-of before account attribution remains reproducible.
+        if not q.get('account') and (q.get('scope'), q['reset'], q['duration']) in attributed:
             continue
         anchor = q['reset'] - q['duration']
         if anchor > q['observed']:
             continue
+        stream = q.get('kind') if service == 'codex' else None
+        groups = account_groups[(q.get('account'), stream)]
         # Minute-resolution window lengths produce small deadline variations.
         if not groups or anchor > max(groups[-1]['first_observed'], groups[-1]['start'] + 60):
             groups.append({'start': anchor, 'reset': q['reset'],
-                           'first_observed': q['observed'], 'evidence': [q]})
+                           'first_observed': q['observed'], 'evidence': [q],
+                           'account': q.get('account')})
         elif anchor >= groups[-1]['start'] - 60:
             # Keep the earliest opening anchor within the deadline cluster.
             groups[-1]['evidence'].append(q)
             groups[-1]['start'] = min(groups[-1]['start'], anchor)
             groups[-1]['reset'] = min(groups[-1]['reset'], q['reset'])
-    candidates = []
-    for i, group in enumerate(groups):
-        following = groups[i + 1]['start'] if i + 1 < len(groups) else float('inf')
-        end = min(group['reset'], following)
-        eligible = group['start'] < end <= asof if selection == 'last' else group['start'] <= asof < end
-        if eligible:
-            candidates.append({'start': group['start'], 'end': min(end, asof),
-                               'reset': end, 'selection': selection,
-                               'basis': 'recorded weekly deadline and subsequent reset',
-                               'evidence': group['evidence'] + (groups[i + 1]['evidence'][:1] if i + 1 < len(groups) else [])})
+    windows = []
+    for groups in account_groups.values():
+        for i, group in enumerate(groups):
+            following = groups[i + 1]['start'] if i + 1 < len(groups) else float('inf')
+            end = min(group['reset'], following)
+            if group['start'] < end:
+                window = dict(group)
+                window['end'] = end
+                windows.append(window)
+    return sorted(windows, key=lambda w: (w['start'], w['end'], w.get('account') or ''))
+
+
+def effective_windows(observations, service, asof):
+    detected = detected_windows(observations, service, asof)
+    boundaries = sorted({value for w in detected for value in (w['start'], w['end'])})
+    windows = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        active = [w for w in detected if w['start'] <= start and end <= w['end']]
+        sources = list(active)
+        if active and not any(w['start'] == start for w in active):
+            sources += [w for w in detected if w['end'] == start]
+        if active and not any(w['reset'] == end for w in active):
+            sources += [w for w in detected if w['start'] == end]
+        if active and start < end:
+            windows.append({'start': start, 'end': end, 'detected': sources})
+    return windows
+
+
+def select_window(observations, service, asof, selection='last'):
+    if selection not in ('last', 'current'):
+        raise ValueError(f'unknown window selection: {selection}')
+    windows = effective_windows(observations, service, asof)
+    candidates = [w for w in windows if w['end'] <= asof] if selection == 'last' else [
+        w for w in windows if w['start'] <= asof < w['end']]
     if not candidates:
         kind = 'completed' if selection == 'last' else 'current'
-        raise ValueError(f'{service}: no {kind} weekly window in the retained reset history; provide --{service}-window START END')
-    return max(candidates, key=lambda w: w['reset'])
+        raise ValueError(f'{service}: no {kind} quota window in the retained reset history; provide --{service}-window START END')
+    selected = max(candidates, key=lambda w: w['end'])
+    evidence = [q for w in selected['detected'] for q in w['evidence']]
+    return {**selected, 'end': min(selected['end'], asof),
+            'reset': selected['end'], 'selection': selection,
+            'basis': 'effective boundaries from detected weekly windows',
+            'evidence': evidence}
 
 
 def previous_window(observations, service, asof):
@@ -142,27 +182,46 @@ def claude_reset(text, observed, zone):
 
 
 def claude_logs(directory, zone, asof):
-    quotas, titles = [], []
+    quotas, titles, account_markers = [], [], []
     title_re = re.compile(r"Updated session ([\w-]+): \{ title: (.*), titleSource: '(user|auto|tool)' \}")
+    account_re = re.compile(r'cacheKey=acct:([0-9a-fA-F-]{36})\|')
     for path in sorted(directory.glob('main*.log')):
-        for line_number, line in enumerate(path.open(errors='replace'), 1):
-            if 'weekly limit' not in line and 'Updated session ' not in line:
-                continue
-            try:
-                t = datetime.strptime(line[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=zone).timestamp()
-            except ValueError:
-                continue
-            if t > asof:
-                continue
-            reset = claude_reset(line, t, zone)
-            if reset:
-                quotas.append({'service': 'claude', 'observed': t, 'reset': reset, 'duration': WEEK,
-                               'source': str(path), 'line': line_number, 'kind': 'weekly limit deadline'})
-            m = title_re.search(line)
-            if m:
-                title = m[2].strip('"\'')
-                titles.append((t, m[1], title, m[3]))
-    return quotas, titles
+        with path.open(errors='replace') as lines:
+            for line_number, line in enumerate(lines, 1):
+                marker = account_re.search(line)
+                if 'weekly limit' not in line and 'Updated session ' not in line and not marker:
+                    continue
+                try:
+                    t = datetime.strptime(line[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=zone).timestamp()
+                except ValueError:
+                    continue
+                if t > asof:
+                    continue
+                if marker:
+                    account_markers.append((t, marker[1].lower()))
+                reset = claude_reset(line, t, zone)
+                if reset:
+                    quota = {'service': 'claude', 'observed': t, 'reset': reset, 'duration': WEEK,
+                             'source': str(path), 'line': line_number, 'kind': 'weekly limit deadline'}
+                    quotas.append(quota)
+                m = title_re.search(line)
+                if m:
+                    title = m[2].strip('"\'')
+                    titles.append((t, m[1], title, m[3]))
+    account_markers.sort(key=lambda marker: marker[0])
+    marker_times = [marker[0] for marker in account_markers]
+    for quota in quotas:
+        index = bisect.bisect_right(marker_times, quota['observed']) - 1
+        if index >= 0:
+            quota['account'] = account_markers[index][1]
+    account_activity = []
+    for observed, account in account_markers:
+        if account_activity and account_activity[-1]['account'] == account:
+            continue
+        if account_activity:
+            account_activity[-1]['end'] = observed
+        account_activity.append({'account': account, 'start': observed, 'end': None})
+    return quotas, titles, account_activity
 
 
 def title_call(name, args, owner):

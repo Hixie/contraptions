@@ -201,7 +201,7 @@ class TitlesAndFiles(unittest.TestCase):
     def test_display_timezone_does_not_reinterpret_local_logs(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch('session_cost_reports.local_zone', return_value=ZoneInfo('America/Los_Angeles')), \
-                 patch('session_cost_reports.claude_logs', return_value=([], [])) as logs, \
+                 patch('session_cost_reports.claude_logs', return_value=([], [], [])) as logs, \
                  patch('session_cost_reports.claude_reader.read', return_value=([], {}, {})) as read, \
                  patch.dict('os.environ', {'CLAUDE_CONFIG_DIR': '/wrong-home'}), \
                  patch('builtins.print'):
