@@ -45,13 +45,15 @@ def main():
         live = os.path.join(support, "claude-code-sessions", *A.split("/"))
         session(live, "local_s1", title="First session")
         session(live, "local_s2", title="Second", isArchived=True)
-        session(live, "local_s3", title="Third")
+        session(live, "local_s3", title="Third", isArchived=False)
+        session(live, "local_s4", title="Fourth", isArchived=True)
         session(live + ".before-recover.abc", "local_s1", title="Stale backup title")
         write_config(support, {
             A: {"groups": [{"id": "g1", "name": "Blocked 🚧"}, {"id": "g2", "name": "Empty"},
-                           {"id": "g3", "name": "no groups"}],
+                           {"id": "g3", "name": "no groups"}, {"id": "g4", "name": "Old"}],
                 "assignments": {"code:local_s2": "g1", "code:local_s1": "g1",
-                                "chat:c9": "g1", "code:local_s3": "g3", "code:local_gone": "g3"},
+                                "chat:c9": "g1", "code:local_s3": "g3", "code:local_gone": "g3",
+                                "code:local_s4": "g4"},
                 "order": {"g1": ["code:local_s1", "code:local_s2", "chat:c9"]}},
             B: {"groups": [{"id": "h1", "name": "Blocked 🚧"}],
                 "assignments": {"code:local_s1": "h1"}},
@@ -68,7 +70,9 @@ def main():
                    "    chat item  [c9]\n"
                    "  no groups\n"
                    "    Third  [local_s3]\n"
-                   "    (no session file)  [local_gone]\n" +
+                   "    (no session file)  [local_gone]\n"
+                   "  Old\n"
+                   "    Fourth (archived)  [local_s4]\n" +
                    B + ":\n"
                    "  Blocked 🚧\n"
                    "    First session  [local_s1]\n"
@@ -80,12 +84,12 @@ def main():
         print("== what one account has filed and another has not")
         code, out, _ = run(support, A, B)
         check((code, out), (0, "Blocked 🚧\n"
-                               "  Second (archived)  [local_s2]\n"
                                "  chat item  [c9]\n"
                                "no groups\n"
                                "  Third  [local_s3]\n"),
               "lists only what the second account lacks, leaving out a session "
-              "that no longer exists")
+              "that no longer exists, archived sessions, and groups with only "
+              "archived sessions missing")
         code, out, _ = run(support, B, A)
         check((code, out), (0, ""), "prints nothing when nothing is missing")
         code, out, _ = run(support, "missing/scope", B)

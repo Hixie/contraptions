@@ -254,7 +254,9 @@ is taken to mean that nothing has been filed in a group on this machine.
 
 After moving the list, `move` lists the sessions the previous account had
 filed in groups that the signed-in account has not filed the same way,
-leaving out sessions that no longer exist.  If it cannot read the record,
+leaving out sessions that no longer exist.  It also leaves out archived
+sessions, because the app's sidebar does not show archived sessions in
+groups or let anyone file them there; `groups` still lists them.  If it cannot read the record,
 it says so and still succeeds, because the list has already moved.
 
 A script cannot file sessions in groups.  The tools that create groups
@@ -431,8 +433,11 @@ Verified on a real switch between two accounts:
   `test-groups.py` checks `groups` on made-up records: the order within
   a group, titles taken from the session directory rather than a backup
   of it, items that are not Code sessions, empty groups left out, only
-  missing filings listed after a switch, and records it cannot read or
-  does not recognize.
+  missing filings listed after a switch, archived sessions left out of
+  that list, and records it cannot read or does not recognize.
+- In version 2.31226.1, the app's sidebar tools refused to file an
+  archived session in a group, saying archived sessions are not shown in
+  groups.
 - `move` and then `recover --apply` on the machine where the failure
   happened.  `move` removed the two links, and `recover` wrote the 81
   missing sessions and updated 23.  On relaunch the app loaded all 1163

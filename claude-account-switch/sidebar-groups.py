@@ -14,7 +14,9 @@
 #       every account's filings
 #   sidebar-groups.py <support-dir> <from account/org> <to account/org>
 #       the filings of the first account that the second lacks, leaving out
-#       sessions that no longer exist here; nothing if there are none
+#       sessions that no longer exist here and archived sessions, which the
+#       app's sidebar does not show in groups or let anyone file there;
+#       nothing if there are none
 
 import glob
 import json
@@ -58,9 +60,9 @@ def filings(support):
     return result
 
 
-def titles(support):
-    """The title and archived state of each Code session, from the session
-    directories themselves, not the backups next to them."""
+def sessions(support):
+    """The contents of each Code session's file, from the session directories
+    themselves, not the backups next to them."""
     result = {}
     for path in glob.glob(os.path.join(support, "claude-code-sessions", "*", "*", "local_*.json")):
         org = os.path.dirname(path)
@@ -72,15 +74,18 @@ def titles(support):
                 session = json.load(f)
         except ValueError:
             continue
-        result["code:" + os.path.basename(path)[:-5]] = "%s%s" % (
-            session.get("title") or "(untitled)", " (archived)" if session.get("isArchived") else "")
+        result["code:" + os.path.basename(path)[:-5]] = session
     return result
 
 
-def describe(member, names):
+def describe(member, known):
     kind, _, ident = member.partition(":")
     if kind == "code":
-        return "%s  [%s]" % (names.get(member, "(no session file)"), ident)
+        if member not in known:
+            return "(no session file)  [%s]" % ident
+        session = known[member]
+        return "%s%s  [%s]" % (session.get("title") or "(untitled)",
+                               " (archived)" if session.get("isArchived") else "", ident)
     return "%s item  [%s]" % (kind, ident)
 
 
@@ -89,16 +94,16 @@ def main():
         sys.exit("usage: sidebar-groups.py <support-dir> [<from account/org> <to account/org>]")
     support = sys.argv[1]
     scopes = filings(support)
-    names = titles(support)
+    known = sessions(support)
     if len(sys.argv) == 4:
         have = {(name, m) for name, members in scopes.get(sys.argv[3], []) for m in members}
         for name, members in scopes.get(sys.argv[2], []):
             missing = [m for m in members if (name, m) not in have
-                       and (m in names or not m.startswith("code:"))]
+                       and (not m.startswith("code:") or (m in known and not known[m].get("isArchived")))]
             if missing:
                 print(name)
                 for member in missing:
-                    print("  " + describe(member, names))
+                    print("  " + describe(member, known))
         return
     for scope, groups in scopes.items():
         print("%s:" % scope)
@@ -107,7 +112,7 @@ def main():
         for name, members in groups:
             print("  %s" % name)
             for member in members:
-                print("    " + describe(member, names))
+                print("    " + describe(member, known))
 
 
 if __name__ == "__main__":
