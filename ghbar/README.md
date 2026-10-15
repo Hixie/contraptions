@@ -69,22 +69,56 @@ mirrored, so it reads correctly once the plane has turned round.
 It flies when a branch that was passing starts failing, and again when a
 branch that is already failing breaks in some new way, so that a second thing
 going wrong is not silent. It does not fly for the first answer GitHub gives
-after an indicator starts: a branch that was already red is not a branch that
-has just turned, and logging in should not send a plane round for every
-indicator that comes back.
+about a branch, after an indicator starts or after its settings change to
+another branch: a branch that was already red is not a branch that has just
+turned, and logging in should not send a plane round for every indicator that
+comes back.
 
 Running `ghbar --banner` sends the plane round straight away and quits when it
 has landed. Holding Option in the menu turns **New Indicator** into **Fly the
 Banner**, which does the same without leaving the menu bar; Command-Option-N
 does it too.
 
+## Handing a red branch to an agent
+
+An indicator can also hand a branch that turns red to a coding agent, which
+is asked to "select an appropriate worktree and fix the red BRANCH on
+OWNER/NAME", followed by a link to the commit's checks page. The agent's
+session starts in the session folder chosen in the settings, or in your home
+folder when none is chosen. A relative folder is taken from your home folder.
+
+This is off unless **When it turns red** in the settings says otherwise. It
+can say either of these:
+
+- **Start a Codex session to fix it.** The Codex app comes to the front with
+  the new session, which starts working without anyone pressing anything.
+  The session begins with a short exchange that runs outside the app, with
+  a read-only sandbox. The request follows, and runs in the app with the
+  app's own sandbox and approval settings.
+- **Open a Claude session, ready to send.** The Claude app comes to the
+  front with a new Code session that has the request written in. The Claude
+  app does not send a request that arrives this way, so it waits for you to
+  send it.
+
+A branch is handed off once each time it turns red, and not again until it
+has passed, even when new commits land on it while it is still red. As with
+the banner, nothing is handed off for the first answer about a branch.
+
+The menu names the branch the last session was started for, and when. For
+Codex, choosing that line opens the session. When a session could not be
+started, the line says so, and its tooltip says why.
+
+Running `ghbar --hand-off` hands the branch to the chosen agent straight
+away, whatever state the branch is in, and exits.
+
 ## Settings
 
 **Settings…** opens a window with the repository, the branch, the name to draw
-in the menu bar, and how often to ask GitHub. The repository can be written as
-`owner/name`, or pasted in any of the forms GitHub hands out: the address of
-the repository, the address of a branch, or the SSH remote. Pasting the address
-of a branch fills in the branch as well.
+in the menu bar, how often to ask GitHub, which agent to hand the branch to
+when it turns red, and the folder that agent's session starts in. The
+repository can be written as `owner/name`, or pasted in any of the forms GitHub
+hands out: the address of the repository, the address of a branch, or the SSH
+remote. Pasting the address of a branch fills in the branch as well.
 
 Settings are remembered per indicator, in `~/Library/Preferences`, under
 `local.ghbar.` followed by the indicator's number.
@@ -172,7 +206,8 @@ gets.
 ## Building and running
 
 Requires the Xcode command line tools, for `swiftc`. There is no Xcode
-project: the indicator is one Swift file and the plane is another.
+project: the indicator is one Swift file, the plane is another, and the hand-off
+to an agent is a third.
 
 ```sh
 make            # builds ./ghbar
@@ -183,16 +218,21 @@ The first indicator with nothing configured opens its settings window.
 
 ```
 usage: ghbar [--instance N] [--repo OWNER/NAME] [--branch BRANCH]
-             [--once] [--banner] [--no-startup]
+             [--once] [--banner] [--hand-off] [--no-startup]
 
   --instance N   run as indicator N rather than the lowest free number
-  --repo R       track this repository, and remember it for this indicator
-  --branch B     track this branch, and remember it for this indicator
+  --repo R       track this repository; in the menu bar, also remember it
+                 for this indicator
+  --branch B     track this branch; in the menu bar, also remember it for
+                 this indicator
   --once         report the branch on standard output and exit, without
                  touching the menu bar; exits 0 when the branch is passing,
                  1 when it is failing, and 2 otherwise
   --banner       fly the plane and its banner straight away and quit when
                  it has landed, to see what it looks like
+  --hand-off     hand the branch to the agent chosen in the settings
+                 straight away, whatever state it is in, and exit, without
+                 touching the menu bar
   --no-startup   leave the login item alone for this run
 ```
 

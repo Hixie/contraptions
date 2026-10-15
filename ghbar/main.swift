@@ -89,6 +89,17 @@ func parseRepository(_ text: String) -> (repository: RepositoryReference, branch
     return (repository, nil)
 }
 
+/// Reads a folder as typed, which may start with a tilde. A relative path is
+/// taken from the home folder, and empty means the home folder.
+func folderURL(_ text: String) -> URL {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+    return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath, isDirectory: true,
+               relativeTo: FileManager.default.homeDirectoryForCurrentUser).absoluteURL
+}
+
 func isBranchName(_ text: String) -> Bool {
     guard !text.isEmpty, !text.hasPrefix("/"), !text.hasSuffix("/") else { return false }
     return !text.contains(where: { $0.isWhitespace }) && !text.contains("..")
@@ -102,6 +113,8 @@ enum SettingsKey {
     static let menuBarName = "menuBarName"
     static let showsMenuBarName = "showsMenuBarName"
     static let refreshSeconds = "refreshSeconds"
+    static let handOff = "handOff"
+    static let handOffFolder = "handOffFolder"
 }
 
 /// One indicator's settings, kept in a preference domain of its own so that
@@ -147,6 +160,21 @@ final class Settings {
         get { max(minimumRefreshSeconds, store.double(forKey: SettingsKey.refreshSeconds)) }
         set { store.set(max(minimumRefreshSeconds, newValue), forKey: SettingsKey.refreshSeconds) }
     }
+
+    /// The agent a branch that turns red is handed to, if any.
+    var handOff: Agent? {
+        get { store.string(forKey: SettingsKey.handOff).flatMap(Agent.init(rawValue:)) }
+        set { store.set(newValue?.rawValue, forKey: SettingsKey.handOff) }
+    }
+
+    /// The folder an agent's session starts in, as typed. Empty means the
+    /// home folder.
+    var handOffFolder: String {
+        get { store.string(forKey: SettingsKey.handOffFolder) ?? "" }
+        set { store.set(newValue, forKey: SettingsKey.handOffFolder) }
+    }
+
+    var handOffFolderURL: URL { folderURL(handOffFolder) }
 
     /// The text drawn next to the indicator in the menu bar.
     var displayName: String {
@@ -290,17 +318,73 @@ final class InstanceLock {
     }
 }
 
+// MARK: - Running other programs
+
+struct ToolRun {
+    let status: Int32
+    let killed: Bool
+    let output: String
+    let errors: String
+
+    /// How the tool ended, and what it reported on its error stream.
+    func failure(_ name: String) -> String {
+        let reported = errors.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ending = killed ? "was killed by signal \(status)" : "exited with status \(status)"
+        return "\(name) \(ending)" + (reported.isEmpty ? "" : ": \(reported)")
+    }
+}
+
+/// Runs a tool to completion and returns what it wrote to each stream. The
+/// streams go to unnamed files, which nothing the tool leaves running can
+/// hold open once the tool itself has exited, and which disappear with this
+/// process however it ends.
+func runTool(_ executable: URL, _ arguments: [String]) throws -> ToolRun {
+    let output = try TemporaryLog()
+    let errors = try TemporaryLog()
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = arguments
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = output.handle
+    process.standardError = errors.handle
+    let exited = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in exited.signal() }
+    try process.run()
+    exited.wait()
+    return ToolRun(status: process.terminationStatus,
+                   killed: process.terminationReason == .uncaughtSignal,
+                   output: try output.contents(),
+                   errors: try errors.contents())
+}
+
+/// A file a tool writes to. Its name is removed as soon as it is made, so
+/// the file lasts only as long as the handle.
+private final class TemporaryLog {
+    let handle: FileHandle
+
+    init() throws {
+        var template = Array(
+            "\(FileManager.default.temporaryDirectory.path)/\(applicationName).XXXXXX".utf8CString)
+        let descriptor = mkstemp(&template)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        unlink(template)
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    func contents() throws -> String {
+        try handle.seek(toOffset: 0)
+        return String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
+    }
+}
+
 // MARK: - Login item
 
 /// The launchd user agent that owns one instance. An ordinary process writes
 /// and loads the agent, then exits after its launchd copy starts waiting for
 /// the instance lock.
 enum LoginItem {
-    private struct LaunchctlResult {
-        let status: Int32
-        let error: String
-    }
-
     static var directory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
@@ -328,25 +412,11 @@ enum LoginItem {
     }
 
     static func isRunning(instance: Int) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["print", "gui/\(getuid())/\(label(instance: instance))"]
-        process.standardInput = FileHandle.nullDevice
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
+        let service = "gui/\(getuid())/\(label(instance: instance))"
+        guard let result = try? runTool(launchctl, ["print", service]), result.status == 0 else {
             return false
         }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0,
-              let text = String(data: data, encoding: .utf8) else {
-            return false
-        }
-        return text.split(separator: "\n").contains {
+        return result.output.split(separator: "\n").contains {
             $0.trimmingCharacters(in: .whitespaces) == "state = running"
         }
     }
@@ -383,61 +453,33 @@ enum LoginItem {
     static func start(instance: Int) -> String? {
         let domain = "gui/\(getuid())"
         let service = "\(domain)/\(label(instance: instance))"
-        if runLaunchctl(["print", service]).status == 0 {
-            let result = runLaunchctl(["bootout", service])
-            guard result.status == 0 else {
-                return result.error.isEmpty
-                    ? "launchctl bootout exited with status \(result.status)"
-                    : result.error
+        do {
+            if try runTool(launchctl, ["print", service]).status == 0 {
+                let result = try runTool(launchctl, ["bootout", service])
+                guard result.status == 0 else {
+                    return result.failure("launchctl bootout")
+                }
             }
+            let result = try runTool(launchctl,
+                                     ["bootstrap", domain, plistURL(instance: instance).path])
+            guard result.status == 0 else {
+                return result.failure("launchctl bootstrap")
+            }
+            return nil
+        } catch {
+            return "could not run launchctl: \(error.localizedDescription)"
         }
-        let result = runLaunchctl([
-            "bootstrap", domain, plistURL(instance: instance).path,
-        ])
-        guard result.status == 0 else {
-            return result.error.isEmpty
-                ? "launchctl exited with status \(result.status)"
-                : result.error
-        }
-        return nil
     }
 
-    private static func runLaunchctl(_ arguments: [String]) -> LaunchctlResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        let errors = Pipe()
-        process.standardError = errors
-        do {
-            try process.run()
-        } catch {
-            return LaunchctlResult(status: -1, error: error.localizedDescription)
-        }
-        let data = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let message = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return LaunchctlResult(status: process.terminationStatus, error: message)
-    }
+    private static let launchctl = URL(fileURLWithPath: "/bin/launchctl")
 
     /// Removes the agent and stops the job. When launchd is the parent of this
     /// process, stopping the job also ends this process.
     static func unregister(instance: Int) {
         try? FileManager.default.removeItem(at: plistURL(instance: instance))
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["bootout", "gui/\(getuid())/\(label(instance: instance))"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            // launchd has nothing loaded for this label, so the file was the
-            // whole of the login item.
-        }
+        // This fails when launchd has nothing loaded for the label, in which
+        // case the file was the whole of the login item.
+        _ = try? runTool(launchctl, ["bootout", "gui/\(getuid())/\(label(instance: instance))"])
     }
 }
 
@@ -494,21 +536,8 @@ func loginShellPath() -> String {
 /// of it. launchd starts login items with almost no environment, so this is
 /// how an indicator started at login sees the same GH_TOKEN a terminal sees.
 func askLoginShellForToken() -> Credential {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: loginShellPath())
-    process.arguments = ["-ilc", tokenProbeScript]
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = FileHandle.nullDevice
-    process.standardInput = FileHandle.nullDevice
-    do {
-        try process.run()
-    } catch {
-        return Credential(token: nil, source: .absent)
-    }
-    let output = pipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    guard let text = String(data: output, encoding: .utf8) else {
+    guard let text = try? runTool(URL(fileURLWithPath: loginShellPath()),
+                                  ["-ilc", tokenProbeScript]).output else {
         return Credential(token: nil, source: .absent)
     }
     // The profile may print before the script does, so the fields are counted
@@ -1428,6 +1457,12 @@ final class BranchMonitor {
             self.fetcher.fetch(repository: repository, branch: branch,
                                token: credential.token) { result in
                 self.busy = false
+                guard repository == self.repository, branch == self.branch else {
+                    // The settings changed while this answer was on its way,
+                    // and the poll for the new branch waited for it.
+                    self.poll()
+                    return
+                }
                 switch result {
                 case .success(let status):
                     self.lastGood = status
@@ -1601,6 +1636,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let intervalField = NSTextField()
     private let showNameButton = NSButton(checkboxWithTitle: "Show the name in the menu bar",
                                           target: nil, action: nil)
+    private let handOffButton = NSPopUpButton()
+    private let folderField = NSTextField()
     private let tokenLabel = NSTextField(labelWithString: "Looking…")
     private let messageLabel = NSTextField(labelWithString: "")
     private var hasBeenPlaced = false
@@ -1633,6 +1670,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         repositoryField.delegate = self
         branchField.placeholderString = defaultBranchName
         nameField.placeholderString = "the repository's name"
+        folderField.placeholderString = "~"
+        handOffButton.addItems(withTitles: [noAgentTitle] + Agent.allCases.map(\.title))
         intervalField.alignment = .right
 
         tokenLabel.lineBreakMode = .byTruncatingTail
@@ -1641,7 +1680,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         messageLabel.lineBreakMode = .byWordWrapping
         messageLabel.maximumNumberOfLines = 2
 
-        for field in [repositoryField, branchField, nameField] {
+        for field in [repositoryField, branchField, nameField, folderField] {
             field.widthAnchor.constraint(equalToConstant: 320).isActive = true
         }
         intervalField.widthAnchor.constraint(equalToConstant: 64).isActive = true
@@ -1658,6 +1697,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             [caption("Menu bar name:"), nameField],
             [caption("Check every:"), intervalRow],
             [NSGridCell.emptyContentView, showNameButton],
+            [caption("When it turns red:"), handOffButton],
+            [caption("Session folder:"), folderField],
             [caption("GitHub token:"), tokenLabel],
         ])
         grid.column(at: 0).xPlacement = .trailing
@@ -1705,6 +1746,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         nameField.stringValue = settings.menuBarName
         intervalField.stringValue = String(Int(settings.refreshSeconds.rounded()))
         showNameButton.state = settings.showsMenuBarName ? .on : .off
+        handOffButton.selectItem(at: settings.handOff.map { Agent.allCases.firstIndex(of: $0)! + 1 } ?? 0)
+        folderField.stringValue = settings.handOffFolder
         messageLabel.stringValue = ""
         tokenLabel.stringValue = "Looking…"
         credentials.resolve { [weak self] credential in
@@ -1757,11 +1800,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             complain("Check at least every \(Int(minimumRefreshSeconds)) seconds.", in: intervalField)
             return
         }
+        let choice = handOffButton.indexOfSelectedItem
+        let handOff = choice == 0 ? nil : Agent.allCases[choice - 1]
+        let folder = folderField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        var isFolder: ObjCBool = false
+        guard handOff == nil
+              || FileManager.default.fileExists(atPath: folderURL(folder).path,
+                                                isDirectory: &isFolder) && isFolder.boolValue else {
+            complain("The session folder has to be a folder that exists.", in: folderField)
+            return
+        }
         settings.repository = parsed.repository
         settings.branch = branch
         settings.menuBarName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         settings.showsMenuBarName = showNameButton.state == .on
         settings.refreshSeconds = seconds
+        settings.handOff = handOff
+        settings.handOffFolder = folder
         close()
         onSave?()
     }
@@ -1790,6 +1845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dynamicEnd: NSMenuItem!
     private var openItem: NSMenuItem!
     private var bannerItem: NSMenuItem!
+    private var handOffItem: NSMenuItem!
     private var footerItem: NSMenuItem!
     private var settingsWindow: SettingsWindowController?
     private var latest: MonitorState = .unconfigured
@@ -1797,6 +1853,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let flyby = FlybyController()
     private var lastHealth: Health?
     private var lastFailure: String?
+    /// The repository and branch the last answer was about.
+    private var lastTarget: String?
+    /// Whether the branch has been handed off since it last passed, or was
+    /// already red when the indicator first heard about it.
+    private var handedOff = false
     private let demonstratesBanner: Bool
 
     init(lock: InstanceLock, settings: Settings, registersLoginItem: Bool,
@@ -1928,6 +1989,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         bannerItem.toolTip = "Send the plane and its banner round now, whatever state the branch is in."
 
         menu.addItem(.separator())
+        handOffItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        handOffItem.target = self
+        handOffItem.isHidden = true
         footerItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
 
         menu.addItem(.separator())
@@ -1954,26 +2018,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusItem()
         refreshMenuContents()
         if case .ready(let status) = state {
-            considerBanner(status)
+            considerRed(status)
         }
     }
 
     /// Flies the banner when the branch turns red, and again if it is still
-    /// red but has broken in a new way. Nothing is flown for the first
-    /// answer GitHub gives: a branch that was already red when the indicator
-    /// started has not just turned, and a login should not fill the screen
-    /// with banners for every indicator that comes back with it.
-    private func considerBanner(_ status: BranchStatus) {
+    /// red but has broken in a new way, which includes being red at a new
+    /// commit. Hands the branch to an agent when it turns red, and not again
+    /// until it has passed.
+    ///
+    /// Nothing happens for the first answer about a branch: a branch that
+    /// was already red when the indicator started, or when the settings
+    /// changed to it, has not just turned, and a login should not fill the
+    /// screen with banners for every indicator that comes back with it.
+    private func considerRed(_ status: BranchStatus) {
         let failing = status.checks.filter { $0.state == .failing }.map(\.name).sorted()
         let signature = ([status.sha] + failing).joined(separator: "\u{1}")
+        let target = "\(status.repository.slug)\u{1}\(status.branch)"
+        let isFirst = target != lastTarget
         let previous = lastHealth
         let previousFailure = lastFailure
+        lastTarget = target
         lastHealth = status.health
         lastFailure = signature
-        guard status.health == .failing, let previous else { return }
-        guard previous != .failing || signature != previousFailure else { return }
         guard !demonstratesBanner else { return }
-        flyby.show(bannerText, from: statusItem?.button)
+        if isFirst {
+            handedOff = status.health == .failing
+            return
+        }
+        if status.health == .passing {
+            handedOff = false
+        }
+        guard status.health == .failing else { return }
+        if !handedOff {
+            handedOff = true
+            handOffIfWanted(status)
+        }
+        if previous != .failing || signature != previousFailure {
+            flyby.show(bannerText, from: statusItem?.button)
+        }
+    }
+
+    private func handOffIfWanted(_ status: BranchStatus) {
+        guard let agent = settings.handOff else { return }
+        handOff(status, to: agent, in: settings.handOffFolderURL) { [weak self] outcome in
+            self?.show(outcome)
+        }
+    }
+
+    /// Puts the outcome of the last hand-off in the menu. Choosing it opens
+    /// the session, when there is a session to open.
+    private func show(_ outcome: HandOffOutcome) {
+        handOffItem.isHidden = false
+        switch outcome {
+        case .started(let summary, let url):
+            handOffItem.title = summary
+            handOffItem.toolTip = nil
+            handOffItem.representedObject = url
+            handOffItem.action = url == nil ? nil : #selector(openItemURL(_:))
+        case .failed(let summary, let detail):
+            handOffItem.title = summary
+            handOffItem.toolTip = detail
+            handOffItem.representedObject = nil
+            handOffItem.action = nil
+            report(outcome.summary)
+        }
     }
 
     /// What the banner says: the name shown in the menu bar, and that it is
@@ -2157,7 +2266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func checkItem(_ check: CheckSummary) -> NSMenuItem {
-        let item = NSMenuItem(title: check.name, action: #selector(openCheck(_:)), keyEquivalent: "")
+        let item = NSMenuItem(title: check.name, action: #selector(openItemURL(_:)), keyEquivalent: "")
         item.target = self
         item.image = indicatorImage(checkIndicator(check.state), pointSize: 11)
         item.representedObject = check.url
@@ -2178,7 +2287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitor.refreshNow()
     }
 
-    @objc private func openCheck(_ sender: NSMenuItem) {
+    @objc private func openItemURL(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
     }
@@ -2238,21 +2347,27 @@ struct Options {
     var once = false
     var registersLoginItem = true
     var demonstratesBanner = false
+    var handsOff = false
     var waitsForInstance = false
 }
 
 let usage = """
 usage: \(applicationName) [--instance N] [--repo OWNER/NAME] [--branch BRANCH]
-              [--once] [--banner] [--no-startup]
+              [--once] [--banner] [--hand-off] [--no-startup]
 
   --instance N   run as indicator N rather than the lowest free number
-  --repo R       track this repository, and remember it for this indicator
-  --branch B     track this branch, and remember it for this indicator
+  --repo R       track this repository; in the menu bar, also remember it
+                 for this indicator
+  --branch B     track this branch; in the menu bar, also remember it for
+                 this indicator
   --once         report the branch on standard output and exit, without
                  touching the menu bar; exits 0 when the branch is passing,
                  1 when it is failing, and 2 otherwise
   --banner       fly the plane and its banner straight away and quit when
                  it has landed, to see what it looks like
+  --hand-off     hand the branch to the agent chosen in the settings
+                 straight away, whatever state it is in, and exit, without
+                 touching the menu bar
   --no-startup   leave the login item alone for this run
 """
 
@@ -2290,6 +2405,8 @@ func parseOptions() -> Options {
         case "--banner":
             options.demonstratesBanner = true
             options.registersLoginItem = false
+        case "--hand-off":
+            options.handsOff = true
         case "--no-startup":
             options.registersLoginItem = false
         case "--launchd":
@@ -2304,6 +2421,9 @@ func parseOptions() -> Options {
     }
     if options.waitsForInstance, options.instance == nil {
         fail("--launchd requires --instance")
+    }
+    if [options.once, options.handsOff, options.demonstratesBanner].filter({ $0 }).count > 1 {
+        fail("--once, --banner, and --hand-off cannot be used together")
     }
     return options
 }
@@ -2323,10 +2443,10 @@ func describe(_ status: BranchStatus) -> String {
     return lines.joined(separator: "\n")
 }
 
-/// Reports the branch once on standard output. Checks the settings, the token
-/// discovery, and the reading of GitHub's answers without the menu bar.
-func runOnce(options: Options) -> Never {
-    let settings = Settings(instance: options.instance ?? 1)
+/// Asks GitHub about the branch once, without the menu bar, and gives the
+/// answer to `body`, which is expected to exit.
+func fetchOnce(options: Options, settings: Settings,
+               _ body: @escaping (BranchStatus) -> Void) -> Never {
     guard let repository = options.repository ?? settings.repository else {
         fail("no repository is configured for indicator \(settings.instance); pass --repo owner/name")
     }
@@ -2342,22 +2462,54 @@ func runOnce(options: Options) -> Never {
                 print("\(repository.slug)@\(branch): \(failure.detail ?? failure.message)")
                 exit(2)
             case .success(let status):
-                print(describe(status))
-                switch status.health {
-                case .passing: exit(0)
-                case .failing: exit(1)
-                case .running, .inconclusive: exit(2)
-                }
+                body(status)
             }
         }
     }
     dispatchMain()
 }
 
+/// Reports the branch once on standard output. Checks the settings, the token
+/// discovery, and the reading of GitHub's answers without the menu bar.
+func runOnce(options: Options) -> Never {
+    fetchOnce(options: options, settings: Settings(instance: options.instance ?? 1)) { status in
+        print(describe(status))
+        switch status.health {
+        case .passing: exit(0)
+        case .failing: exit(1)
+        case .running, .inconclusive: exit(2)
+        }
+    }
+}
+
+/// Hands the branch off once, so that what the agent is given can be seen
+/// without waiting for the branch to break.
+func runHandOff(options: Options) -> Never {
+    let settings = Settings(instance: options.instance ?? 1)
+    guard let agent = settings.handOff else {
+        FileHandle.standardError.write(Data(
+            "\(applicationName): indicator \(settings.instance) hands red branches to no agent; choose one in its settings\n".utf8))
+        exit(2)
+    }
+    fetchOnce(options: options, settings: settings) { status in
+        print(handOffPrompt(status))
+        handOff(status, to: agent, in: settings.handOffFolderURL) { outcome in
+            print(outcome.summary)
+            if case .failed = outcome {
+                exit(1)
+            }
+            exit(0)
+        }
+    }
+}
+
 // MARK: - Entry point
 
 let options = parseOptions()
 
+if options.handsOff {
+    runHandOff(options: options)
+}
 if options.once {
     runOnce(options: options)
 }

@@ -3,7 +3,7 @@ INSTALL_DIR = $(HOME)/.local/bin
 AGENT_DIR = $(HOME)/Library/LaunchAgents
 AGENT_PREFIX = local.ghbar
 
-SOURCES = main.swift flyby.swift
+SOURCES = main.swift flyby.swift handoff.swift
 # Not named Info.plist: an Info.plist beside an executable named after its
 # directory makes macOS take the directory for an application bundle, and
 # then the binary fails signature verification and launchd will not start
