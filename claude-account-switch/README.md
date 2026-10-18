@@ -13,7 +13,8 @@ The first time you switch:
 3. Quit the app completely (⌘Q).
 4. Run `./account-switch.sh move`.
 5. Open the app.
-6. File any sessions `move` lists into sidebar groups, or ask Claude to.
+6. File any sessions `move` lists into sidebar groups, and make any
+   sidebar setting it lists, or ask Claude to.
 
 Every time after that, to any account:
 
@@ -22,7 +23,8 @@ Every time after that, to any account:
 2. Quit the app completely (⌘Q).
 3. Run `./account-switch.sh move`.
 4. Open the app.
-5. File any sessions `move` lists into sidebar groups, or ask Claude to.
+5. File any sessions `move` lists into sidebar groups, and make any
+   sidebar setting it lists, or ask Claude to.
 
 If you ever switched with the old `link` command, do this once first:
 
@@ -103,6 +105,7 @@ were intact.  `recover`, described below, rebuilds the lost entries.
 ./account-switch.sh record    # once, signed in as the account holding the list
 ./account-switch.sh move      # after each switch to another account
 ./account-switch.sh groups    # what each account has filed in sidebar groups
+./account-switch.sh layout    # how each account lays out the sidebar
 ```
 
 The whole procedure:
@@ -275,6 +278,34 @@ outside could be replaced.  Writing to that storage, a LevelDB database,
 from outside also risks the app treating it as corrupt and discarding
 all of it, including drafts and settings.
 
+## Sidebar layout
+
+The sidebar lays sessions out in sections: Pinned, Routines and
+Sessions, and one for each custom group.  Each section has settings of
+its own: whether it is shown, whether it is collapsed, how it is sorted,
+and which details its rows show.  These are kept per account, the way
+groups are.  The page keeps them in `dframe-store`, under
+`codeSidebarByScope`, as a map from `<account>/<org>` to that account's
+sections.  So after a switch the sidebar takes the signed-in account's own
+layout, and the same sessions can look organized differently: sorted by
+last activity in one account and by date created in the other.
+
+The app copies the layout into `claude_desktop_config.json`, under
+`preferences.epitaxyPrefs["dframe-code-sections"]`.  The page reads that
+copy only to lay out an account it has not laid out before.  Once an
+account has a layout of its own, the page keeps it, so editing the copy
+does not change the sidebar of an account already used on this machine,
+and `move` does not try.
+
+`layout` reads that copy, changing nothing, and lists each account's
+built-in sections in sidebar order with their settings.  After moving the
+list, `move` lists the settings the previous account had that the
+signed-in account does not share.  If it cannot read the copy, it says
+so and still succeeds, because the list has already moved.  Make the
+settings in the sidebar's own menus, or ask Claude in a Code session in
+the app: its sidebar tools set how a section is sorted and grouped.
+Custom groups are listed by `groups`, not here.
+
 ## Recovering sessions the app failed to save
 
 `recover` rebuilds the sidebar entries of sessions whose saves failed,
@@ -438,6 +469,20 @@ Verified on a real switch between two accounts:
 - In version 2.31226.1, the app's sidebar tools refused to file an
   archived session in a group, saying archived sessions are not shown in
   groups.
+- Where the sidebar layout is kept, in version 2.42304.0.
+  `codeSidebarByScope` in `dframe-store` held a layout for each of the two
+  accounts used on the machine, one sorting the Sessions section by date
+  created and the other by last activity, and each matched its copy in
+  `claude_desktop_config.json`.  The app's sidebar tools reported the
+  signed-in account's.  That the page lays out an account from the copy
+  only once, and keeps its own layout afterwards, is from reading the
+  page's code, not from observation.  `test-layout.py` checks `layout` on
+  made-up records, and `test-move.sh` checks that `move` lists a setting
+  that differs and says nothing when the layouts match.
+- A real switch to an account that sorted its Sessions section differently,
+  in version 2.42304.0.  `move` listed that one setting.  On reopening, the
+  app's sidebar tools reported the signed-in account's own sorting, Claude
+  set it with them, and `layout` then showed the two accounts alike.
 - `move` and then `recover --apply` on the machine where the failure
   happened.  `move` removed the two links, and `recover` wrote the 81
   missing sessions and updated 23.  On relaunch the app loaded all 1163
@@ -455,3 +500,10 @@ Not verified, and worth knowing:
   `status` will show it: the entry counts will not match what the
   sidebar shows.  A version that changes the log lines will make
   `recover --verify` report mismatches.
+- Whether the app draws the sidebar the same way for every organization.
+  Some of its local state is keyed by organization, such as whether
+  session presets are offered, so a feature can be on for one account and
+  off for another.  That is decided by the app and the account, and no
+  file this script moves carries it.  Session presets themselves are kept
+  per account, in `ccd-session-presets.json`, and `move` does not carry
+  them either.

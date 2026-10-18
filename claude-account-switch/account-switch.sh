@@ -25,11 +25,15 @@
 #   ./account-switch.sh record    # once, logged in as the account with the list
 #   ./account-switch.sh move      # after each switch to another account
 #   ./account-switch.sh groups    # each account's sidebar groups
+#   ./account-switch.sh layout    # each account's sidebar layout
 #   ./account-switch.sh recover [--apply|--verify]
 #
 # Sidebar groups are kept per account by the app and on claude.ai, not in the
 # session directory, so "move" does not carry them; it lists the sessions the
 # previous account had filed in groups, so they can be filed again in the app.
+# The sidebar's layout -- how each section is sorted, which are shown or
+# collapsed -- is kept per account the same way, and "move" lists the settings
+# the previous account had that this one does not, so they can be set again.
 #
 # The account this script acts on comes from the app's own config.json, in the
 # key "lastKnownAccountUuid", together with the <account>/<org> directory the
@@ -331,12 +335,25 @@ case "${1-}" in
         sed 's/^/  /' <<< "$groups"
         echo "File them in the app, making any group that is missing, or ask Claude to."
       fi
+      if ! layout="$(python3 "$(dirname "$0")/sidebar-layout.py" "$SUPPORT" "$from" "$acct/$org")"; then
+        echo "Could not compare the sidebar layout $who had; see the message above."
+      elif [ -n "$layout" ]; then
+        echo
+        echo "The sidebar layout stays with each account too.  $who had these settings,"
+        echo "and this account has not:"
+        sed 's/^/  /' <<< "$layout"
+        echo "Set them in the sidebar's section menus, or ask Claude to."
+      fi
       echo "Now open the Claude app again."
     fi
     ;;
 
   groups)
     python3 "$(dirname "$0")/sidebar-groups.py" "$SUPPORT"
+    ;;
+
+  layout)
+    python3 "$(dirname "$0")/sidebar-layout.py" "$SUPPORT"
     ;;
 
   recover)
@@ -360,7 +377,7 @@ case "${1-}" in
     ;;
 
   *)
-    echo "usage: $0 status|record|move|groups|recover [--apply|--verify]" >&2
+    echo "usage: $0 status|record|move|groups|layout|recover [--apply|--verify]" >&2
     exit 1
     ;;
 esac
