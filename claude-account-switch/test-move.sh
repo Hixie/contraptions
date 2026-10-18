@@ -12,7 +12,7 @@ export HOME="$T/home"
 sed 's|^app_is_running() {|app_is_running() { return 1; }\nreal_app_is_running() {|' \
   "$here/account-switch.sh" > "$T/as.sh"
 chmod +x "$T/as.sh"
-cp "$here/sidebar-groups.py" "$T/"
+cp "$here/sidebar-groups.py" "$here/sidebar-layout.py" "$T/"
 S="$HOME/Library/Application Support/Claude"
 CODE="$S/claude-code-sessions"
 AGENT="$S/local-agent-mode-sessions"
@@ -54,6 +54,21 @@ with open(support + "/claude_desktop_config.json", "w") as f:
     json.dump({"preferences": {"epitaxyPrefs": {"dframe-group-scopes": scopes}}}, f)
 PY
 }
+# Record how account/org $1 sorts its Sessions section ($2), as the app copies
+# the sidebar's layout into its config, keeping what else the config holds.
+store_layout() {
+  python3 - "$S" "$@" <<'PY'
+import json, sys
+support, scope, sort = sys.argv[1:]
+path = support + "/claude_desktop_config.json"
+config = json.load(open(path))
+prefs = config.setdefault("preferences", {}).setdefault("epitaxyPrefs", {})
+prefs.setdefault("dframe-code-sections", {})[scope] = {"sections": [
+    {"id": "pinned", "kind": "pinned", "order": 0, "sortBy": "recency", "shown": True},
+    {"id": "sessions", "kind": "sessions", "order": 1, "sortBy": sort, "shown": True}]}
+json.dump(config, open(path, "w"))
+PY
+}
 
 echo "== first switch, to an account with a history of its own"
 reset
@@ -75,6 +90,8 @@ check "$(ls "$AGENT/$B/$BO/agent" | grep -c '^local_')" 2 "nested agent sessions
 check "$(cat "$AGENT/$B/$BO/agent/manifest.json")" a "a nested collision keeps the list's copy"
 check "$(cat "$AGENT/$B/$BO".superseded.*/agent/manifest.json)" b "and sets the other aside at the same path"
 check "$(recorded)" "$B $BO" "the signed-in account is recorded"
+check "$(grep -c -E 'sidebar layout|Could not compare' "$T/out")" 0 \
+  "nothing is said about the sidebar layout when none is recorded"
 move; check $? 0 "a second move succeeds"
 check "$(grep -c 'already with the signed-in account' "$T/out")" 2 "and reports the list already in place"
 
@@ -95,6 +112,21 @@ move; check $? 0 "move succeeds"
 check "$(grep -c "$A had filed" "$T/out")" 1 "move says the groups stay behind"
 check "$(grep -A3 'had filed' "$T/out" | tail -2 | tr -s ' ')" " Blocked
  (untitled) [local_a1]" "and lists them with their sessions"
+
+echo "== the previous account's sidebar layout is listed"
+reset
+login $A $AO; session $A $AO a1; "$T/as.sh" record > /dev/null
+store_layout "$A/$AO" created
+login $B $BO
+store_layout "$B/$BO" recency
+move; check $? 0 "move succeeds"
+check "$(grep -c "$A had these settings" "$T/out")" 1 "move says the layout stays behind"
+check "$(grep -A2 'sidebar layout stays' "$T/out" | tail -1 | tr -s ' ')" \
+  " Sessions: sorted by date created (this account: last activity)" "and lists the setting that differs"
+store_layout "$A/$AO" recency
+login $A $AO
+move; check $? 0 "moving back succeeds"
+check "$(grep -c -E 'sidebar layout|Could not compare' "$T/out")" 0 "nothing is said when the layouts match"
 
 echo "== filings the signed-in account already has are not listed"
 reset
