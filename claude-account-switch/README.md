@@ -14,7 +14,8 @@ The first time you switch:
 4. Run `./account-switch.sh move`.
 5. Open the app.
 6. File any sessions `move` lists into sidebar groups, and make any
-   sidebar setting it lists, or ask Claude to.
+   sidebar setting it lists, or ask Claude in a Code session to follow
+   what `./account-switch.sh for-claude` prints.
 
 Every time after that, to any account:
 
@@ -24,7 +25,8 @@ Every time after that, to any account:
 3. Run `./account-switch.sh move`.
 4. Open the app.
 5. File any sessions `move` lists into sidebar groups, and make any
-   sidebar setting it lists, or ask Claude to.
+   sidebar setting it lists, or ask Claude in a Code session to follow
+   what `./account-switch.sh for-claude` prints.
 
 If you ever switched with the old `link` command, do this once first:
 
@@ -106,6 +108,7 @@ were intact.  `recover`, described below, rebuilds the lost entries.
 ./account-switch.sh move      # after each switch to another account
 ./account-switch.sh groups    # what each account has filed in sidebar groups
 ./account-switch.sh layout    # how each account lays out the sidebar
+./account-switch.sh for-claude  # steps for Claude to copy the sidebar over
 ```
 
 The whole procedure:
@@ -266,10 +269,11 @@ A script cannot file sessions in groups.  The tools that create groups
 and file sessions in them belong to the running app, which gives them
 only to the Claude sessions it hosts, and `move` runs while the app is
 quit.  So file the listed sessions in the sidebar yourself, making any
-group that is missing, or ask Claude in a Code session in the app to do
-it.  Those tools file Code sessions; any other kind of item in the list
-has to be filed by hand.  In the default permission mode, Claude asks
-before moving each session.
+group that is missing, or have Claude in a Code session in the app do
+it, as described under "Steps for Claude" below.  Those tools file
+Code sessions; any other kind of item in the list has to be filed by
+hand.  In the default permission mode, Claude asks before moving each
+session.
 
 `move` does not copy groups between accounts.  The page syncs
 `dframe-store` to the account's settings on claude.ai, and merges the
@@ -302,9 +306,79 @@ built-in sections in sidebar order with their settings.  After moving the
 list, `move` lists the settings the previous account had that the
 signed-in account does not share.  If it cannot read the copy, it says
 so and still succeeds, because the list has already moved.  Make the
-settings in the sidebar's own menus, or ask Claude in a Code session in
-the app: its sidebar tools set how a section is sorted and grouped.
-Custom groups are listed by `groups`, not here.
+settings in the sidebar's own menus, or have Claude in a Code session in
+the app make them, as described under "Steps for Claude" below.  Custom
+groups are listed by `groups`, not here.
+
+## Steps for Claude
+
+`for-claude` prints instructions for Claude, running in a Code session
+in the app, to make the signed-in account's sidebar match that of the
+account the session list was last moved from.  `move` records which
+account that was, on a second line of the state file, and `record`
+starts the state file afresh without it.  To copy from some other
+account, name it as `<account>/<org>`, the way `layout` or `groups`
+lists it:
+
+```bash
+./account-switch.sh for-claude <account>/<org>
+```
+
+It refuses to run until `move` has put the list with the signed-in
+account, because until then the sidebar it would describe is empty.  It
+also refuses an account it has no record of, and an account with two
+sections of the same name, which the instructions could not tell apart.
+
+The instructions use the app's sidebar tools.  Those tools belong to the
+app, which gives them only to the Claude sessions it hosts.  The
+instructions list the other account's sections in sidebar order, each
+with its settings in the form the `list_sections` tool reports them.
+Claude compares that list with what `list_sections` reports for the
+signed-in account.  It creates each section that is missing, and sets
+each section's sorting and grouping where they differ.  Each account
+gives its custom sections identifiers of its own, so the instructions
+name a custom section by its label, and Claude looks up its identifier
+with `list_sections`.
+
+The instructions also give the calls that file each session the other
+account had filed, with the same exceptions as `move`.  Filing a pinned
+session unpins it, so they pin each such session again.  A session is
+taken to be pinned when its file has `isStarred` set.  On the machine
+this was written for, the one such session was the one the sidebar
+showed as pinned.  The tool that lists groups says that a pinned session
+keeps its group, so pinning a session after filing it is taken not to
+undo the filing.  Neither has been checked by filing a pinned session.
+
+The instructions list the changes the tools cannot make, for Claude to
+ask the user to make in the sidebar:
+
+- the order of the sections;
+- whether each section is shown, whether it is collapsed, and whether
+  it is sorted ascending or descending;
+- which details each section's rows show;
+- filing any item that is not a Code session.
+
+`list_sections` does not report which details a section's rows show.
+For those, the instructions compare with the signed-in account's copy
+in `claude_desktop_config.json`.  A section that copy does not have is
+assumed to show no details.  This is a guess, based on every custom
+section on the machine this was written for showing none.
+
+Like `move`, the instructions leave alone the sections that only the
+signed-in account has, and the sessions that only it has filed.  A
+session is in one group at a time, so a session the two accounts filed
+in different groups is moved to the group the other account filed it
+in, and the instructions name the group it leaves.
+
+`list_sections` reported a section with no recorded grouping as grouped
+by nothing, for custom sections and for Pinned and Routines, and the
+instructions list such a section that way.  The Sessions section is
+different.  With no grouping recorded for it, `list_sections` reported
+it as grouped by folder on the machine this was written for.  The
+`set_view` tool describes the grouping of the Sessions section as that
+of the whole list, so that is taken to be where the grouping came from.
+The instructions give no grouping for such a Sessions section, so the
+signed-in account's grouping of it stays as it is.
 
 ## Recovering sessions the app failed to save
 
@@ -483,6 +557,14 @@ Verified on a real switch between two accounts:
   in version 2.42304.0.  `move` listed that one setting.  On reopening, the
   app's sidebar tools reported the signed-in account's own sorting, Claude
   set it with them, and `layout` then showed the two accounts alike.
+- `for-claude` on the machine this was written for, in version
+  2.42304.0, compared with what `list_sections` reported for the
+  signed-in account.  The built-in sections' identifiers, the custom
+  sections' names, and each section's settings were in the same form,
+  and with no grouping recorded, sections were reported as described
+  under "Steps for Claude".  `test-steps.py` checks the instructions on
+  made-up records, and `test-move.sh` checks that `move` records the
+  account `for-claude` copies from, and that a second `move` keeps it.
 - `move` and then `recover --apply` on the machine where the failure
   happened.  `move` removed the two links, and `recover` wrote the 81
   missing sessions and updated 23.  On relaunch the app loaded all 1163

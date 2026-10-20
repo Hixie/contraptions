@@ -78,6 +78,21 @@ def sessions(support):
     return result
 
 
+def missing(scopes, known, source, target):
+    """The filings of account/org source that target lacks, as (group name,
+    [member, ...]) in sidebar order.  Sessions that no longer exist here are
+    left out, and so are archived sessions, which the app's sidebar does not
+    show in groups or let anyone file there."""
+    have = {(name, m) for name, members in scopes.get(target, []) for m in members}
+    result = []
+    for name, members in scopes.get(source, []):
+        members = [m for m in members if (name, m) not in have
+                   and (not m.startswith("code:") or (m in known and not known[m].get("isArchived")))]
+        if members:
+            result.append((name, members))
+    return result
+
+
 def describe(member, known):
     kind, _, ident = member.partition(":")
     if kind == "code":
@@ -96,14 +111,10 @@ def main():
     scopes = filings(support)
     known = sessions(support)
     if len(sys.argv) == 4:
-        have = {(name, m) for name, members in scopes.get(sys.argv[3], []) for m in members}
-        for name, members in scopes.get(sys.argv[2], []):
-            missing = [m for m in members if (name, m) not in have
-                       and (not m.startswith("code:") or (m in known and not known[m].get("isArchived")))]
-            if missing:
-                print(name)
-                for member in missing:
-                    print("  " + describe(member, known))
+        for name, members in missing(scopes, known, sys.argv[2], sys.argv[3]):
+            print(name)
+            for member in members:
+                print("  " + describe(member, known))
         return
     for scope, groups in scopes.items():
         print("%s:" % scope)

@@ -46,10 +46,12 @@ def run(support, *args):
 def main():
     with tempfile.TemporaryDirectory() as support:
         write_config(support, {
-            A: {"sections": [section("sessions", 2, "created", show={"sideChats": True}),
+            A: {"sections": [section("sessions", 2, "created", show={"sideChats": True},
+                                     groupBy="none"),
                              section("pinned", 0),
                              section("routines", 1, collapsed=True, shown=False),
-                             section("manual", 3, id="g1", name="Blocked")],
+                             section("manual", 3, id="g1", name="Blocked"),
+                             {"kind": "from-a-later-version"}],
                 "migratedFrom": 1, "prefsSeeded": True},
             B: {"sections": [section("pinned", 0), section("routines", 1, collapsed=True, shown=False),
                              section("sessions", 2)],
@@ -61,17 +63,21 @@ def main():
         check(code, 0, "succeeds")
         check(out.splitlines()[:4], [
             A + ":",
-            "  Pinned: shown yes, collapsed no, sorted by last activity, order descending, "
-            "shows metadata no, shows empty groups no, shows side chats no",
-            "  Routines: shown no, collapsed yes, sorted by last activity, order descending, "
-            "shows metadata no, shows empty groups no, shows side chats no",
-            "  Sessions: shown yes, collapsed no, sorted by date created, order descending, "
+            "  Pinned: shown yes, collapsed no, grouped by nothing, sorted by last activity, "
+            "order descending, shows metadata no, shows empty groups no, shows side chats no",
+            "  Routines: shown no, collapsed yes, grouped by nothing, sorted by last activity, "
+            "order descending, shows metadata no, shows empty groups no, shows side chats no",
+            "  Sessions: shown yes, collapsed no, grouped by nothing, sorted by date created, "
+            "order descending, "
             "shows metadata no, shows empty groups no, shows side chats yes",
-        ], "lists built-in sections in sidebar order, leaving custom groups to sidebar-groups.py")
+        ], "lists built-in sections in sidebar order, leaving custom groups to sidebar-groups.py "
+           "and ignoring sections of kinds it does not know, with no recorded grouping taken "
+           "as nothing except for Sessions")
 
         print("== what one account has set and another has not")
         code, out, _ = run(support, A, B)
-        check((code, out), (0, "Sessions: sorted by date created (this account: last activity)\n"
+        check((code, out), (0, "Sessions: grouped by nothing (this account: not set)\n"
+                               "Sessions: sorted by date created (this account: last activity)\n"
                                "Sessions: shows side chats yes (this account: no)\n"),
               "lists only the settings the second account does not share")
         code, out, _ = run(support, B, B)
@@ -83,6 +89,18 @@ def main():
               (0, "Sessions: shown yes, collapsed no, sorted by last activity, order descending, "
                   "shows metadata no, shows empty groups no, shows side chats no"),
               "an account the app has not laid out yet gets the whole layout")
+
+        print("== groupings as the app reports them")
+        write_config(support, {
+            A: {"sections": [section("pinned", 0, groupBy="none"), section("sessions", 1)]},
+            B: {"sections": [section("pinned", 0), section("sessions", 1, groupBy="date")]},
+        })
+        code, out, _ = run(support, A, B)
+        check((code, out), (0, ""), "no recorded grouping matches nothing, and Sessions with none "
+              "recorded has nothing to list")
+        code, out, _ = run(support, B, A)
+        check((code, out), (0, "Sessions: grouped by date (this account: not set)\n"),
+              "a recorded grouping of Sessions is listed when the other has none")
 
         print("== a reordered sidebar")
         write_config(support, {

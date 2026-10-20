@@ -12,7 +12,7 @@ export HOME="$T/home"
 sed 's|^app_is_running() {|app_is_running() { return 1; }\nreal_app_is_running() {|' \
   "$here/account-switch.sh" > "$T/as.sh"
 chmod +x "$T/as.sh"
-cp "$here/sidebar-groups.py" "$here/sidebar-layout.py" "$T/"
+cp "$here/sidebar-groups.py" "$here/sidebar-layout.py" "$here/sidebar-steps.py" "$T/"
 S="$HOME/Library/Application Support/Claude"
 CODE="$S/claude-code-sessions"
 AGENT="$S/local-agent-mode-sessions"
@@ -37,7 +37,7 @@ sessions() { ls -A "$CODE/$1/$2" 2>/dev/null | grep -c '^local_'; }
 exists() { if [ -L "$1" ]; then echo link; elif [ -d "$1" ]; then echo dir; else echo none; fi; }
 nlinks() { find "$CODE" "$AGENT" -maxdepth 2 -type l | wc -l | tr -d ' '; }
 move() { "$T/as.sh" move > "$T/out" 2>&1; }
-recorded() { cut -d' ' -f1-2 "$HOME/.claude-account-switch-state"; }
+recorded() { head -1 "$HOME/.claude-account-switch-state" | cut -d' ' -f1-2; }
 # Record sidebar filings as the app does: for each account/org, group name
 # and session given, that session is filed in that group.
 store_group() {
@@ -73,6 +73,9 @@ PY
 echo "== first switch, to an account with a history of its own"
 reset
 login $A $AO; session $A $AO a1; session $A $AO a2
+"$T/as.sh" record > /dev/null
+"$T/as.sh" for-claude > "$T/steps" 2>&1; check $? 1 "for-claude fails before any move"
+check "$(grep -c "'move'$" "$T/steps")" 1 "and says move records the account to copy from"
 echo '{"v":1,"archived":["local_a1"]}' > "$CODE/$A/$AO/archived-sessions.idx"
 mkdir -p "$AGENT/$A/$AO/agent"; echo '{}' > "$AGENT/$A/$AO/agent/local_x1.json"
 "$T/as.sh" record > /dev/null
@@ -96,6 +99,12 @@ move; check $? 0 "a second move succeeds"
 check "$(grep -c 'already with the signed-in account' "$T/out")" 2 "and reports the list already in place"
 
 check "$(grep -c 'had filed' "$T/out")" 0 "nothing is said about sidebar groups when there were none"
+"$T/as.sh" for-claude "$A/$AO" > "$T/steps" 2>&1; check $? 1 "for-claude fails for an account with no sidebar recorded"
+check "$(grep -c "nothing is recorded about the sidebar of $A/$AO" "$T/steps")" 1 "and says so"
+store_layout "$A/$AO" created
+"$T/as.sh" for-claude "$A/$AO" > "$T/steps" 2>&1; check $? 0 "for-claude takes an account to copy from"
+check "$(grep -c "Copy from:    $A/$AO$" "$T/steps")" 1 "and names it"
+"$T/as.sh" for-claude "$A/$AO" extra > "$T/steps" 2>&1; check $? 1 "for-claude refuses extra arguments"
 
 echo "== switching back"
 login $A $AO; session $A $AO a3
@@ -123,10 +132,23 @@ move; check $? 0 "move succeeds"
 check "$(grep -c "$A had these settings" "$T/out")" 1 "move says the layout stays behind"
 check "$(grep -A2 'sidebar layout stays' "$T/out" | tail -1 | tr -s ' ')" \
   " Sessions: sorted by date created (this account: last activity)" "and lists the setting that differs"
+check "$(grep -c 'for-claude' "$T/out")" 1 "and points at the steps for Claude"
+"$T/as.sh" for-claude > "$T/steps" 2>&1; check $? 0 "for-claude succeeds"
+check "$(grep -c "Copy from:    $A/$AO" "$T/steps")" 1 "for-claude names the account the list came from"
+check "$(grep -c '^  sessions *{.*"sort_by": "created"' "$T/steps")" 1 \
+  "and gives the setting to make"
+move; check $? 0 "a second move succeeds"
+"$T/as.sh" for-claude > "$T/steps" 2>&1
+check "$(grep -c "Copy from:    $A/$AO" "$T/steps")" 1 "and for-claude still names the account the list came from"
 store_layout "$A/$AO" recency
 login $A $AO
 move; check $? 0 "moving back succeeds"
 check "$(grep -c -E 'sidebar layout|Could not compare' "$T/out")" 0 "nothing is said when the layouts match"
+"$T/as.sh" for-claude > "$T/steps" 2>&1
+check "$(grep -c "Copy from:    $B/$BO" "$T/steps")" 1 "for-claude follows the latest move"
+login $B $BO
+"$T/as.sh" for-claude > "$T/steps" 2>&1; check $? 1 "for-claude fails before the list has moved"
+check "$(grep -c "run 'move' first" "$T/steps")" 1 "and says to run move"
 
 echo "== filings the signed-in account already has are not listed"
 reset

@@ -26,6 +26,8 @@
 #   ./account-switch.sh move      # after each switch to another account
 #   ./account-switch.sh groups    # each account's sidebar groups
 #   ./account-switch.sh layout    # each account's sidebar layout
+#   ./account-switch.sh for-claude [<account>/<org>]
+#                                 # steps for Claude to copy over the sidebar
 #   ./account-switch.sh recover [--apply|--verify]
 #
 # Sidebar groups are kept per account by the app and on claude.ai, not in the
@@ -34,6 +36,8 @@
 # The sidebar's layout -- how each section is sorted, which are shown or
 # collapsed -- is kept per account the same way, and "move" lists the settings
 # the previous account had that this one does not, so they can be set again.
+# "for-claude" prints steps for Claude, in a Code session in the app, to file
+# those sessions and make those settings with the app's sidebar tools.
 #
 # The account this script acts on comes from the app's own config.json, in the
 # key "lastKnownAccountUuid", together with the <account>/<org> directory the
@@ -53,6 +57,10 @@
 set -u
 
 SUPPORT="$HOME/Library/Application Support/Claude"
+# The state file's first line is "<account> <org> <email>" for the account
+# holding the list.  Its second line, once "move" has moved the list, is
+# "<account>/<org>" for the account the list was moved from, followed by its
+# email when that is known.
 STATE="$HOME/.claude-account-switch-state"
 DIRS=(claude-code-sessions local-agent-mode-sessions)
 
@@ -229,7 +237,7 @@ case "${1-}" in
       echo "these files as it goes, and this step moves them." >&2
       exit 1
     fi
-    read -r old_acct old_org old_email < "$STATE"
+    { read -r old_acct old_org old_email; read -r previous; } < "$STATE"
     pair="$(live_pair)" || exit 1
     read -r acct org <<< "$pair"
     email="$(cached_email "$acct")"
@@ -315,25 +323,28 @@ case "${1-}" in
       echo "No session list was found to move." >&2
       exit 1
     fi
-    printf '%s %s %s\n' "$acct" "$org" "$email" > "$STATE"
+    name=""
+    if [ "$from" = "$old_acct/$old_org" ] && [ "$old_email" != unknown ]; then
+      name="$old_email"
+    fi
+    who="${name:-${from%%/*}}"
+    [ "$moves" -gt 0 ] && [ "$from" != "$acct/$org" ] && previous="$from${name:+ $name}"
+    { printf '%s %s %s\n' "$acct" "$org" "$email"; [ -z "$previous" ] || echo "$previous"; } > "$STATE"
     if [ "$moves" -eq 0 ]; then
       echo "The session list is already with the account the app is logged in"
       echo "as.  After a switch, open the app once so it creates its directory,"
       echo "then quit the app and rerun this."
     else
       echo "Recorded $email as the account holding the list."
-      who="${from%%/*}"
-      if [ "$from" = "$old_acct/$old_org" ] && [ "$old_email" != unknown ]; then
-        who="$old_email"
-      fi
       if ! groups="$(python3 "$(dirname "$0")/sidebar-groups.py" "$SUPPORT" "$from" "$acct/$org")"; then
         echo "Could not list the sidebar groups $who had; see the message above."
       elif [ -n "$groups" ]; then
         echo
         echo "Sidebar groups stay with each account.  $who had filed these sessions"
-        echo "in groups, and this account has not:"
+        echo "in groups, and this account has not filed them there:"
         sed 's/^/  /' <<< "$groups"
-        echo "File them in the app, making any group that is missing, or ask Claude to."
+        echo "File them in the app, making any group that is missing, or ask Claude"
+        echo "to follow what '$0 for-claude' prints."
       fi
       if ! layout="$(python3 "$(dirname "$0")/sidebar-layout.py" "$SUPPORT" "$from" "$acct/$org")"; then
         echo "Could not compare the sidebar layout $who had; see the message above."
@@ -342,7 +353,8 @@ case "${1-}" in
         echo "The sidebar layout stays with each account too.  $who had these settings,"
         echo "and this account has not:"
         sed 's/^/  /' <<< "$layout"
-        echo "Set them in the sidebar's section menus, or ask Claude to."
+        echo "Set them in the sidebar's section menus, or ask Claude to follow what"
+        echo "'$0 for-claude' prints."
       fi
       echo "Now open the Claude app again."
     fi
@@ -354,6 +366,28 @@ case "${1-}" in
 
   layout)
     python3 "$(dirname "$0")/sidebar-layout.py" "$SUPPORT"
+    ;;
+
+  for-claude)
+    [ $# -le 2 ] || { echo "usage: $0 for-claude [<account>/<org>]" >&2; exit 1; }
+    [ -f "$STATE" ] || { echo "No recorded account; run 'record' first." >&2; exit 1; }
+    { read -r old_acct old_org old_email; read -r last_from last_who; } < "$STATE"
+    pair="$(live_pair)" || exit 1
+    read -r acct org <<< "$pair"
+    if [ "$acct $org" != "$old_acct $old_org" ]; then
+      echo "The session list is not with the account the app is signed in as." >&2
+      echo "Quit the app and run 'move' first." >&2
+      exit 1
+    fi
+    if [ $# -eq 2 ]; then
+      last_from="$2" last_who=""
+    elif [ -z "$last_from" ]; then
+      echo "No account is recorded as the one the list was moved from; 'move'" >&2
+      echo "records it.  Name one instead, as <account>/<org>, from those that" >&2
+      echo "'layout' or 'groups' lists." >&2
+      exit 1
+    fi
+    python3 "$(dirname "$0")/sidebar-steps.py" "$SUPPORT" "$last_from" "$acct/$org" ${last_who:+"$last_who"}
     ;;
 
   recover)
@@ -377,7 +411,7 @@ case "${1-}" in
     ;;
 
   *)
-    echo "usage: $0 status|record|move|groups|layout|recover [--apply|--verify]" >&2
+    echo "usage: $0 status|record|move|groups|layout|for-claude [<account>/<org>]|recover [--apply|--verify]" >&2
     exit 1
     ;;
 esac
