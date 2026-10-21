@@ -604,7 +604,7 @@ enum ConnectionState {
     case disconnected(reason: String, retryAt: Date?)
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let configurationURL: URL
     private var configuration: Configuration?
     private var connection: RelayConnection?
@@ -612,6 +612,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var retryDelay = firstRetryDelay
     private var retry: DispatchWorkItem?
     private var recent: [Run] = []
+    /// How long after GitHub made it the last delivery on this connection
+    /// arrived, when its delivery ID says when that was.
+    private var lastDeliveryAge: TimeInterval?
+    private var dimming = Dimming()
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private let settingsWindow: SettingsWindow
@@ -635,6 +639,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = makeMainMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.menu = menu
+        menu.delegate = self
+        // A layer, so that a delivery can dim the indicator.
+        statusItem.button?.wantsLayer = true
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake),
             name: NSWorkspace.didWakeNotification, object: nil)
@@ -659,12 +666,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         self.configuration = configuration
+        lastDeliveryAge = nil
         let connection = RelayConnection(configuration)
         connection.onReady = { [weak self] in
             self?.show(.connected(since: Date()))
         }
         connection.onDelivery = { [weak self] delivery in
-            self?.handle(delivery)
+            self?.received(delivery)
         }
         connection.onEnded = { [weak self] reason in
             self?.connectionEnded(reason)
@@ -699,6 +707,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Dims the indicator briefly for every delivery, notes how late it
+    /// arrived, and then handles it.
+    private func received(_ delivery: Delivery) {
+        lastDeliveryAge = delivery.headers["x-github-delivery"].flatMap(creationTime(ofDelivery:))
+            .map { Date().timeIntervalSince($0) }
+        // Each delivery replaces the animation with one from the indicator's
+        // opacity at that moment.
+        let steps = dimming.deliver(at: CACurrentMediaTime())
+        let duration = steps[steps.count - 1].time
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = steps.map(\.opacity)
+        animation.keyTimes = steps.map { NSNumber(value: $0.time / duration) }
+        animation.duration = duration
+        statusItem.button?.layer?.add(animation, forKey: "pulse")
+        updateIndicator()
+        handle(delivery)
+    }
+
     private func handle(_ delivery: Delivery) {
         guard let configuration else { return }
         guard delivery.headers["x-github-event"] == "pull_request" else { return }
@@ -724,21 +750,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func show(_ state: ConnectionState) {
         self.state = state
+        switch state {
+        case .connecting:
+            break
+        case .connected:
+            log("connected to \(configuration?.relay ?? "the relay")")
+        case .disconnected(let reason, _):
+            log("not connected: \(reason)")
+        }
+        updateIndicator()
+        updateMenu()
+    }
+
+    /// Shows the state in the indicator and its tooltip. While connected,
+    /// the indicator is orange when the last delivery arrived late.
+    private func updateIndicator() {
         let symbol: String
+        var tint: NSColor?
         switch state {
         case .connecting:
             symbol = "ellipsis.circle"
         case .connected:
             symbol = "arrow.triangle.pull"
-            log("connected to \(configuration?.relay ?? "the relay")")
-        case .disconnected(let reason, _):
+            if let lastDeliveryAge, isLate(lastDeliveryAge) {
+                tint = .systemOrange
+            }
+        case .disconnected:
             symbol = "exclamationmark.triangle"
-            log("not connected: \(reason)")
         }
-        statusItem.button?.image = NSImage(systemSymbolName: symbol,
-                                           accessibilityDescription: "github-hookbar")
+        var image = NSImage(systemSymbolName: symbol, accessibilityDescription: "github-hookbar")
+        // The menu bar draws a template image in its own color, so a colored
+        // indicator is an ordinary image drawn in that color.
+        if let tint {
+            image = image?.withSymbolConfiguration(.init(paletteColors: [tint]))
+            image?.isTemplate = false
+        }
+        statusItem.button?.image = image
         statusItem.button?.toolTip = statusLines.joined(separator: "\n")
-        updateMenu()
     }
 
     private var statusLines: [String] {
@@ -746,8 +794,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .connecting:
             return ["Connecting to \(configuration?.relay ?? "the relay")…"]
         case .connected(let since):
-            return ["Connected to \(configuration?.relay ?? "the relay") since "
-                    + timeFormatter.string(from: since)]
+            var lines = ["Connected to \(configuration?.relay ?? "the relay") since "
+                         + timeFormatter.string(from: since)]
+            if let lastDeliveryAge {
+                lines.append(String(format: "The last delivery arrived %.1f seconds after "
+                                    + "GitHub made it", lastDeliveryAge))
+            }
+            return lines
         case .disconnected(let reason, let retryAt):
             var lines = ["Not connected: \(reason)"]
             if let retryAt {
@@ -755,6 +808,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return lines
         }
+    }
+
+    /// Refreshes the menu as it opens, so that it says how late the last
+    /// delivery arrived without being rebuilt for every delivery.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        updateMenu()
     }
 
     private func updateMenu() {

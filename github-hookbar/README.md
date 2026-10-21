@@ -7,15 +7,22 @@ request, announce it, or hand it to whatever should start work on it.
 
 ## What the indicator means
 
-- **Pull request arrows**: connected to the relay.
+- **Pull request arrows**: connected to the relay. The arrows dim for a
+  moment when a delivery arrives, and stay dim while deliveries keep
+  arriving less than a quarter of a second apart. They turn orange when
+  the last delivery arrived more than five seconds after GitHub made it,
+  and are otherwise the menu bar's own color. Orange means GitHub or the
+  relay is delivering slowly, the delivery waited while the computer
+  slept, or this computer's clock is wrong.
 - **Circle with three dots**: connecting.
 - **Warning triangle**: not connected. The menu says why, and when
   github-hookbar will try again.
 
 ## The menu
 
-The menu says whether github-hookbar is connected, and to what, and names the
-command it runs. Below that are the last ten pull requests it ran the command
+The menu says whether github-hookbar is connected, and to what, how long
+after GitHub made it the last delivery arrived, and names the command it
+runs. Below that are the last ten pull requests it ran the command
 for, newest first, each marked with a clock while the command runs, a tick
 when it exits with status 0, and a cross otherwise. Hovering over one shows
 the exit status and everything the command printed. Choosing one opens the
@@ -45,6 +52,12 @@ It reads the body as JSON, so the GitHub webhook's content type must be
 The connection to the relay is neither encrypted nor authenticated, and
 webhook payloads can describe private repositories, so the relay should be
 reachable only from computers you trust, for example over a private network.
+
+github-hookbar learns when GitHub made a delivery from its
+`X-GitHub-Delivery` header, which GitHub sets to a time-based (version 1)
+UUID. GitHub gives a redelivered webhook the same ID as the original, so
+a redelivery counts as late. A delivery whose ID is not a time-based UUID
+returns the arrows to the menu bar's own color.
 
 The relay keeps no history, so a pull request opened while github-hookbar is
 not connected does not run the command. Redelivering the webhook from GitHub,
@@ -116,10 +129,11 @@ not connected.
 ## Building and running
 
 Requires the Xcode command line tools, for `swiftc`. There is no Xcode
-project; the whole app is one Swift file.
+project; the app is two Swift files, `main.swift` and `timing.swift`.
 
 ```sh
 make              # builds ./github-hookbar
+make test         # builds and runs the tests in tests/main.swift
 ./github-hookbar  # runs the menu bar indicator in the foreground
 ```
 
