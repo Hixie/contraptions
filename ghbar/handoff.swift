@@ -41,20 +41,21 @@ enum HandOffOutcome {
     }
 }
 
-func handOffPrompt(_ status: BranchStatus) -> String {
+/// The request to the agent, followed by `report`, which says what failed.
+func handOffPrompt(_ status: BranchStatus, report: String) -> String {
     var prompt = "Select an appropriate worktree and fix the red \(status.branch) on "
         + status.repository.slug
     if let url = status.checksURL {
         prompt += ": \(url.absoluteString)"
     }
-    return prompt
+    return prompt + "\n\n" + report
 }
 
 /// Hands the branch to the agent and calls back on the main thread once the
 /// session has been started, or has failed to start.
-func handOff(_ status: BranchStatus, to agent: Agent, in folder: URL,
+func handOff(_ status: BranchStatus, report: String, to agent: Agent, in folder: URL,
              completion: @escaping (HandOffOutcome) -> Void) {
-    let prompt = handOffPrompt(status)
+    let prompt = handOffPrompt(status, report: report)
     let target = "\(status.repository.name) \(status.branch)"
     switch agent {
     case .claude:

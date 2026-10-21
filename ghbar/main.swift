@@ -13,8 +13,6 @@ import AppKit
 
 // MARK: - Constants
 
-let applicationName = "ghbar"
-
 /// Prefix for the preference domain, the lock file names, and the launchd
 /// agent labels. The instance number is appended to it.
 let identifierPrefix = "local.ghbar"
@@ -26,14 +24,6 @@ let defaultBranchName = "main"
 let defaultRefreshSeconds = 60.0
 let minimumRefreshSeconds = 15.0
 
-let apiRoot = "https://api.github.com"
-let apiVersion = "2022-11-28"
-let checkRunsPageSize = 100
-
-/// How many of a commit's checks the rollup query asks for by name. The
-/// verdict it comes back with covers every check, however many there are.
-let rollupContextLimit = 100
-
 /// Marks the fields the login shell prints, so the token can be picked out of
 /// whatever else the user's profile writes to standard output.
 let shellFieldSeparator = "\u{1e}"
@@ -44,50 +34,6 @@ let shellFieldSeparator = "\u{1e}"
 let inlineCheckLimit = 12
 
 // MARK: - Repository references
-
-struct RepositoryReference: Equatable {
-    let owner: String
-    let name: String
-
-    var slug: String { "\(owner)/\(name)" }
-}
-
-func isRepositoryNameCharacter(_ character: Character) -> Bool {
-    guard character.isASCII else { return false }
-    return character.isLetter || character.isNumber || character == "." || character == "-"
-        || character == "_"
-}
-
-func isRepositoryNameComponent(_ text: String) -> Bool {
-    !text.isEmpty && text.allSatisfy(isRepositoryNameCharacter)
-}
-
-/// Reads "owner/name", "github.com/owner/name", and full repository or branch
-/// URLs. A URL that names a branch, such as one ending in "/tree/main", also
-/// yields that branch.
-func parseRepository(_ text: String) -> (repository: RepositoryReference, branch: String?)? {
-    var remainder = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let host = remainder.range(of: "github.com") {
-        remainder = String(remainder[host.upperBound...])
-    }
-    while remainder.hasPrefix("/") || remainder.hasPrefix(":") {
-        remainder.removeFirst()
-    }
-    if remainder.hasSuffix(".git") {
-        remainder.removeLast(4)
-    }
-    let parts = remainder.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-    guard parts.count >= 2,
-          isRepositoryNameComponent(parts[0]),
-          isRepositoryNameComponent(parts[1]) else {
-        return nil
-    }
-    let repository = RepositoryReference(owner: parts[0], name: parts[1])
-    if parts.count >= 4, parts[2] == "tree" || parts[2] == "commits" {
-        return (repository, parts[3...].joined(separator: "/"))
-    }
-    return (repository, nil)
-}
 
 /// Reads a folder as typed, which may start with a tilde. A relative path is
 /// taken from the home folder, and empty means the home folder.
@@ -115,6 +61,7 @@ enum SettingsKey {
     static let refreshSeconds = "refreshSeconds"
     static let handOff = "handOff"
     static let handOffFolder = "handOffFolder"
+    static let relay = "relay"
 }
 
 /// One indicator's settings, kept in a preference domain of its own so that
@@ -175,6 +122,12 @@ final class Settings {
     }
 
     var handOffFolderURL: URL { folderURL(handOffFolder) }
+
+    /// The webhook relay to hear about changes from, if any.
+    var relay: RelayAddress? {
+        get { store.string(forKey: SettingsKey.relay).flatMap(parseRelayAddress) }
+        set { store.set(newValue?.description, forKey: SettingsKey.relay) }
+    }
 
     /// The text drawn next to the indicator in the menu bar.
     var displayName: String {
@@ -611,885 +564,22 @@ final class CredentialResolver {
     }
 }
 
-// MARK: - Check results
+// MARK: - Asking GitHub with the user's token
 
-enum CheckState: String {
-    case passing
-    case failing
-    case running
-    /// Reported, but neither a pass nor a failure: skipped, neutral, or stale.
-    case other
-}
-
-struct CheckSummary {
-    let name: String
-    let state: CheckState
-    let detail: String
-    let url: URL?
-}
-
-enum Health {
-    case passing
-    case failing
-    case running
-    /// Nothing reported a pass, a failure, or work in progress.
-    case inconclusive
-}
-
-func rollUp(_ checks: [CheckSummary]) -> Health {
-    if checks.contains(where: { $0.state == .failing }) { return .failing }
-    if checks.contains(where: { $0.state == .running }) { return .running }
-    if checks.contains(where: { $0.state == .passing }) { return .passing }
-    return .inconclusive
-}
-
-func checkState(runStatus: String, conclusion: String?) -> CheckState {
-    guard runStatus == "completed" else { return .running }
-    switch conclusion {
-    case "success":
-        return .passing
-    case "failure", "timed_out", "cancelled", "action_required", "startup_failure":
-        return .failing
-    default:
-        return .other
-    }
-}
-
-/// GitHub's own verdict over every check on a commit, whether or not the
-/// token may see them one by one.
-func health(rollupState state: String) -> Health {
-    switch state {
-    case "SUCCESS": return .passing
-    case "FAILURE", "ERROR": return .failing
-    case "PENDING", "EXPECTED": return .running
-    default: return .inconclusive
-    }
-}
-
-func checkState(commitStatus state: String) -> CheckState {
-    switch state {
-    case "success":
-        return .passing
-    case "failure", "error":
-        return .failing
-    case "pending":
-        return .running
-    default:
-        return .other
-    }
-}
-
-struct RateLimit {
-    let remaining: Int
-    let limit: Int
-    let reset: Date
-}
-
-struct BranchStatus {
-    let repository: RepositoryReference
-    let branch: String
-    let sha: String
-    let headline: String?
-    let checks: [CheckSummary]
-    /// How many checks GitHub says are on the commit, which can be more than
-    /// it is willing to name.
-    let reportedCheckCount: Int
-    /// How many of those it refused to name, for want of a permission.
-    let unreadableCheckCount: Int
-    let health: Health
-    let fetched: Date
-    let rateLimit: RateLimit?
-
-    /// Checks that GitHub counted but did not name, and did not refuse
-    /// either: they are past the end of the page that was asked for.
-    var unlistedCheckCount: Int {
-        max(0, reportedCheckCount - checks.count - unreadableCheckCount)
-    }
-
-    var shortSHA: String { String(sha.prefix(7)) }
-
-    var checksURL: URL? {
-        URL(string: "https://github.com/\(repository.slug)/commit/\(sha)/checks")
-    }
-
-    func count(_ state: CheckState) -> Int {
-        checks.reduce(into: 0) { total, check in
-            if check.state == state { total += 1 }
-        }
-    }
-}
-
-struct FetchFailure: Error {
-    /// Short enough for a menu item.
-    let message: String
-    /// Everything known about the refusal, for the tooltip.
-    var detail: String? = nil
-    let authenticationFailed: Bool
-}
-
-// MARK: - GitHub requests
-
-private struct CombinedStatusResponse: Decodable {
-    struct Entry: Decodable {
-        let context: String
-        let state: String
-        let description: String?
-        let targetUrl: String?
-    }
-    let sha: String
-    let statuses: [Entry]
-}
-
-private struct CheckRunsResponse: Decodable {
-    struct Run: Decodable {
-        let name: String
-        let status: String
-        let conclusion: String?
-        let htmlUrl: String?
-    }
-    let checkRuns: [Run]
-}
-
-private struct CommitResponse: Decodable {
-    struct Details: Decodable {
-        let message: String
-    }
-    let commit: Details
-}
-
-/// Asks for one branch's head commit and GitHub's verdict over the checks on
-/// it. The verdict is computed by GitHub across every check, so it is right
-/// even when the token may not see the checks one by one, which is the case
-/// for a fine-grained personal access token: those cannot be granted the
-/// Checks permission at all.
-let rollupQuery = """
-query($owner: String!, $name: String!, $branch: String!) {
-  repository(owner: $owner, name: $name) {
-    ref(qualifiedName: $branch) {
-      target {
-        ... on Commit {
-          oid
-          messageHeadline
-          statusCheckRollup {
-            state
-            contexts(first: \(rollupContextLimit)) {
-              totalCount
-              nodes {
-                kind: __typename
-                ... on CheckRun { name status conclusion detailsUrl }
-                ... on StatusContext { context state targetUrl description }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-
-private struct RollupResponse: Decodable {
-    struct Complaint: Decodable {
-        let message: String
-    }
-
-    struct Node: Decodable {
-        let kind: String
-        let name: String?
-        let status: String?
-        let conclusion: String?
-        let detailsUrl: String?
-        let context: String?
-        let state: String?
-        let targetUrl: String?
-        let description: String?
-    }
-
-    struct Contexts: Decodable {
-        let totalCount: Int
-        let nodes: [Node?]
-    }
-
-    struct Rollup: Decodable {
-        let state: String
-        let contexts: Contexts
-    }
-
-    struct Target: Decodable {
-        let oid: String?
-        let messageHeadline: String?
-        let statusCheckRollup: Rollup?
-    }
-
-    struct Ref: Decodable {
-        let target: Target?
-    }
-
-    struct Repository: Decodable {
-        let ref: Ref?
-    }
-
-    struct Payload: Decodable {
-        let repository: Repository?
-    }
-
-    let data: Payload?
-    let errors: [Complaint]?
-}
-
-/// Reads one entry of the rollup. A null entry is one GitHub counted but
-/// would not name.
-private func checkSummary(_ node: RollupResponse.Node) -> CheckSummary? {
-    switch node.kind {
-    case "CheckRun":
-        guard let name = node.name, let status = node.status else { return nil }
-        let conclusion = node.conclusion?.lowercased()
-        return CheckSummary(name: name,
-                            state: checkState(runStatus: status.lowercased(),
-                                              conclusion: conclusion),
-                            detail: conclusion ?? status.lowercased(),
-                            url: node.detailsUrl.flatMap(URL.init(string:)))
-    case "StatusContext":
-        guard let context = node.context, let state = node.state else { return nil }
-        return CheckSummary(name: context,
-                            state: checkState(commitStatus: state.lowercased()),
-                            detail: node.description ?? state.lowercased(),
-                            url: node.targetUrl.flatMap(URL.init(string:)))
-    default:
-        return nil
-    }
-}
-
-enum GetOutcome {
-    case ok(data: Data, etag: String?, rate: RateLimit?, nextPage: URL?)
-    case notModified(rate: RateLimit?)
-    case failure(FetchFailure)
-}
-
-func escapePathComponent(_ text: String) -> String {
-    // Slashes are left alone: GitHub takes a branch such as "release/1.2" as
-    // the whole of the ref in the path.
-    text.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? text
-}
-
-func parseRateLimit(_ response: HTTPURLResponse) -> RateLimit? {
-    guard let remaining = Int(response.value(forHTTPHeaderField: "x-ratelimit-remaining") ?? ""),
-          let limit = Int(response.value(forHTTPHeaderField: "x-ratelimit-limit") ?? ""),
-          let reset = Double(response.value(forHTTPHeaderField: "x-ratelimit-reset") ?? "") else {
-        return nil
-    }
-    return RateLimit(remaining: remaining, limit: limit,
-                     reset: Date(timeIntervalSince1970: reset))
-}
-
-/// Reads the address of the next page out of a Link header, which looks like
-/// `<https://api.github.com/...&page=2>; rel="next", <...>; rel="last"`.
-func nextPageURL(from header: String?) -> URL? {
-    guard let header else { return nil }
-    for link in header.components(separatedBy: ",") {
-        let pieces = link.components(separatedBy: ";")
-        guard pieces.count >= 2 else { continue }
-        let relation = pieces[1].trimmingCharacters(in: .whitespaces)
-        guard relation == "rel=\"next\"" else { continue }
-        var target = pieces[0].trimmingCharacters(in: .whitespaces)
-        guard target.hasPrefix("<"), target.hasSuffix(">") else { continue }
-        target.removeFirst()
-        target.removeLast()
-        return URL(string: target)
-    }
-    return nil
-}
-
-let timeOfDayFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.timeStyle = .medium
-    formatter.dateStyle = .none
-    return formatter
-}()
-
-/// One GET at a time against the GitHub REST API, with the conditional request
-/// handling left to the caller. Completions run on the main thread.
-final class GitHubClient {
-    private let session: URLSession
-
-    init() {
-        let configuration = URLSessionConfiguration.ephemeral
-        // The ETags this app sends are its own, so the session is kept out of
-        // the way of them.
-        configuration.urlCache = nil
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.httpAdditionalHeaders = [
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": apiVersion,
-            "User-Agent": applicationName,
-        ]
-        session = URLSession(configuration: configuration)
-    }
-
-    func get(path: String, token: String?, etag: String?,
-             completion: @escaping (GetOutcome) -> Void) {
-        guard let url = URL(string: "\(apiRoot)/\(path)") else {
-            completion(.failure(FetchFailure(message: "\(path) is not a usable address.",
-                                             authenticationFailed: false)))
-            return
-        }
-        get(url: url, token: token, etag: etag, completion: completion)
-    }
-
-    func get(url: URL, token: String?, etag: String?,
-             completion: @escaping (GetOutcome) -> Void) {
-        var request = URLRequest(url: url)
-        if let token {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        if let etag {
-            request.setValue(etag, forHTTPHeaderField: "If-None-Match")
-        }
-        send(request, completion: completion)
-    }
-
-    /// The GraphQL endpoint takes one POST and refuses anonymous callers, so
-    /// it carries no ETag and is only reachable with a token.
-    func post(query: String, variables: [String: String], token: String,
-              completion: @escaping (GetOutcome) -> Void) {
-        guard let url = URL(string: "\(apiRoot)/graphql"),
-              let body = try? JSONSerialization.data(
-                withJSONObject: ["query": query, "variables": variables]) else {
-            completion(.failure(FetchFailure(message: "The query could not be assembled.",
-                                             authenticationFailed: false)))
-            return
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.httpBody = body
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        send(request, completion: completion)
-    }
-
-    private func send(_ request: URLRequest, completion: @escaping (GetOutcome) -> Void) {
-        let task = session.dataTask(with: request) { data, response, error in
-            let outcome = GitHubClient.interpret(data: data, response: response, error: error)
-            DispatchQueue.main.async {
-                completion(outcome)
-            }
-        }
-        task.resume()
-    }
-
-    /// GitHub explains a refusal in the body of its answer, and names the
-    /// permission the request wanted in a header. A token that can read a
-    /// repository's commit statuses but not its checks is refused on the
-    /// header's terms alone, so both are worth repeating.
-    private static func explanation(_ data: Data?,
-                                    _ response: HTTPURLResponse) -> (said: String?, needs: String?) {
-        var said: String?
-        if let data,
-           let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let message = payload["message"] as? String,
-           !message.isEmpty, message != "Not Found" {
-            said = message
-        }
-        var needs: String?
-        if let header = response.value(forHTTPHeaderField: "x-accepted-github-permissions"),
-           !header.isEmpty {
-            needs = header
-        }
-        return (said, needs)
-    }
-
-    private static func interpret(data: Data?, response: URLResponse?,
-                                  error: Error?) -> GetOutcome {
-        if let error {
-            return .failure(FetchFailure(message: error.localizedDescription,
-                                         authenticationFailed: false))
-        }
-        guard let response = response as? HTTPURLResponse else {
-            return .failure(FetchFailure(message: "GitHub sent a reply this app cannot read.",
-                                         authenticationFailed: false))
-        }
-        let rate = parseRateLimit(response)
-        switch response.statusCode {
-        case 200:
-            return .ok(data: data ?? Data(),
-                       etag: response.value(forHTTPHeaderField: "ETag"),
-                       rate: rate,
-                       nextPage: nextPageURL(from: response.value(forHTTPHeaderField: "Link")))
-        case 304:
-            return .notModified(rate: rate)
-        case 401:
-            let (said, _) = explanation(data, response)
-            let short = "GitHub rejected the token."
-            return .failure(FetchFailure(message: short,
-                                         detail: said.map { "\(short) GitHub said: \($0)" },
-                                         authenticationFailed: true))
-        case 403, 429:
-            if let rate, rate.remaining == 0 {
-                let when = timeOfDayFormatter.string(from: rate.reset)
-                return .failure(FetchFailure(
-                    message: "GitHub's rate limit is used up until \(when).",
-                    authenticationFailed: false))
-            }
-            let (said, needs) = explanation(data, response)
-            let short = needs.map { "GitHub refused: the token needs \($0)." }
-                ?? "GitHub refused the request."
-            return .failure(FetchFailure(message: short,
-                                         detail: said.map { "\(short) GitHub said: \($0)" },
-                                         authenticationFailed: false))
-        case 404:
-            let (said, needs) = explanation(data, response)
-            let short = "GitHub has no such repository or branch, or the token cannot see it."
-            var long = short
-            if let said { long += " GitHub said: \(said)" }
-            if let needs { long += " The request wanted \(needs)." }
-            return .failure(FetchFailure(message: short,
-                                         detail: long == short ? nil : long,
-                                         authenticationFailed: false))
-        case 422:
-            let (said, _) = explanation(data, response)
-            let short = "GitHub could not use that branch name."
-            return .failure(FetchFailure(message: short,
-                                         detail: said.map { "\(short) GitHub said: \($0)" },
-                                         authenticationFailed: false))
-        default:
-            let (said, _) = explanation(data, response)
-            let short = "GitHub answered with status \(response.statusCode)."
-            return .failure(FetchFailure(message: short,
-                                         detail: said.map { "\(short) GitHub said: \($0)" },
-                                         authenticationFailed: false))
-        }
-    }
-}
-
-// MARK: - Fetching one branch
-
-/// Collects the state of a branch from three GitHub endpoints and remembers
-/// enough between calls to ask conditionally. A conditional request that comes
-/// back unchanged costs nothing against the rate limit, which matters most
-/// when there is no token and the hourly allowance is sixty requests.
-final class BranchFetcher {
-    private struct StatusCache {
-        let key: String
-        let etag: String
-        let sha: String
-        let checks: [CheckSummary]
-    }
-
-    private struct CheckRunsCache {
-        let sha: String
-        let etag: String
-        let singlePage: Bool
-        let checks: [CheckSummary]
-    }
-
-    private let client = GitHubClient()
-    private let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return decoder
-    }()
-
-    private var statusCache: StatusCache?
-    private var checkRunsCache: CheckRunsCache?
-    private var headlines: [String: String] = [:]
-
-    func forget() {
-        statusCache = nil
-        checkRunsCache = nil
-        headlines.removeAll()
-    }
-
-    /// With a token, one GraphQL query answers the whole question, and it
-    /// answers it even for a token that may not see the checks one by one.
-    /// Without one, GraphQL is closed and the REST endpoints, which do serve
-    /// anonymous callers, are asked instead.
-    func fetch(repository: RepositoryReference, branch: String, token: String?,
-               completion: @escaping (Result<BranchStatus, FetchFailure>) -> Void) {
-        if let token {
-            fetchRollup(repository: repository, branch: branch, token: token,
-                        completion: completion)
-        } else {
-            fetchViaREST(repository: repository, branch: branch, completion: completion)
-        }
-    }
-
-    // MARK: The rollup, in one query
-
-    private func fetchRollup(repository: RepositoryReference, branch: String, token: String,
-                             completion: @escaping (Result<BranchStatus, FetchFailure>) -> Void) {
-        let variables = ["owner": repository.owner, "name": repository.name, "branch": branch]
-        client.post(query: rollupQuery, variables: variables, token: token) { outcome in
-            switch outcome {
-            case .failure(let failure):
-                completion(.failure(failure))
-            case .notModified:
-                completion(.failure(FetchFailure(
-                    message: "GitHub reported no change to a question asked without one.",
-                    authenticationFailed: false)))
-            case .ok(let data, _, let rate, _):
-                completion(self.readRollup(data, repository: repository, branch: branch,
-                                           rate: rate))
-            }
-        }
-    }
-
-    private func readRollup(_ data: Data, repository: RepositoryReference, branch: String,
-                            rate: RateLimit?) -> Result<BranchStatus, FetchFailure> {
-        let payload: RollupResponse
-        do {
-            payload = try decoder.decode(RollupResponse.self, from: data)
-        } catch {
-            let short = "GitHub's answer did not parse."
-            return .failure(FetchFailure(message: short,
-                                         detail: "\(short) \(error.localizedDescription)",
-                                         authenticationFailed: false))
-        }
-        guard let found = payload.data?.repository else {
-            let said = payload.errors?.first?.message
-            let short = "GitHub has no such repository, or the token cannot see it."
-            return .failure(FetchFailure(message: short,
-                                         detail: said.map { "\(short) GitHub said: \($0)" },
-                                         authenticationFailed: false))
-        }
-        guard let target = found.ref?.target, let sha = target.oid else {
-            return .failure(FetchFailure(message: "GitHub has no branch named \(branch).",
-                                         authenticationFailed: false))
-        }
-        var checks: [CheckSummary] = []
-        var unreadable = 0
-        var reported = 0
-        var verdict = Health.inconclusive
-        if let rollup = target.statusCheckRollup {
-            // The verdict is GitHub's, taken over every check on the commit.
-            // The entries beside it are only as many as this token may name;
-            // the rest arrive as nulls.
-            verdict = health(rollupState: rollup.state)
-            reported = rollup.contexts.totalCount
-            for node in rollup.contexts.nodes {
-                if let node, let summary = checkSummary(node) {
-                    checks.append(summary)
-                } else {
-                    unreadable += 1
+/// Asks GitHub through a reader of its own, with the token the login shell
+/// gives, and asks the shell again when GitHub rejects the token.
+func tokenFetch(_ credentials: CredentialResolver) -> BranchFetch {
+    let reader = BranchReader()
+    return { repository, branch, completion in
+        credentials.resolve { credential in
+            reader.fetch(repository: repository, branch: branch,
+                         token: credential.token) { result in
+                if case .failure(let failure) = result, failure.authenticationFailed {
+                    credentials.invalidate()
                 }
+                completion(result)
             }
         }
-        checks.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        return .success(BranchStatus(repository: repository,
-                                     branch: branch,
-                                     sha: sha,
-                                     headline: target.messageHeadline,
-                                     checks: checks,
-                                     reportedCheckCount: max(reported, checks.count),
-                                     unreadableCheckCount: unreadable,
-                                     health: verdict,
-                                     fetched: Date(),
-                                     rateLimit: rate))
-    }
-
-    // MARK: The same question, for a caller with no token
-
-    private func fetchViaREST(repository: RepositoryReference, branch: String,
-                              completion: @escaping (Result<BranchStatus, FetchFailure>) -> Void) {
-        let token: String? = nil
-        fetchCombinedStatus(repository: repository, branch: branch, token: token) { result in
-            switch result {
-            case .failure(let failure):
-                completion(.failure(failure))
-            case .success(let status):
-                self.fetchCheckRuns(repository: repository, sha: status.sha,
-                                    token: token) { runsResult in
-                    switch runsResult {
-                    case .failure(let failure):
-                        completion(.failure(failure))
-                    case .success(let runs):
-                        self.fetchHeadline(repository: repository, sha: status.sha,
-                                           token: token) { headline in
-                            let checks = (status.checks + runs.checks)
-                                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-                            completion(.success(BranchStatus(
-                                repository: repository,
-                                branch: branch,
-                                sha: status.sha,
-                                headline: headline,
-                                checks: checks,
-                                reportedCheckCount: checks.count,
-                                unreadableCheckCount: 0,
-                                health: rollUp(checks),
-                                fetched: Date(),
-                                rateLimit: runs.rate ?? status.rate)))
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Commit statuses
-
-    private struct StatusStep {
-        let sha: String
-        let checks: [CheckSummary]
-        let rate: RateLimit?
-    }
-
-    private func fetchCombinedStatus(repository: RepositoryReference, branch: String,
-                                     token: String?,
-                                     completion: @escaping (Result<StatusStep, FetchFailure>) -> Void) {
-        let key = "\(repository.slug)@\(branch)"
-        let cache = statusCache?.key == key ? statusCache : nil
-        let path = "repos/\(repository.slug)/commits/\(escapePathComponent(branch))/status"
-        client.get(path: path, token: token, etag: cache?.etag) { outcome in
-            switch outcome {
-            case .failure(let failure):
-                completion(.failure(failure))
-            case .notModified(let rate):
-                guard let cache else {
-                    completion(.failure(FetchFailure(
-                        message: "GitHub reported no change to something this app never read.",
-                        authenticationFailed: false)))
-                    return
-                }
-                completion(.success(StatusStep(sha: cache.sha, checks: cache.checks, rate: rate)))
-            case .ok(let data, let etag, let rate, _):
-                do {
-                    let payload = try self.decoder.decode(CombinedStatusResponse.self, from: data)
-                    let checks = payload.statuses.map { entry in
-                        CheckSummary(name: entry.context,
-                                     state: checkState(commitStatus: entry.state),
-                                     detail: entry.description ?? entry.state,
-                                     url: entry.targetUrl.flatMap(URL.init(string:)))
-                    }
-                    if let etag {
-                        self.statusCache = StatusCache(key: key, etag: etag,
-                                                       sha: payload.sha, checks: checks)
-                    } else {
-                        self.statusCache = nil
-                    }
-                    completion(.success(StatusStep(sha: payload.sha, checks: checks, rate: rate)))
-                } catch {
-                    completion(.failure(FetchFailure(
-                        message: "GitHub's answer about \(key) did not parse: \(error.localizedDescription)",
-                        authenticationFailed: false)))
-                }
-            }
-        }
-    }
-
-    // MARK: Check runs
-
-    private struct CheckRunsStep {
-        let checks: [CheckSummary]
-        let rate: RateLimit?
-    }
-
-    private func fetchCheckRuns(repository: RepositoryReference, sha: String, token: String?,
-                                completion: @escaping (Result<CheckRunsStep, FetchFailure>) -> Void) {
-        let path = "repos/\(repository.slug)/commits/\(sha)/check-runs"
-            + "?per_page=\(checkRunsPageSize)&filter=latest"
-        // A conditional request covers the whole answer only when the answer
-        // fitted on one page last time; the ETag of the first page says
-        // nothing about the pages behind it.
-        let cache = checkRunsCache
-        let etag = (cache?.sha == sha && cache?.singlePage == true) ? cache?.etag : nil
-        client.get(path: path, token: token, etag: etag) { outcome in
-            switch outcome {
-            case .failure(let failure):
-                completion(.failure(failure))
-            case .notModified(let rate):
-                guard let cache, cache.sha == sha else {
-                    completion(.failure(FetchFailure(
-                        message: "GitHub reported no change to something this app never read.",
-                        authenticationFailed: false)))
-                    return
-                }
-                completion(.success(CheckRunsStep(checks: cache.checks, rate: rate)))
-            case .ok(let data, let firstETag, let rate, let nextPage):
-                self.collectCheckRuns(page: data, nextPage: nextPage, token: token,
-                                      collected: []) { result in
-                    switch result {
-                    case .failure(let failure):
-                        completion(.failure(failure))
-                    case .success(let gathered):
-                        if let firstETag {
-                            self.checkRunsCache = CheckRunsCache(sha: sha, etag: firstETag,
-                                                                 singlePage: nextPage == nil,
-                                                                 checks: gathered.checks)
-                        } else {
-                            self.checkRunsCache = nil
-                        }
-                        completion(.success(CheckRunsStep(checks: gathered.checks,
-                                                          rate: gathered.rate ?? rate)))
-                    }
-                }
-            }
-        }
-    }
-
-    private func collectCheckRuns(page: Data, nextPage: URL?, token: String?,
-                                  collected: [CheckSummary],
-                                  completion: @escaping (Result<CheckRunsStep, FetchFailure>) -> Void) {
-        var gathered = collected
-        do {
-            let payload = try decoder.decode(CheckRunsResponse.self, from: page)
-            gathered += payload.checkRuns.map { run in
-                CheckSummary(name: run.name,
-                             state: checkState(runStatus: run.status, conclusion: run.conclusion),
-                             detail: run.conclusion ?? run.status,
-                             url: run.htmlUrl.flatMap(URL.init(string:)))
-            }
-        } catch {
-            completion(.failure(FetchFailure(
-                message: "GitHub's list of checks did not parse: \(error.localizedDescription)",
-                authenticationFailed: false)))
-            return
-        }
-        guard let nextPage else {
-            completion(.success(CheckRunsStep(checks: gathered, rate: nil)))
-            return
-        }
-        client.get(url: nextPage, token: token, etag: nil) { outcome in
-            switch outcome {
-            case .failure(let failure):
-                completion(.failure(failure))
-            case .notModified:
-                completion(.success(CheckRunsStep(checks: gathered, rate: nil)))
-            case .ok(let data, _, let rate, let following):
-                self.collectCheckRuns(page: data, nextPage: following, token: token,
-                                      collected: gathered) { result in
-                    // The rate limit from the newest page is the useful one.
-                    switch result {
-                    case .failure(let failure):
-                        completion(.failure(failure))
-                    case .success(let step):
-                        completion(.success(CheckRunsStep(checks: step.checks,
-                                                          rate: step.rate ?? rate)))
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Commit headline
-
-    /// The first line of the commit message, asked for once per commit. A
-    /// branch head changes rarely compared to how often the checks on it do,
-    /// so this costs almost nothing.
-    private func fetchHeadline(repository: RepositoryReference, sha: String, token: String?,
-                               completion: @escaping (String?) -> Void) {
-        if let known = headlines[sha] {
-            completion(known)
-            return
-        }
-        client.get(path: "repos/\(repository.slug)/commits/\(sha)", token: token,
-                   etag: nil) { outcome in
-            guard case .ok(let data, _, _, _) = outcome,
-                  let payload = try? self.decoder.decode(CommitResponse.self, from: data) else {
-                completion(nil)
-                return
-            }
-            let headline = payload.commit.message
-                .components(separatedBy: .newlines)
-                .first?
-                .trimmingCharacters(in: .whitespaces) ?? ""
-            self.headlines[sha] = headline
-            completion(headline.isEmpty ? nil : headline)
-        }
-    }
-}
-
-// MARK: - Polling one branch
-
-enum MonitorState {
-    case unconfigured
-    case waiting
-    case ready(BranchStatus)
-    case failed(FetchFailure, BranchStatus?)
-}
-
-/// Asks GitHub about the configured branch, waits, and asks again. All methods
-/// run on the main thread.
-final class BranchMonitor {
-    var onChange: ((MonitorState) -> Void)?
-    private(set) var state: MonitorState = .unconfigured
-
-    private let credentials: CredentialResolver
-    private var fetcher = BranchFetcher()
-    private var repository: RepositoryReference?
-    private var branch = defaultBranchName
-    private var refreshSeconds = defaultRefreshSeconds
-    private var timer: Timer?
-    private var busy = false
-    private var lastGood: BranchStatus?
-
-    init(credentials: CredentialResolver) {
-        self.credentials = credentials
-    }
-
-    func configure(repository: RepositoryReference?, branch: String, refreshSeconds: Double) {
-        let changed = repository != self.repository || branch != self.branch
-        self.repository = repository
-        self.branch = branch
-        self.refreshSeconds = refreshSeconds
-        if changed {
-            fetcher.forget()
-            lastGood = nil
-            publish(repository == nil ? .unconfigured : .waiting)
-        }
-        refreshNow()
-    }
-
-    func refreshNow() {
-        timer?.invalidate()
-        timer = nil
-        poll()
-    }
-
-    private func poll() {
-        guard let repository else {
-            publish(.unconfigured)
-            return
-        }
-        guard !busy else { return }
-        busy = true
-        let branch = self.branch
-        credentials.resolve { [weak self] credential in
-            guard let self else { return }
-            self.fetcher.fetch(repository: repository, branch: branch,
-                               token: credential.token) { result in
-                self.busy = false
-                guard repository == self.repository, branch == self.branch else {
-                    // The settings changed while this answer was on its way,
-                    // and the poll for the new branch waited for it.
-                    self.poll()
-                    return
-                }
-                switch result {
-                case .success(let status):
-                    self.lastGood = status
-                    self.publish(.ready(status))
-                case .failure(let failure):
-                    if failure.authenticationFailed {
-                        self.credentials.invalidate()
-                    }
-                    self.publish(.failed(failure, self.lastGood))
-                }
-                self.scheduleNextPoll()
-            }
-        }
-    }
-
-    private func scheduleNextPoll() {
-        timer?.invalidate()
-        let timer = Timer(timeInterval: refreshSeconds, repeats: false) { [weak self] _ in
-            self?.poll()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
-    }
-
-    private func publish(_ state: MonitorState) {
-        self.state = state
-        onChange?(state)
     }
 }
 
@@ -1585,12 +675,6 @@ func countsSentence(_ status: BranchStatus) -> String {
     if running > 0 { parts.append("\(running) running") }
     if passed > 0 { parts.append("\(passed) passed") }
     if other > 0 { parts.append("\(other) with no verdict") }
-    if status.unreadableCheckCount > 0 {
-        parts.append("\(status.unreadableCheckCount) not listed by this token")
-    }
-    if status.unlistedCheckCount > 0 {
-        parts.append("\(status.unlistedCheckCount) beyond the first \(rollupContextLimit)")
-    }
     if parts.isEmpty { return "no checks reported" }
     return parts.joined(separator: ", ")
 }
@@ -1638,6 +722,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
                                           target: nil, action: nil)
     private let handOffButton = NSPopUpButton()
     private let folderField = NSTextField()
+    private let relayField = NSTextField()
     private let tokenLabel = NSTextField(labelWithString: "Looking…")
     private let messageLabel = NSTextField(labelWithString: "")
     private var hasBeenPlaced = false
@@ -1671,6 +756,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         branchField.placeholderString = defaultBranchName
         nameField.placeholderString = "the repository's name"
         folderField.placeholderString = "~"
+        relayField.placeholderString = "host:port, or empty to only ask GitHub"
         handOffButton.addItems(withTitles: [noAgentTitle] + Agent.allCases.map(\.title))
         intervalField.alignment = .right
 
@@ -1680,7 +766,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         messageLabel.lineBreakMode = .byWordWrapping
         messageLabel.maximumNumberOfLines = 2
 
-        for field in [repositoryField, branchField, nameField, folderField] {
+        for field in [repositoryField, branchField, nameField, folderField, relayField] {
             field.widthAnchor.constraint(equalToConstant: 320).isActive = true
         }
         intervalField.widthAnchor.constraint(equalToConstant: 64).isActive = true
@@ -1699,6 +785,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             [NSGridCell.emptyContentView, showNameButton],
             [caption("When it turns red:"), handOffButton],
             [caption("Session folder:"), folderField],
+            [caption("Webhook relay:"), relayField],
             [caption("GitHub token:"), tokenLabel],
         ])
         grid.column(at: 0).xPlacement = .trailing
@@ -1748,6 +835,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         showNameButton.state = settings.showsMenuBarName ? .on : .off
         handOffButton.selectItem(at: settings.handOff.map { Agent.allCases.firstIndex(of: $0)! + 1 } ?? 0)
         folderField.stringValue = settings.handOffFolder
+        relayField.stringValue = settings.relay?.description ?? ""
         messageLabel.stringValue = ""
         tokenLabel.stringValue = "Looking…"
         credentials.resolve { [weak self] credential in
@@ -1810,6 +898,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             complain("The session folder has to be a folder that exists.", in: folderField)
             return
         }
+        let relayText = relayField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let relay = parseRelayAddress(relayText)
+        guard relayText.isEmpty || relay != nil else {
+            complain("Write the relay as host:port.", in: relayField)
+            return
+        }
         settings.repository = parsed.repository
         settings.branch = branch
         settings.menuBarName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1817,6 +911,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         settings.refreshSeconds = seconds
         settings.handOff = handOff
         settings.handOffFolder = folder
+        settings.relay = relay
         close()
         onSave?()
     }
@@ -1834,7 +929,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings: Settings
     private let registersLoginItem: Bool
     private let credentials = CredentialResolver()
-    private lazy var monitor = BranchMonitor(credentials: credentials)
+    private lazy var monitor = BranchMonitor { [credentials] in tokenFetch(credentials) }
 
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
@@ -1846,6 +941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var openItem: NSMenuItem!
     private var bannerItem: NSMenuItem!
     private var handOffItem: NSMenuItem!
+    private var relayItem: NSMenuItem!
     private var footerItem: NSMenuItem!
     private var settingsWindow: SettingsWindowController?
     private var latest: MonitorState = .unconfigured
@@ -1855,6 +951,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastFailure: String?
     /// The repository and branch the last answer was about.
     private var lastTarget: String?
+    /// The last commit the branch passed on, for the agent a red branch is
+    /// handed to.
+    private var lastGreen: String?
+    private let reader = BranchReader()
     /// Whether the branch has been handed off since it last passed, or was
     /// already red when the indicator first heard about it.
     private var handedOff = false
@@ -1889,6 +989,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // went away.
             self?.lock.reassertIfNeeded()
             self?.apply(state)
+        }
+        monitor.onRelayChange = { [weak self] in
+            self?.refreshMenuContents()
         }
         apply(.unconfigured)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -1992,6 +1095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         handOffItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         handOffItem.target = self
         handOffItem.isHidden = true
+        relayItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         footerItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
 
         menu.addItem(.separator())
@@ -2009,7 +1113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applySettings() {
         monitor.configure(repository: settings.repository,
                           branch: settings.branch,
-                          refreshSeconds: settings.refreshSeconds)
+                          refreshSeconds: settings.refreshSeconds,
+                          relay: settings.relay)
         updateStatusItem()
     }
 
@@ -2032,7 +1137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// changed to it, has not just turned, and a login should not fill the
     /// screen with banners for every indicator that comes back with it.
     private func considerRed(_ status: BranchStatus) {
-        let failing = status.checks.filter { $0.state == .failing }.map(\.name).sorted()
+        let failing = status.checks.filter { $0.state == .failing }
+            .map { $0.suite.map { "suite \($0)" } ?? $0.name }.sorted()
         let signature = ([status.sha] + failing).joined(separator: "\u{1}")
         let target = "\(status.repository.slug)\u{1}\(status.branch)"
         let isFirst = target != lastTarget
@@ -2041,6 +1147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastTarget = target
         lastHealth = status.health
         lastFailure = signature
+        if isFirst {
+            lastGreen = nil
+        }
+        if status.health == .passing {
+            lastGreen = status.sha
+        }
         guard !demonstratesBanner else { return }
         if isFirst {
             handedOff = status.health == .failing
@@ -2059,10 +1171,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Hands the branch to the chosen agent, with a report of what failed.
     private func handOffIfWanted(_ status: BranchStatus) {
         guard let agent = settings.handOff else { return }
-        handOff(status, to: agent, in: settings.handOffFolderURL) { [weak self] outcome in
-            self?.show(outcome)
+        let lastGreen = self.lastGreen
+        let folder = settings.handOffFolderURL
+        credentials.resolve { [weak self] credential in
+            self?.reader.failureReport(status, lastGreen: lastGreen, token: credential.token) { report in
+                handOff(status, report: report, to: agent, in: folder) { outcome in
+                    self?.show(outcome)
+                }
+            }
         }
     }
 
@@ -2202,8 +1321,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             commitItem.isHidden = true
         }
         openItem.isHidden = status == nil
+        updateRelayItem()
         footerItem.title = footerText()
         rebuildDynamicItems(status)
+    }
+
+    /// Says whether changes are coming from the relay, or from asking
+    /// GitHub over and over.
+    private func updateRelayItem() {
+        relayItem.toolTip = nil
+        switch monitor.relayState {
+        case .off:
+            relayItem.isHidden = true
+            return
+        case .connecting:
+            relayItem.title = "Connecting to the webhook relay…"
+        case .connected:
+            if let unreadable = monitor.unreadableDelivery {
+                relayItem.title = "Some deliveries from the webhook relay could not be read"
+                relayItem.toolTip = unreadable
+            } else {
+                relayItem.title = "Hearing about changes from the webhook relay"
+            }
+        case .unavailable(let reason):
+            relayItem.title = monitor.nextPoll.map {
+                "Webhook relay unavailable; asking GitHub at \(timeOfDayFormatter.string(from: $0))"
+            } ?? "Webhook relay unavailable"
+            relayItem.toolTip = sentenceCase(reason)
+        }
+        relayItem.isHidden = false
     }
 
     private func footerText() -> String {
@@ -2280,7 +1426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Actions
 
     @objc private func wokeUp() {
-        monitor.refreshNow()
+        monitor.woke()
     }
 
     @objc private func refresh(_ sender: Any?) {
@@ -2444,25 +1590,28 @@ func describe(_ status: BranchStatus) -> String {
 }
 
 /// Asks GitHub about the branch once, without the menu bar, and gives the
-/// answer to `body`, which is expected to exit.
+/// answer, the reader and the token to `body`, which is expected to exit.
 func fetchOnce(options: Options, settings: Settings,
-               _ body: @escaping (BranchStatus) -> Void) -> Never {
+               _ body: @escaping (BranchStatus, BranchReader, String?) -> Void) -> Never {
     guard let repository = options.repository ?? settings.repository else {
         fail("no repository is configured for indicator \(settings.instance); pass --repo owner/name")
     }
     let branch = options.branch ?? settings.branch
     let credentials = CredentialResolver()
-    let fetcher = BranchFetcher()
+    let reader = BranchReader()
     credentials.resolve { credential in
         print("token: \(credential.source.summary)")
-        fetcher.fetch(repository: repository, branch: branch,
-                      token: credential.token) { result in
+        reader.fetch(repository: repository, branch: branch,
+                     token: credential.token) { result in
             switch result {
             case .failure(let failure):
                 print("\(repository.slug)@\(branch): \(failure.detail ?? failure.message)")
                 exit(2)
-            case .success(let status):
-                body(status)
+            case .success(let answer):
+                body(BranchStatus(repository: answer.repository, branch: branch, sha: answer.sha,
+                                  headline: answer.headline, checks: answer.checks, fetched: Date(),
+                                  rateLimit: answer.rateLimit),
+                     reader, credential.token)
             }
         }
     }
@@ -2472,7 +1621,7 @@ func fetchOnce(options: Options, settings: Settings,
 /// Reports the branch once on standard output. Checks the settings, the token
 /// discovery, and the reading of GitHub's answers without the menu bar.
 func runOnce(options: Options) -> Never {
-    fetchOnce(options: options, settings: Settings(instance: options.instance ?? 1)) { status in
+    fetchOnce(options: options, settings: Settings(instance: options.instance ?? 1)) { status, _, _ in
         print(describe(status))
         switch status.health {
         case .passing: exit(0)
@@ -2491,14 +1640,16 @@ func runHandOff(options: Options) -> Never {
             "\(applicationName): indicator \(settings.instance) hands red branches to no agent; choose one in its settings\n".utf8))
         exit(2)
     }
-    fetchOnce(options: options, settings: settings) { status in
-        print(handOffPrompt(status))
-        handOff(status, to: agent, in: settings.handOffFolderURL) { outcome in
-            print(outcome.summary)
-            if case .failed = outcome {
-                exit(1)
+    fetchOnce(options: options, settings: settings) { status, reader, token in
+        reader.failureReport(status, lastGreen: nil, token: token) { report in
+            print(handOffPrompt(status, report: report))
+            handOff(status, report: report, to: agent, in: settings.handOffFolderURL) { outcome in
+                print(outcome.summary)
+                if case .failed = outcome {
+                    exit(1)
+                }
+                exit(0)
             }
-            exit(0)
         }
     }
 }

@@ -4,6 +4,10 @@ A macOS menu bar indicator that shows whether the checks GitHub runs on one
 branch of one repository are passing. The indicator watches the head commit of
 the branch, so it follows the branch as new commits land on it.
 
+The checks on a commit are every GitHub Actions workflow run on it and every
+commit status set on it, whatever started them: a push, a schedule, another
+workflow finishing, or a person.
+
 ## What the indicator means
 
 The shape changes along with the color, so the indicator still reads when red
@@ -11,8 +15,9 @@ and green do not.
 
 - **Green tick**: every check that reached a verdict passed.
 - **Red cross in an octagon**: at least one check failed. A check that was
-  cancelled, timed out, or asked for action counts as a failure, which is also
-  how GitHub's own summary counts them.
+  cancelled, timed out, failed to start, or asked for action counts as a
+  failure. A workflow run fails as soon as one of its jobs does, before the
+  rest of it finishes.
 - **Orange clock**: no check has failed, and at least one is still queued or
   running.
 - **Gray dash**: GitHub reported no checks on the commit, or reported only
@@ -28,15 +33,16 @@ turned off, in the settings.
 ## The menu
 
 Clicking the indicator opens a menu that names the repository and branch, sums
-up the checks, and names the head commit. Checks that GitHub counted but would
-not name are counted separately rather than passed over. Below that come the
-checks that are failing or still running, each of which opens its own page on
-GitHub when clicked. Everything else is in the **All Checks** submenu, which
-lists every check on the commit, failures first. **Open Checks on GitHub**
-opens the head commit's checks page.
+up the checks, and names the head commit. Below that come the checks that are
+failing or still running, each of which opens its own page on GitHub when
+clicked; a workflow run that has a failed job names the job. Everything else
+is in the **All Checks** submenu, which lists every check on the commit,
+failures first. **Open Checks on GitHub** opens the head commit's checks page.
 
 The line above the last separator names the indicator's number, when it last
-heard from GitHub, and how much of the hourly request allowance is left.
+asked GitHub, and how much of the hourly request allowance is left. When
+the indicator listens to a webhook relay, the line before it says whether the
+relay is connected; while it is not, the line's tooltip says why.
 
 The menu keeps changing while it is open, so a check that finishes while you
 are reading moves as it finishes.
@@ -83,7 +89,11 @@ does it too.
 
 An indicator can also hand a branch that turns red to a coding agent, which
 is asked to "select an appropriate worktree and fix the red BRANCH on
-OWNER/NAME", followed by a link to the commit's checks page. The agent's
+OWNER/NAME", followed by a link to the commit's checks page and a report of
+what failed. Before handing the branch off, the indicator asks GitHub for
+that report: each failed job, the step it failed at, and a link to it; each
+failed commit status; and the commits since the last commit it saw pass,
+newest first. Whatever GitHub will not say is left out. The agent's
 session starts in the session folder chosen in the settings, or in your home
 folder when none is chosen. A relative folder is taken from your home folder.
 
@@ -115,7 +125,8 @@ away, whatever state the branch is in, and exits.
 
 **Settings…** opens a window with the repository, the branch, the name to draw
 in the menu bar, how often to ask GitHub, which agent to hand the branch to
-when it turns red, and the folder that agent's session starts in. The
+when it turns red, the folder that agent's session starts in, and the webhook
+relay to hear about changes from, written as `host:port`. The
 repository can be written as `owner/name`, or pasted in any of the forms GitHub
 hands out: the address of the repository, the address of a branch, or the SSH
 remote. Pasting the address of a branch fills in the branch as well.
@@ -166,23 +177,15 @@ terminal reads, and takes `GH_TOKEN`, then `GITHUB_TOKEN`, then whatever
 from. The answer is remembered until GitHub rejects it, at which point the app
 asks the shell again.
 
-GitHub does not offer the **Checks** permission to fine-grained personal
-access tokens at all; only a GitHub App can be granted it. Searching for it in
-the token editor finds nothing, because there is nothing to find. Reading a
-private repository's check runs through the REST API is therefore closed to
-the kind of token GitHub now recommends.
-
-What is not closed is GitHub's own verdict. Ask through the GraphQL API and it
-answers with the state it has computed across every check on the commit,
-whether or not the token may look at those checks one by one. That is the
-answer this app wants, so whenever it has a token it asks that way, and a
-private repository works with an ordinary fine-grained token.
-
-What such a token loses is the list, not the color. The indicator is right,
-the menu reports the verdict and how many checks it was taken over, and it
-says how many of them it could not name: "Passing: 41 not listed by this
-token". Read-only **Contents** is what gives the line naming the head commit.
-A classic token with the `repo` scope can name every check.
+The indicator reads the checks through the Actions API, which lists a
+commit's workflow runs and their jobs, and the commit status API. A
+fine-grained token needs read access to **Actions**, **Commit statuses** and
+**Contents**; the last gives the commit messages. GitHub does not offer such
+a token the **Checks** permission at all, which is why the indicator does not
+use the check runs API: in a private repository, that API refuses such a
+token. Check suites run by apps other than GitHub Actions are therefore not
+counted. Deliveries about them are passed over too, so that the indicator
+says the same with a relay as without one.
 
 Adding a permission to a token an organization has already approved can put
 that token back in front of the organization's owners, so a permission that
@@ -191,28 +194,139 @@ added.
 
 ## Requests and the rate limit
 
-With a token, each poll is one GraphQL query, which brings back the verdict,
-the head commit, and as many of the checks as the token may see. It costs one
-point of an hourly five thousand, so a poll a minute spends sixty.
+Each time it asks, the indicator makes these requests: the branch's combined
+commit status, which also names the commit the branch is on; the workflow
+runs on that commit; the jobs of each workflow run that has not finished, so
+that a job that has failed is seen before its run finishes; and, once per
+commit, the commit's message. Every request carries the ETag of the previous
+answer to it. With a token, GitHub charges nothing for an answer of "nothing
+has changed", so an idle branch costs almost nothing even when polled.
+Without one, every request counts against the sixty an hour, and polling a
+branch that has a workflow running every minute spends them in well under an
+hour.
 
-Without a token GraphQL is closed, since it serves no anonymous callers, and
-the REST endpoints are asked instead: the branch's combined commit status and
-the check runs on the head commit each poll, and the commit message once per
-commit. Both polled requests carry the ETag from the previous answer, and
-GitHub charges nothing for an answer of "nothing has changed", so an idle
-branch costs almost none of the sixty requests an hour an anonymous caller
-gets.
+While a webhook relay is connected, the indicator asks for a starting point
+on each connection, when deliveries show that one went missing, and once
+more after an answer that may lag them, as the next section describes.
+
+## Hearing about changes from a webhook relay
+
+GitHub can only deliver a webhook to an address on the public internet. A
+relay receives the deliveries there and passes each one on to every program
+connected to it, which brings them to a computer on a private network. An
+indicator that is given a relay in its settings listens to it, and hears
+about a branch's checks as they change, rather than asking GitHub at an
+interval.
+
+The indicator connects to the relay over plain TCP. It expects the relay to
+send each delivery as a frame: the length of an HTTP request, as a 32-bit
+big-endian integer, followed by the request exactly as the relay received
+it. The webhook that feeds the relay has to cover the repository, use the
+`application/json` content type, and send check run, check suite, status
+and push events.
+
+While the relay is connected, the indicator follows the branch from the
+deliveries alone:
+
+- a push to the branch moves the indicator to the new commit, and gives it
+  the commit's message;
+- a check run that starts makes its suite run, and one that fails makes its
+  suite fail;
+- a check suite that finishes takes the state it finished in;
+- a commit status sets its context.
+
+Each delivery carries GitHub's time, and a report that is older than what is
+already known about its suite changes nothing, so deliveries that arrive out
+of order leave each suite as the latest of them says. A check run that
+passes says nothing about its suite until the suite finishes. Deliveries
+about commits the branch is not on yet are kept, since they can arrive before
+the push that moves the branch there.
+
+A push says when it happened, and the latest push to the branch decides
+where it is: pushes delivered out of order, or delivered again, leave the
+branch where the last of them put it. A push GitHub gives no time for, the
+first one heard of, or one in the same second as the last, moves the branch
+only if it starts from the commit the branch is on and does not lead back
+to one it has left; otherwise GitHub is asked. Check suites never move the
+branch, but every check suite a push started is on the branch, so one at a
+commit the branch has not been on means that push went undelivered.
+
+GitHub is asked only for a starting point, since the relay keeps no history:
+when the indicator starts or its settings change, once the relay connection
+is up, and after waking. It is also asked when deliveries show that one went
+missing: a push that cannot be placed after the last; a check run or check
+suite on the branch at a commit it has not been on, or at one it has left
+that a push from where it is started; the branch being deleted; and a
+delivery that cannot be read. Once two answers running show the branch is
+not on such a commit, deliveries about it stop asking, until the branch
+moves. An answer that names a commit the branch has since moved away from
+may be out of date, so the indicator keeps the newer commit and asks again
+at the interval; if the next answer names the same commit, it is believed.
+An answer asked for while the relay is connected is otherwise added to what
+deliveries have said, by the same rule of GitHub's times, so an answer that
+lags the deliveries does not undo them. Without the relay, each answer
+replaces what is known about its commit.
+
+Waking the computer, and **Refresh Now**, believe GitHub's answer instead:
+it replaces what deliveries have said about the commit, and moves the
+branch wherever GitHub says, even onto a commit deliveries showed it
+leaving. That is how a workflow run that has been deleted stops counting,
+since deleting a run is not delivered. In case that answer lags the
+deliveries, GitHub is asked once more at the interval, and its answer is
+added to what was delivered since.
+
+Requests made because of deliveries never come more often than the interval
+in the settings: one that comes less than the interval after the last
+request is put off until the end of the interval.
+
+When the connection ends, the indicator asks GitHub as soon as the interval
+allows, since anything that changed while the connection was dying was never
+delivered. Until the relay is back, the indicator asks GitHub at the
+interval, as it does without a relay, and tries the relay again each time it
+asks; the menu says when it will next ask. A request to GitHub that fails is
+tried again at that interval too, and deliveries go on being followed in the
+meantime. TCP keepalive notices a connection that died without closing
+within about a minute and a half of quiet. Waking the computer starts a new
+connection straight away, since the old one may have died while the computer
+slept, and asks GitHub. **Refresh Now** asks GitHub, and tries the relay if
+it is not connected.
+
+A delivery of one of the four events that cannot be read, for example
+because the webhook sends form data rather than JSON, is reported in the
+menu, in place of the line that says the relay is connected, and so is a
+frame from the relay that is not an HTTP request.
+
+The indicator cannot notice a delivery that GitHub never sends to the relay,
+unless a later delivery shows it. A check suite that finishes without its
+finish being delivered stays running in the indicator until a wake, a new
+connection, or **Refresh Now**.
+
+The connection to the relay is neither encrypted nor authenticated, and the
+indicator relies on the relay to check each delivery's signature, so the
+relay should be reachable only over a network you trust.
 
 ## Building and running
 
 Requires the Xcode command line tools, for `swiftc`. There is no Xcode
-project: the indicator is one Swift file, the plane is another, and the hand-off
-to an agent is a third.
+project. The menu bar indicator is `main.swift`. What it knows about a
+commit's checks is in `checks.swift`, the requests to GitHub are in
+`github.swift`, the relay connection and the deliveries it carries are in
+`relay.swift`, and following the branch, and deciding when to ask GitHub,
+are in `monitor.swift`. The plane is `flyby.swift`, and the hand-off to an
+agent is `handoff.swift`.
 
 ```sh
 make            # builds ./ghbar
 ./ghbar         # runs an indicator, taking the lowest free instance number
+make test       # tests following a branch, with and without a relay
 ```
+
+The tests run a stand-in relay on the loopback interface, a stand-in for
+GitHub that answers each request when the test says so, and a stand-in for
+GitHub's HTTP API. A test has no time
+limit: it waits until what it is waiting for happens. With `TRACE_WAITS` set
+in the environment, each wait prints its line number, so a test that never
+finishes shows where it stopped.
 
 The first indicator with nothing configured opens its settings window.
 

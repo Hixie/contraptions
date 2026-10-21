@@ -3,7 +3,9 @@ INSTALL_DIR = $(HOME)/.local/bin
 AGENT_DIR = $(HOME)/Library/LaunchAgents
 AGENT_PREFIX = local.ghbar
 
-SOURCES = main.swift flyby.swift handoff.swift
+SOURCES = main.swift checks.swift github.swift relay.swift monitor.swift flyby.swift handoff.swift
+# Everything the tests exercise, which leaves out main.swift and the menu bar.
+TEST_SOURCES = checks.swift github.swift relay.swift monitor.swift tests/main.swift
 # Not named Info.plist: an Info.plist beside an executable named after its
 # directory makes macOS take the directory for an application bundle, and
 # then the binary fails signature verification and launchd will not start
@@ -23,6 +25,10 @@ $(BINARY): $(SOURCES) $(INFO_PLIST)
 run: $(BINARY)
 	./$(BINARY)
 
+test: $(TEST_SOURCES)
+	swiftc -o $(BINARY)-tests $(TEST_SOURCES)
+	./$(BINARY)-tests
+
 install: $(BINARY)
 	mkdir -p "$(INSTALL_DIR)"
 	install -m 755 $(BINARY) "$(INSTALL_DIR)/$(BINARY)"
@@ -37,6 +43,6 @@ uninstall:
 	rm -f "$(INSTALL_DIR)/$(BINARY)"
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(BINARY)-tests
 
-.PHONY: run install uninstall clean
+.PHONY: run test install uninstall clean
