@@ -1,5 +1,6 @@
 import AppKit
 import Network
+import os
 
 // github-hookbar: a menu bar indicator that keeps a connection open to a relay of
 // GitHub webhook deliveries, and runs a command for each pull request that a
@@ -26,7 +27,13 @@ let keptOutputLength = 2000
 
 let logTimeFormatter = ISO8601DateFormatter()
 
+/// The system log keeps every line, however github-hookbar was started;
+/// `/usr/bin/log show --predicate 'subsystem == "local.github-hookbar"'`
+/// lists them.
+let systemLog = Logger(subsystem: "local.github-hookbar", category: "events")
+
 func log(_ message: String) {
+    systemLog.notice("\(message, privacy: .public)")
     let stamp = logTimeFormatter.string(from: Date())
     // Once the terminal github-hookbar was started from has gone, writing
     // fails, and the line is dropped.
@@ -735,15 +742,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("ignoring a pull_request delivery that could not be read: \(error)")
             return
         }
-        guard event.matches(configuration) else { return }
+        let url = event.pullRequest.htmlUrl
+        let described = "pull_request delivery \(delivery.headers["x-github-delivery"] ?? "without an ID")"
+            + " for \(url.absoluteString), \(event.action) by \(event.pullRequest.user.login)"
+        guard event.matches(configuration) else {
+            log("\(described): not one the configuration chooses")
+            return
+        }
         let item = Run(event)
-        log("running the command for \(event.pullRequest.htmlUrl.absoluteString)")
+        log("\(described): running the command")
         recent = Array(([item] + recent).prefix(recentLength))
         updateMenu()
-        let url = event.pullRequest.htmlUrl
         runCommand(configuration.command, with: url) { [weak self] status, output in
             item.outcome = (status, output)
-            log("the command for \(url.absoluteString) exited with status \(status)")
+            // The system log cuts a message off after about a kilobyte, so
+            // each line of output is a log line of its own.
+            let lines = output.split(whereSeparator: \.isNewline)
+            log("the command for \(url.absoluteString) exited with status \(status)"
+                + (lines.isEmpty ? " and printed nothing" : " and printed:"))
+            for line in lines {
+                log("  | \(line)")
+            }
             self?.updateMenu()
         }
     }

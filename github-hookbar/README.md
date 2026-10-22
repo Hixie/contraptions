@@ -137,10 +137,20 @@ make test         # builds and runs the tests in tests/main.swift
 ./github-hookbar  # runs the menu bar indicator in the foreground
 ```
 
-github-hookbar writes a line to standard error each time it connects, each
-time it loses the connection or fails to connect, and each time it runs the
-command. Started from a terminal, it keeps running when the terminal
-closes; it stops when **Quit github-hookbar** is chosen.
+github-hookbar logs each time it connects, each time it loses the connection
+or fails to connect, each `pull_request` delivery with whether it runs the
+command, and each time the command finishes, with its exit status and
+output, one line of output per log line. The lines go to standard error
+and to the system log, which keeps them however github-hookbar was
+started. They include the URLs of pull requests in private repositories.
+zsh has a `log` command of its own, so give the full path:
+
+```sh
+/usr/bin/log show --last 1d --predicate 'subsystem == "local.github-hookbar"'
+```
+
+Started from a terminal, it keeps running when the terminal closes; it stops
+when **Quit github-hookbar** is chosen.
 
 ## Installing as a login item
 
