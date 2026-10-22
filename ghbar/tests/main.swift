@@ -37,13 +37,13 @@ func stamp(_ seconds: Int) -> String {
 }
 
 /// GitHub's answer about a commit: one suite per entry, finished in the
-/// given state, or running if nil.
-func snapshot(sha: String = "a1", _ suites: [Int: CheckState?] = [1: nil],
+/// given state at `finished`, or running if nil.
+func snapshot(sha: String = "a1", _ suites: [Int: CheckState?] = [1: nil], finished: Int = 0,
               named: RepositoryReference = repository) -> BranchSnapshot {
     var checks = CommitChecks()
     for (suite, state) in suites {
         if let state {
-            checks.suiteFinished(suite: suite, state: state, detail: state.rawValue, at: at(0),
+            checks.suiteFinished(suite: suite, state: state, detail: state.rawValue, at: at(finished),
                                  workflow: "Workflow \(suite)")
         } else {
             checks.runStarted(suite: suite, run: "Workflow \(suite)", url: nil, at: at(0),
@@ -114,8 +114,17 @@ func frame(_ request: Data) -> Data {
 }
 
 func changed(_ reaction: LedgerReaction) -> BranchStatus? {
-    if case .changed(let status) = reaction { return status }
+    if case .changed(let status, _) = reaction { return status }
     return nil
+}
+
+/// Whether the reaction asks GitHub, whether or not it also shows a change.
+func asksGitHub(_ reaction: LedgerReaction) -> Bool {
+    switch reaction {
+    case .fetch: return true
+    case .changed(_, let fetch): return fetch
+    case .ignore: return false
+    }
 }
 
 func isFetch(_ reaction: LedgerReaction) -> Bool {
@@ -207,6 +216,14 @@ do {
     }
     expect(read("check_suite", checkSuiteBody(status: "in_progress")) == nil,
            "a suite that has not finished is not read")
+    for (name, body) in [("check_run", checkRunBody(suite: 4, conclusion: "cancelled")),
+                         ("check_suite", checkSuiteBody(suite: 4, conclusion: "cancelled"))] {
+        if case .cancelled(let suite)? = read(name, body)?.kind {
+            expect(suite == 4, "a cancelled \(name) names its suite")
+        } else {
+            expect(false, "a cancelled \(name) is read as a cancellation, neither a pass nor a failure")
+        }
+    }
 
     let status = read("status", statusBody(sha: "c3"))
     if case .status(let context, let record)? = status?.kind {
@@ -327,6 +344,53 @@ do {
     expect(byName["Skipped"]?.state == .other, "a skipped workflow run neither passes nor fails")
 } catch {
     expect(false, "GitHub's lists of workflow runs and jobs are read: \(error)")
+}
+
+do {
+    // A concurrency group replaces a waiting run, or a waiting job, with a
+    // newer one, and GitHub concludes what it replaced as cancelled.
+    let runs = try gitHubDecoder.decode(WorkflowRuns.self, from: Data("""
+    {"workflow_runs": [
+      {"id": 1, "name": "Replaced", "status": "completed", "conclusion": "cancelled", "check_suite_id": 11,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"},
+      {"id": 2, "name": "Job replaced", "status": "completed", "conclusion": "cancelled", "check_suite_id": 12,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"},
+      {"id": 3, "name": "Timed out", "status": "completed", "conclusion": "cancelled", "check_suite_id": 13,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"},
+      {"id": 4, "name": "Running", "status": "in_progress", "conclusion": null, "check_suite_id": 14,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"},
+      {"id": 5, "name": "Failed", "status": "completed", "conclusion": "cancelled", "check_suite_id": 15,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"},
+      {"id": 6, "name": "Lagging", "status": "completed", "conclusion": "cancelled", "check_suite_id": 16,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"},
+      {"id": 7, "name": "Stopped while going", "status": "in_progress", "conclusion": null, "check_suite_id": 17,
+       "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"}]}
+    """.utf8)).workflowRuns
+    func jobs(_ json: String) throws -> [Job] {
+        try gitHubDecoder.decode(Jobs.self, from: Data(#"{"jobs": \#(json)}"#.utf8)).jobs
+    }
+    let queued = #"{"name": "reconcile", "status": "completed", "conclusion": "cancelled", "completed_at": null, "html_url": null, "steps": [], "runner_name": ""}"#
+    let passed = #"{"name": "estuary", "status": "completed", "conclusion": "success", "completed_at": null, "html_url": null, "steps": [], "runner_name": "GitHub Actions 2"}"#
+    let stopped = #"{"name": "reconcile", "status": "completed", "conclusion": "cancelled", "completed_at": null, "html_url": null, "steps": [], "runner_name": "GitHub Actions 1"}"#
+    let failed = #"{"name": "lint", "status": "completed", "conclusion": "failure", "completed_at": null, "html_url": null, "steps": [], "runner_name": "GitHub Actions 3"}"#
+    let going = #"{"name": "reconcile", "status": "in_progress", "conclusion": null, "completed_at": null, "html_url": null, "steps": [], "runner_name": "GitHub Actions 4"}"#
+    let checks = commitChecks(runs: runs, jobs: [1: [], 2: try jobs("[\(queued), \(passed)]"),
+                                                 3: try jobs("[\(stopped)]"), 4: try jobs("[\(queued)]"),
+                                                 5: try jobs("[\(failed), \(queued)]"), 6: try jobs("[\(going)]"),
+                                                 7: try jobs("[\(stopped), \(going)]")],
+                              statuses: [])
+    let byName = Dictionary(uniqueKeysWithValues: checks.summaries.map { ($0.name, $0) })
+    expect(byName["Replaced"]?.state == .other, "a run replaced before it listed a job neither passes nor fails")
+    expect(byName["Job replaced"]?.state == .passing,
+           "one whose only cancelled job no runner picked up takes the state of the jobs that ran")
+    expect(byName["Timed out"]?.state == .failing, "a run that stopped a job a runner was running fails")
+    expect(byName["Failed"]?.state == .failing, "and so does one with a job that failed beside a replaced one")
+    expect(byName["Lagging"]?.state == .running, "a cancelled run whose jobs are still listed as going is going")
+    expect(byName["Stopped while going"]?.state == .failing,
+           "a job stopped while a runner ran it fails a run that goes on")
+    expect(byName["Running"]?.state == .running, "a job replaced while queued does not fail a run that goes on")
+} catch {
+    expect(false, "cancelled workflow runs and their jobs are read: \(error)")
 }
 
 // MARK: - The ledger
@@ -537,6 +601,66 @@ do {
 }
 
 do {
+    // Whether a cancellation failed turns on GitHub's answer.
+    let head = ledger()
+    _ = head.take(event("check_run", checkRunBody(suite: 2, status: "in_progress", conclusion: nil)))
+    expect(isFetch(head.take(event("check_run", checkRunBody(suite: 2, conclusion: "cancelled")))),
+           "a check run cancelled on the head asks GitHub")
+    expect(head.status?.health == .running, "a cancellation turns nothing red while GitHub is asked")
+    let lagging = head.adopt(snapshot([1: nil, 2: nil]), complete: true, replacing: false)
+    expect(!lagging.settled, "an answer that does not yet show the suite finished is checked again")
+    expect(isFetch(head.take(event("check_suite", checkSuiteBody(suite: 2, conclusion: "cancelled")))),
+           "and a suite cancelled on the head asks GitHub too")
+    let replaced = head.adopt(snapshot([1: nil, 2: .other], finished: 40), complete: true, replacing: false)
+    expect(replaced.settled && replaced.shown.health == .running,
+           "an answer that shows it finished settles the branch, in the state it gives")
+
+    // An answer can show a finish from before the attempt that was cancelled.
+    let rerun = BranchLedger(repository: repository, branch: "main")
+    _ = rerun.adopt(snapshot([2: .passing]), complete: true, replacing: false)
+    _ = rerun.take(event("check_run", checkRunBody(suite: 2, status: "in_progress", conclusion: nil, started: 10)))
+    _ = rerun.take(event("check_suite", checkSuiteBody(suite: 2, conclusion: "cancelled", updated: 30)))
+    expect(!rerun.adopt(snapshot([2: .passing]), complete: true, replacing: false).settled,
+           "a finish from before the suite's latest start does not settle its cancellation")
+    let atStart = BranchLedger(repository: repository, branch: "main")
+    _ = atStart.adopt(snapshot([2: nil]), complete: true, replacing: false)
+    _ = atStart.take(event("check_run", checkRunBody(suite: 2, status: "in_progress", conclusion: nil, started: 10)))
+    _ = atStart.take(event("check_suite", checkSuiteBody(suite: 2, conclusion: "cancelled", updated: 30)))
+    expect(atStart.adopt(snapshot([2: .other], finished: 10), complete: true, replacing: false).settled,
+           "a finish at the suite's latest start settles it")
+    let decided = rerun.adopt(snapshot([2: .failing], finished: 30), complete: true, replacing: false)
+    expect(decided.settled && decided.shown.health == .failing,
+           "a finish from after it does, and a run that stopped a job a runner was running fails the branch")
+
+    // A cancelled run can be deleted, which is not delivered.
+    let deleted = BranchLedger(repository: repository, branch: "main")
+    _ = deleted.adopt(snapshot([1: .passing]), complete: true, replacing: false)
+    _ = deleted.take(event("check_run", checkRunBody(suite: 2, status: "queued", conclusion: nil)))
+    _ = deleted.take(event("check_suite", checkSuiteBody(suite: 2, conclusion: "cancelled")))
+    let gone = deleted.adopt(snapshot([1: .passing]), complete: true, replacing: false)
+    expect(gone.settled && gone.shown.health == .passing,
+           "an answer that no longer lists the cancelled suite settles it, and what was delivered about it goes")
+    _ = deleted.take(event("check_suite", checkSuiteBody(suite: 3, conclusion: "cancelled")))
+    _ = deleted.adopt(snapshot([1: .passing, 3: nil]), complete: true, replacing: true)
+    expect(!deleted.adopt(snapshot([1: .passing, 3: nil]), complete: true, replacing: false).settled,
+           "a believed answer that lags the cancellation does not settle it either")
+
+    // A suite can be cancelled before the push that moves the branch to it.
+    let early = ledger()
+    expect(isIgnore(early.take(event("check_suite", checkSuiteBody(sha: "b2", suite: 6, conclusion: "cancelled",
+                                                                   branch: "other")))),
+           "a suite cancelled on another branch's commit does not ask")
+    expect(isFetch(early.take(event("check_suite", checkSuiteBody(sha: "c3", suite: 7, conclusion: "cancelled",
+                                                                  before: "a1")))),
+           "a suite cancelled on the branch at a commit it has not been on asks GitHub, as a push went missing")
+    let moved = early.take(event("push", pushBody(after: "b2")))
+    expect(changed(moved)?.sha == "b2" && asksGitHub(moved),
+           "a push onto a commit with a cancelled suite shows the commit and asks GitHub")
+    expect(!asksGitHub(early.take(event("push", pushBody(before: "b2", after: "d4")))),
+           "a push onto a commit without one does not")
+}
+
+do {
     var record = CommitChecks()
     record.runFailed(suite: 1, run: "lint", url: URL(string: "https://github.com/job"), at: at(10))
     record.runStarted(suite: 1, run: "test", url: nil, at: at(20))
@@ -669,6 +793,92 @@ do {
     expect(headlineAsks(.init(status: 403, headers: ["retry-after": "60"], body: "{}")) == 2,
            "and so is one refused to slow requests down")
     expect(headlineAsks(.init(unreachable: true)) == 2, "one the network could not fetch is asked for again")
+
+    // The jobs of a cancelled run say whether it failed.
+    StubGitHub.routes["/repos/octo/repo/commits/main/status?per_page=100"] = .init(body: """
+        {"sha": "b2", "repository": {"full_name": "octo/repo"}, "statuses": []}
+        """)
+    StubGitHub.routes["/repos/octo/repo/actions/runs?head_sha=b2&per_page=100"] = .init(body: """
+        {"workflow_runs": [{"id": 5, "name": "Roll", "status": "completed", "conclusion": "cancelled",
+          "check_suite_id": 15, "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"}]}
+        """)
+    StubGitHub.routes["/repos/octo/repo/actions/runs/5/jobs?filter=latest&per_page=100"] = .init(body: """
+        {"jobs": [{"name": "reconcile", "status": "completed", "conclusion": "cancelled", "completed_at": null,
+          "html_url": null, "steps": [], "runner_name": ""}]}
+        """)
+    StubGitHub.routes["/repos/octo/repo/commits/b2"] = .init(body: #"{"commit": {"message": "Second"}}"#)
+    StubGitHub.asked.removeAll()
+    answer = nil
+    BranchReader(client: GitHubClient(protocolClasses: [StubGitHub.self]))
+        .fetch(repository: repository, branch: "main", token: "t") { result in
+            if case .success(let found) = result { answer = found } else { expect(false, "the branch is read: \(result)") }
+        }
+    waitUntil { answer != nil || StubGitHub.asked.count > 9 }
+    expect(StubGitHub.asked.contains { $0.path == "/repos/octo/repo/actions/runs/5/jobs?filter=latest&per_page=100" },
+           "the jobs of a finished run that was cancelled are asked for")
+    expect(answer?.checks.summaries.map(\.state) == [.other],
+           "and a run no runner started neither passes nor fails")
+
+    // Asked again, the jobs of the cancelled run, which has not changed, are
+    // not asked for again.
+    let cancelledReader = BranchReader(client: GitHubClient(protocolClasses: [StubGitHub.self]))
+    for _ in 0..<2 {
+        var done = false
+        cancelledReader.fetch(repository: repository, branch: "main", token: nil) { _ in done = true }
+        waitUntil { done }
+    }
+    let cancelledJobsPath = "/repos/octo/repo/actions/runs/5/jobs?filter=latest&per_page=100"
+    expect(StubGitHub.asked.filter { $0.path == cancelledJobsPath }.count == 2,
+           "the jobs of a cancelled run are asked for once by each reader, however often it reads the branch")
+    func cancelledJobsAsked(runUpdated: Int, jobStatus: String) -> Int {
+        StubGitHub.routes["/repos/octo/repo/actions/runs?head_sha=b2&per_page=100"] = .init(body: """
+            {"workflow_runs": [{"id": 5, "name": "Roll", "status": "completed", "conclusion": "cancelled",
+              "check_suite_id": 15, "html_url": null, "run_started_at": null,
+              "updated_at": "\(stamp(runUpdated))"}]}
+            """)
+        let conclusion = jobStatus == "completed" ? #""cancelled""# : "null"
+        StubGitHub.routes[cancelledJobsPath] = .init(body: """
+            {"jobs": [{"name": "reconcile", "status": "\(jobStatus)", "conclusion": \(conclusion),
+              "completed_at": null, "html_url": null, "steps": [], "runner_name": "GitHub Actions 1"}]}
+            """)
+        StubGitHub.asked.removeAll()
+        answer = nil
+        cancelledReader.fetch(repository: repository, branch: "main", token: nil) { result in
+            if case .success(let found) = result { answer = found } else { expect(false, "the branch is read") }
+        }
+        waitUntil { answer != nil }
+        return StubGitHub.asked.filter { $0.path == cancelledJobsPath }.count
+    }
+    expect(cancelledJobsAsked(runUpdated: 50, jobStatus: "in_progress") == 1,
+           "a cancelled run that was run again has its jobs asked for again")
+    expect(cancelledJobsAsked(runUpdated: 50, jobStatus: "completed") == 1,
+           "and jobs still listed as going are not kept")
+    expect(cancelledJobsAsked(runUpdated: 50, jobStatus: "completed") == 0, "but finished ones are")
+    expect(answer?.checks.summaries.map(\.state) == [.failing],
+           "and the run is judged by the jobs kept, here one stopped while a runner ran it")
+
+    // A job replaced while queued is left out of the report on a failure.
+    StubGitHub.routes["/repos/octo/repo/actions/runs?check_suite_id=15"] = .init(body: """
+        {"workflow_runs": [{"id": 5, "name": "Roll", "status": "completed", "conclusion": "cancelled",
+          "check_suite_id": 15, "html_url": null, "run_started_at": null, "updated_at": "\(stamp(5))"}]}
+        """)
+    StubGitHub.routes["/repos/octo/repo/actions/runs/5/jobs?filter=latest&per_page=100"] = .init(body: """
+        {"jobs": [{"name": "reconcile", "status": "completed", "conclusion": "cancelled", "completed_at": null,
+          "html_url": null, "steps": [], "runner_name": ""},
+         {"name": "deploy", "status": "completed", "conclusion": "cancelled", "completed_at": null,
+          "html_url": null, "steps": [{"name": "Apply", "conclusion": "cancelled"}],
+          "runner_name": "GitHub Actions 1"}]}
+        """)
+    var rollChecks = CommitChecks()
+    rollChecks.suiteFinished(suite: 15, state: .failing, detail: "cancelled", at: at(5), workflow: "Roll")
+    var rollReport: String?
+    reader.failureReport(BranchStatus(repository: repository, branch: "main", sha: "b2", headline: nil,
+                                      checks: rollChecks, fetched: Date(), rateLimit: nil),
+                         lastGreen: nil, token: nil) { rollReport = $0 }
+    waitUntil { rollReport != nil }
+    expect(rollReport?.contains("Roll / deploy, at the step \"Apply\"") == true,
+           "the report names the job that was stopped while it ran")
+    expect(rollReport?.contains("reconcile") == false, "and leaves out the job replaced while queued")
 
     var quiet: String?
     reader.failureReport(BranchStatus(repository: repository, branch: "main", sha: "a1", headline: nil,
@@ -921,6 +1131,16 @@ do {
     github.answer(snapshot(sha: "c3"))
     expect(shownStatus(monitor)?.sha == "c3", "Refresh Now takes the branch to the commit GitHub names")
     settle(monitor, github, with: snapshot(sha: "c3"))
+
+    // A push onto a commit with a cancelled suite asks GitHub whether it
+    // failed.
+    relay.send(request("check_suite", checkSuiteBody(sha: "e5", suite: 5, conclusion: "cancelled",
+                                                     branch: "other")),
+               request("push", pushBody(before: "c3", after: "e5")))
+    waitUntil { shownStatus(monitor)?.sha == "e5" }
+    expect(monitor.nextPoll != nil || github.waiting,
+           "a push onto a commit with a cancelled suite shows the commit and asks GitHub")
+    settle(monitor, github, with: snapshot(sha: "e5", [5: .other]))
 
     monitor.configure(repository: nil, branch: "main", refreshSeconds: 3600, relay: relay.address)
     expect(monitor.relayState == .off, "with no repository, the relay is not listened to")

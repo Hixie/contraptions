@@ -109,6 +109,10 @@ struct WebhookEvent {
         case runStarted(suite: Int, run: String, url: URL?, at: Date)
         case runFailed(suite: Int, run: String, url: URL?, at: Date)
         case suiteFinished(suite: Int, state: CheckState, detail: String, at: Date)
+        /// A check run, or a whole check suite, was cancelled. Whether that
+        /// is a failure turns on whether a runner was running the job it
+        /// stopped, which the delivery does not say.
+        case cancelled(suite: Int)
         case status(context: String, StatusRecord)
     }
 
@@ -125,11 +129,13 @@ struct WebhookEvent {
     let before: String?
     let kind: Kind
 
-    /// Reads a check run, check suite, commit status or push delivery.
-    /// Returns nil for any other delivery; for a check run that finished
-    /// without failing, which says nothing about its suite until the suite
-    /// finishes; and for check runs and suites of apps other than GitHub
-    /// Actions, which GitHub's answers to a fine-grained token leave out.
+    /// Reads a check run, check suite, commit status or push delivery. A
+    /// check run or suite that was cancelled is read as a cancellation, for
+    /// GitHub's answer to settle. Returns nil for any other delivery; for a
+    /// check run that finished without failing, which says nothing about its
+    /// suite until the suite finishes; and for check runs and suites of apps
+    /// other than GitHub Actions, which GitHub's answers to a fine-grained
+    /// token leave out.
     init?(_ delivery: Delivery) throws(UnreadableDelivery) {
         let name = delivery.headers["x-github-event"] ?? ""
         do {
@@ -139,15 +145,19 @@ struct WebhookEvent {
                 let run = payload.checkRun
                 guard run.app.slug == actionsApp else { return nil }
                 let url = (run.detailsUrl ?? run.htmlUrl).flatMap(URL.init(string:))
-                switch checkState(runStatus: run.status, conclusion: run.conclusion) {
-                case .running:
-                    kind = .runStarted(suite: run.checkSuite.id, run: run.name, url: url,
-                                       at: run.startedAt ?? Date())
-                case .failing:
-                    kind = .runFailed(suite: run.checkSuite.id, run: run.name, url: url,
-                                      at: run.completedAt ?? Date())
-                case .passing, .other:
-                    return nil
+                if run.conclusion == "cancelled" {
+                    kind = .cancelled(suite: run.checkSuite.id)
+                } else {
+                    switch checkState(runStatus: run.status, conclusion: run.conclusion) {
+                    case .running:
+                        kind = .runStarted(suite: run.checkSuite.id, run: run.name, url: url,
+                                           at: run.startedAt ?? Date())
+                    case .failing:
+                        kind = .runFailed(suite: run.checkSuite.id, run: run.name, url: url,
+                                          at: run.completedAt ?? Date())
+                    case .passing, .other:
+                        return nil
+                    }
                 }
                 repository = payload.repository.fullName
                 sha = run.headSha
@@ -161,9 +171,11 @@ struct WebhookEvent {
                 sha = suite.headSha
                 branch = suite.headBranch
                 before = suite.before
-                kind = .suiteFinished(suite: suite.id,
-                                      state: checkState(runStatus: "completed", conclusion: suite.conclusion),
-                                      detail: suite.conclusion ?? "completed", at: suite.updatedAt)
+                kind = suite.conclusion == "cancelled"
+                    ? .cancelled(suite: suite.id)
+                    : .suiteFinished(suite: suite.id,
+                                     state: checkState(runStatus: "completed", conclusion: suite.conclusion),
+                                     detail: suite.conclusion ?? "completed", at: suite.updatedAt)
             case "status":
                 let payload = try gitHubDecoder.decode(StatusPayload.self, from: delivery.body)
                 repository = payload.repository.fullName

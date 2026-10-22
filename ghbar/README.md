@@ -14,14 +14,21 @@ The shape changes along with the color, so the indicator still reads when red
 and green do not.
 
 - **Green tick**: every check that reached a verdict passed.
-- **Red cross in an octagon**: at least one check failed. A check that was
-  cancelled, timed out, failed to start, or asked for action counts as a
-  failure. A workflow run fails as soon as one of its jobs does, before the
-  rest of it finishes.
+- **Red cross in an octagon**: at least one check failed. A check that timed
+  out, failed to start, or asked for action counts as a failure, and so does
+  a job cancelled while a runner was running it. A workflow run fails as soon
+  as one of its jobs does, before the rest of it finishes. A job cancelled
+  while it waited for a runner neither passes nor fails: GitHub cancels a
+  waiting run or job when a newer one takes its place in a concurrency
+  group, and that says nothing about the commit. A cancelled workflow run
+  therefore takes the state of its jobs: it fails when one of them failed or
+  was stopped while it ran, passes when the rest passed, and otherwise
+  neither passes nor fails.
 - **Orange clock**: no check has failed, and at least one is still queued or
   running.
 - **Gray dash**: GitHub reported no checks on the commit, or reported only
-  checks that were skipped or neutral.
+  checks that were skipped or neutral, or runs cancelled before a runner ran
+  any of their jobs.
 - **Gray question mark**: the state is not known, because the last request to
   GitHub did not work. The menu says why.
 - **Gray gear**: no repository has been chosen yet.
@@ -197,7 +204,9 @@ added.
 Each time it asks, the indicator makes these requests: the branch's combined
 commit status, which also names the commit the branch is on; the workflow
 runs on that commit; the jobs of each workflow run that has not finished, so
-that a job that has failed is seen before its run finishes; and, once per
+that a job that has failed is seen before its run finishes; the jobs of each
+workflow run that was cancelled, which say whether a runner was running a job
+it stopped, asked for once and again only when the run changes; and, once per
 commit, the commit's message. Every request carries the ETag of the previous
 answer to it. With a token, GitHub charges nothing for an answer of "nothing
 has changed", so an idle branch costs almost nothing even when polled.
@@ -233,6 +242,11 @@ deliveries alone:
 - a check run that starts makes its suite run, and one that fails makes its
   suite fail;
 - a check suite that finishes takes the state it finished in;
+- a check run or check suite that is cancelled asks GitHub, since only
+  GitHub's answer says whether a runner was running the job it stopped, and
+  GitHub is asked again at the interval until an answer shows the suite's
+  latest attempt finished, or no longer lists the suite; a push that moves
+  the branch onto a commit with such a suite asks as well;
 - a commit status sets its context.
 
 Each delivery carries GitHub's time, and a report that is older than what is
@@ -257,7 +271,8 @@ is up, and after waking. It is also asked when deliveries show that one went
 missing: a push that cannot be placed after the last; a check run or check
 suite on the branch at a commit it has not been on, or at one it has left
 that a push from where it is started; the branch being deleted; and a
-delivery that cannot be read. Once two answers running show the branch is
+delivery that cannot be read. It is asked about cancellations as described
+above. Once two answers running show the branch is
 not on such a commit, deliveries about it stop asking, until the branch
 moves. An answer that names a commit the branch has since moved away from
 may be out of date, so the indicator keeps the newer commit and asks again

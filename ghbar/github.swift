@@ -320,6 +320,19 @@ struct Job: Decodable {
     let completedAt: Date?
     let htmlUrl: String?
     let steps: [Step]?
+    /// Empty, or missing, for a job no runner picked up.
+    let runnerName: String?
+}
+
+/// A job's state. A cancelled job fails only when a runner was running it.
+/// A job that a newer run replaced while it was queued, as a concurrency
+/// group does, is listed as cancelled with no runner, and says nothing about
+/// the commit.
+func jobState(_ job: Job) -> CheckState {
+    if job.conclusion == "cancelled", job.runnerName?.isEmpty ?? true {
+        return .other
+    }
+    return checkState(runStatus: job.status, conclusion: job.conclusion)
 }
 
 struct Jobs: Decodable {
@@ -349,23 +362,31 @@ func firstLine(_ message: String) -> String {
 }
 
 /// The commit's checks as the workflow runs, the jobs of the runs that have
-/// not finished, and the commit statuses describe them.
+/// not finished or were cancelled, and the commit statuses describe them. A
+/// cancelled run takes the state of its jobs: it fails when one of them
+/// failed or was stopped while a runner ran it, passes when every other job
+/// a runner ran passed, and otherwise neither passes nor fails.
 func commitChecks(runs: [WorkflowRun], jobs: [Int: [Job]], statuses: [CombinedStatus.Entry]) -> CommitChecks {
     var checks = CommitChecks()
     for run in runs {
         let url = run.htmlUrl.flatMap(URL.init(string:))
         let name = run.name ?? "Workflow run \(run.id)"
-        if run.status == "completed" {
-            checks.suiteFinished(suite: run.checkSuiteId,
-                                 state: checkState(runStatus: run.status, conclusion: run.conclusion),
-                                 detail: run.conclusion ?? run.status, at: run.updatedAt,
-                                 workflow: name, url: url)
+        // GitHub can list a cancelled run's jobs as still going for a while
+        // after the run finished; until they finish, the run is read as going.
+        if run.status == "completed",
+           run.conclusion != "cancelled" || (jobs[run.id] ?? []).allSatisfy({ $0.status == "completed" }) {
+            var state = checkState(runStatus: run.status, conclusion: run.conclusion)
+            if run.conclusion == "cancelled" {
+                let states = (jobs[run.id] ?? []).map(jobState)
+                state = states.contains(.failing) ? .failing : states.contains(.passing) ? .passing : .other
+            }
+            checks.suiteFinished(suite: run.checkSuiteId, state: state, detail: run.conclusion ?? run.status,
+                                 at: run.updatedAt, workflow: name, url: url)
             continue
         }
         checks.runStarted(suite: run.checkSuiteId, run: name, url: url,
                           at: run.runStartedAt ?? run.updatedAt, workflow: name)
-        for job in jobs[run.id] ?? []
-        where checkState(runStatus: job.status, conclusion: job.conclusion) == .failing {
+        for job in jobs[run.id] ?? [] where jobState(job) == .failing {
             checks.runFailed(suite: run.checkSuiteId, run: job.name,
                              url: job.htmlUrl.flatMap(URL.init(string:)),
                              at: job.completedAt ?? run.updatedAt)
@@ -384,13 +405,20 @@ func commitChecks(runs: [WorkflowRun], jobs: [Int: [Job]], statuses: [CombinedSt
 
 /// Asks GitHub about one branch: the commit it is on and that commit's
 /// statuses, the workflow runs on the commit, and the jobs of the runs that
-/// have not finished, so that a job that has already failed is not missed.
+/// have not finished, so that a job that has already failed is not missed,
+/// and of the runs that were cancelled, to learn whether a runner was running
+/// a job they stopped. The jobs of a cancelled run are asked for again only
+/// once the run changes.
 /// The Actions API serves a fine-grained token that has the Actions
 /// permission, which, unlike the Checks permission, such a token can be
 /// given.
 final class BranchReader {
     private let client: GitHubClient
     private var headlines: [String: String] = [:]
+    /// The jobs of finished runs that were cancelled, by run, with when the
+    /// run last changed. They stay the same until the run is run again,
+    /// which changes that time.
+    private var cancelledJobs: [Int: (updated: Date, jobs: [Job])] = [:]
 
     init(client: GitHubClient = GitHubClient()) {
         self.client = client
@@ -443,12 +471,27 @@ final class BranchReader {
             case .failure(let failure):
                 completion(.failure(failure))
             case .success(let listed):
-                let unfinished = listed.items.filter { $0.status != "completed" }
-                self.fetchJobs(repository: repository, runs: unfinished, token: token) { jobs in
+                let listedIds = Set(listed.items.map(\.id))
+                self.cancelledJobs = self.cancelledJobs.filter { listedIds.contains($0.key) }
+                let cancelled = listed.items.filter { $0.status == "completed" && $0.conclusion == "cancelled" }
+                let unsettled = listed.items.filter { run in
+                    run.status != "completed"
+                        || run.conclusion == "cancelled" && self.cancelledJobs[run.id]?.updated != run.updatedAt
+                }
+                self.fetchJobs(repository: repository, runs: unsettled, token: token) { jobs in
                     switch jobs {
                     case .failure(let failure):
                         completion(.failure(failure))
-                    case .success(let jobs):
+                    case .success(var jobs):
+                        for run in cancelled {
+                            if let fetched = jobs[run.id] {
+                                if fetched.allSatisfy({ $0.status == "completed" }) {
+                                    self.cancelledJobs[run.id] = (run.updatedAt, fetched)
+                                }
+                            } else {
+                                jobs[run.id] = self.cancelledJobs[run.id]?.jobs
+                            }
+                        }
                         completion(.success((listed.items, jobs, listed.rate)))
                     }
                 }
@@ -577,7 +620,7 @@ final class BranchReader {
                     return
                 }
                 completion(listed.items.compactMap { job in
-                    guard checkState(runStatus: job.status, conclusion: job.conclusion) == .failing else {
+                    guard jobState(job) == .failing else {
                         return nil
                     }
                     let step = job.steps?.first {

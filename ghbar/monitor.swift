@@ -12,9 +12,10 @@ let rememberedCommits = 64
 /// What to do about a webhook delivery.
 enum LedgerReaction {
     case ignore
-    case changed(BranchStatus)
+    /// Show the branch, and ask GitHub too if `fetch`.
+    case changed(BranchStatus, fetch: Bool = false)
     /// Ask GitHub, because the delivery shows that something went
-    /// undelivered.
+    /// undelivered, or says something only GitHub's answer settles.
     case fetch
 }
 
@@ -31,7 +32,10 @@ enum LedgerReaction {
 /// branch; one on the branch at a commit it has not been on means a push
 /// went undelivered, and asks GitHub, which says where the branch is. An
 /// answer that disagrees with the deliveries is checked once more, and
-/// believed if it says the same again.
+/// believed if it says the same again. Whether a cancelled check run or suite
+/// failed is left to GitHub's answer, which says whether a runner was running
+/// what it stopped, and GitHub is asked until an answer shows the suite's
+/// latest attempt finished.
 final class BranchLedger {
     let repository: RepositoryReference
     let branch: String
@@ -91,9 +95,10 @@ final class BranchLedger {
     /// whether deliveries can be left to say when to ask GitHub again: they
     /// cannot when the answer may have missed changes, when a delivery that
     /// could not be read arrived before the request, when the answer
-    /// replaced what deliveries said, or when it disagrees with them, by
+    /// replaced what deliveries said, when it disagrees with them, by
     /// naming a commit they showed the branch leaving or not naming one they
-    /// asked about.
+    /// asked about, or when it does not yet show finished a suite they said
+    /// was cancelled.
     func adopt(_ answer: BranchSnapshot, complete: Bool,
                replacing: Bool) -> (shown: BranchStatus, settled: Bool) {
         currentName = answer.repository
@@ -110,10 +115,25 @@ final class BranchLedger {
         if answer.sha == head {
             headline = answer.headline ?? headline
         }
+        // A cancellation is settled by an answer that shows its suite finished
+        // no earlier than the suite's latest known start, or that no longer
+        // lists the suite, as when the run was deleted, in which case what
+        // deliveries said about it goes too.
+        let known = commits[answer.sha]
+        let gone = (known?.undecided ?? []).filter { answer.checks.suites[$0] == nil }
+        let undecided = (known?.undecided ?? []).filter { suite in
+            guard let theirs = answer.checks.suites[suite] else { return false }
+            guard let finished = theirs.finished else { return true }
+            return finished.at < known?.suites[suite]?.started ?? .distantPast
+        }
         if replacing {
             record(answer.sha) { $0 = answer.checks }
         } else {
             record(answer.sha) { $0.merge(answer.checks) }
+        }
+        commits[answer.sha]?.undecided = undecided
+        for suite in gone {
+            commits[answer.sha]?.suites[suite] = nil
         }
         rateLimit = answer.rateLimit
         fetched = Date()
@@ -122,7 +142,7 @@ final class BranchLedger {
         // An answer that replaced what deliveries said may lag them, so one
         // more is asked for at the interval, and added to them.
         return (status(at: head ?? answer.sha),
-                complete && quiet && !behind && !replacing && doubted.isEmpty)
+                complete && quiet && !behind && !replacing && doubted.isEmpty && undecided.isEmpty)
     }
 
     func take(_ event: WebhookEvent) -> LedgerReaction {
@@ -155,7 +175,8 @@ final class BranchLedger {
             if newer || head != nil && event.before == head && !formerHeads.contains(event.sha) {
                 move(to: event.sha)
                 self.headline = headline
-                return status.map { .changed($0) } ?? .ignore
+                let undecided = !(commits[event.sha]?.undecided.isEmpty ?? true)
+                return status.map { .changed($0, fetch: undecided) } ?? .ignore
             }
             askedAbout.insert(event.sha)
             return .fetch
@@ -168,6 +189,9 @@ final class BranchLedger {
         case .suiteFinished(let suite, let state, let detail, let time):
             ask = asks(event)
             record(event.sha) { $0.suiteFinished(suite: suite, state: state, detail: detail, at: time) }
+        case .cancelled(let suite):
+            record(event.sha) { $0.suiteCancelled(suite: suite) }
+            return event.sha == head || asks(event) ? .fetch : .ignore
         case .status(let context, let status):
             record(event.sha) { $0.statusSet(context: context, status) }
         }
@@ -471,9 +495,9 @@ final class BranchMonitor {
     /// whether to ask GitHub.
     private func take(_ event: WebhookEvent) -> Bool {
         switch ledger?.take(event) {
-        case .changed(let status):
+        case .changed(let status, let fetch):
             show(status)
-            return false
+            return fetch
         case .fetch:
             return true
         case .ignore, nil:

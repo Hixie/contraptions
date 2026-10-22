@@ -55,7 +55,8 @@ enum CheckState: String {
     case passing
     case failing
     case running
-    /// Reported, but neither a pass nor a failure: skipped, neutral, or stale.
+    /// Reported, but neither a pass nor a failure: skipped, neutral, stale,
+    /// or cancelled before a runner ran it.
     case other
 }
 
@@ -179,6 +180,15 @@ struct StatusRecord {
 struct CommitChecks {
     var suites: [Int: SuiteRecord] = [:]
     var statuses: [String: StatusRecord] = [:]
+    /// Suites a delivery said a check run or the suite itself was cancelled
+    /// in, and whose latest attempt no answer from GitHub has shown finished
+    /// since. Only GitHub's answer says whether a runner was running a job a
+    /// cancellation stopped.
+    var undecided: Set<Int> = []
+
+    mutating func suiteCancelled(suite: Int) {
+        undecided.insert(suite)
+    }
 
     mutating func runStarted(suite: Int, run: String, url: URL?, at time: Date,
                              workflow: String? = nil) {
