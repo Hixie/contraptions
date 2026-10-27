@@ -13,6 +13,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import zipfile
 
 import longrun
 
@@ -343,6 +344,48 @@ class Runs(unittest.TestCase):
                               "import builtins; print(hasattr(builtins, "
                               "'SEEN'))")
         self.assertIn("1| False", result.stdout)
+
+    def test_python_stack_hook_chains_with_one_that_chains_the_same_way(self):
+        # Each directory's sitecustomize records its letter. A and C run
+        # the one they hide with a copy of the hook's own code, which
+        # registers no stack handler. P is the hook's directory and L is a
+        # symbolic link to it. Z is a zip file.
+        pystacks = os.path.join(HERE, "pystacks")
+        with open(os.path.join(pystacks, "sitecustomize.py")) as f:
+            chain = f.read()
+        self.assertIn("LONGRUN_PYSTACKS", chain)
+        chain = chain.replace("LONGRUN_PYSTACKS", "UNSET")
+        stacks = os.path.join(self.base, "py")
+        os.mkdir(stacks)
+        dirs = {"P": pystacks, "L": os.path.join(self.base, "L")}
+        os.symlink(pystacks, dirs["L"])
+        dirs["Z"] = os.path.join(self.base, "Z.zip")
+        with zipfile.ZipFile(dirs["Z"], "w") as z:
+            z.writestr("sitecustomize.py", "import builtins\nbuiltins.SEEN "
+                       "= getattr(builtins, 'SEEN', '') + 'Z'\n")
+        for name in "ABC":
+            dirs[name] = os.path.join(self.base, name)
+            os.mkdir(dirs[name])
+            with open(os.path.join(dirs[name], "sitecustomize.py"),
+                      "w") as f:
+                f.write("import builtins\nbuiltins.SEEN = getattr("
+                        "builtins, 'SEEN', '') + %r\n" % name)
+                if name != "B":
+                    f.write(chain)
+        for order, seen in [("APB", "AB"), ("PAB", "AB"), ("CAPB", "CAB"),
+                            ("PALB", "AB"), ("LAPB", "AB"), ("APZ", "AZ"),
+                            ("P", "")]:
+            path = [dirs[name] for name in order]
+            env = dict(self.env, PYTHONPATH=os.pathsep.join(path),
+                       LONGRUN_PYSTACKS=stacks)
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import builtins, faulthandler, signal; "
+                 "print(getattr(builtins, 'SEEN', ''), "
+                 "faulthandler.unregister(signal.SIGINFO))"],
+                env=env, capture_output=True, text=True)
+            self.assertEqual((result.stderr, result.stdout),
+                             ("", seen + " True\n"), order)
 
     def test_stop_ends_the_whole_tree(self):
         proc, rundir = self.start("--quiet", "0.04",

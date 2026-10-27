@@ -118,16 +118,21 @@ finish.
 Python stacks come from `pystacks/sitecustomize.py`, which longrun puts
 first on the command's `PYTHONPATH`. In each Python process it starts,
 that module registers a handler that writes every thread's stack to a
-file in the run directory on SIGINFO, then runs any `sitecustomize`
-module that it hides (Homebrew's Python has one). SIGINFO is ignored by
-default, so a process without the handler is unaffected by it, and
-longrun sends it only to processes that are still running Python. The
-stacks are read once the `sample` runs have finished, which takes a
-second or more, and a process whose stacks have not arrived by then is
-described by its `sample` frames. Reading a Python stack from outside
-the process needs root on macOS, which is why longrun asks the process
-instead. The handler is registered without chaining to an earlier one,
-so that a system call it interrupts is restarted rather than failing.
+file in the run directory on SIGINFO, then runs the `sitecustomize`
+module that it hides, if there is one (Homebrew's Python has one). The
+module it hides is the one that Python finds in the entries of the path
+after the entry it was loaded from. Another `sitecustomize` earlier on
+the path that runs the module it hides in the same way can therefore run
+this one. The modules then run in the order of their entries on the
+path, the module of each entry once. SIGINFO is ignored by default, so a
+process without the handler is unaffected by it, and longrun sends it
+only to processes that are still running Python. The stacks are read
+once the `sample` runs have finished, which takes a second or more, and
+a process whose stacks have not arrived by then is described by its
+`sample` frames. Reading a Python stack from outside the process needs
+root on macOS, which is why longrun asks the process instead. The
+handler is registered without chaining to an earlier one, so that a
+system call it interrupts is restarted rather than failing.
 
 ## How a run ends
 
