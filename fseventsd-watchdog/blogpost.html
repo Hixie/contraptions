@@ -1,0 +1,138 @@
+<!DOCTYPE HTML>
+<title>fseventsd's 32-bit memory leak</title>
+
+<h1>fseventsd's 32-bit memory leak</h1>
+
+<p><i>I asked Claude to write a blog post in <a href="https://ln.hixie.ch/">my style</a> and here's
+what it came up with. I include this here largely for comedic value, not sure how I feel about it
+matching my blog style like this! To be clear, while this is written in my voice (roughly) and from
+my perspective, Claude actually did all the work, all the research, and all the writing, and I had
+very little to do with any of this.</i></p>
+
+<hr>
+
+<p>If you search Google for "fseventsd", the results are a catalogue
+of misery. A Reddit thread asking why it's using thirty-odd gigabytes
+of memory. Apple Community threads about it eating CPU and RAM going
+back to 2008. A GitHub issue from May where it reached 28GB over a
+weekend. A "People also ask" box wondering why it uses so much memory.
+A selection of "Mac cleaner" sites with step-by-step guides, one of which
+helpfully explains that "fseventsd stands for Your Mac has malware".
+(It doesn't. It stands for "file system events daemon".)</p>
+
+<p>What you won't find is any acknowledgement from Apple. I couldn't
+find anything in their release notes or support documents. The closest
+thing is a reply from a developer support engineer on a
+developer forums thread, agreeing that there are bugs in FSEvents and
+suggesting the poster move their busiest directories onto a separate
+volume.</p>
+
+<p>I've now run into this twice in a week. On the 22nd, fseventsd on
+my Mac had grown to 103GB and was using about two cores. On the 27th
+it was at about 60GB, and I killed it. Killing it is fine, by the way;
+launchd immediately starts a fresh copy, which uses a few megabytes. But
+having to do that every few days is annoying, so I asked Claude to
+figure out why it was happening.</p>
+
+<p>It turns out that after the first incident, the agent I'd been
+working with had set up a launchd agent that copies everything
+fseventsd logs into a file, because the system log on my machine only
+keeps about a day of history. That meant
+that this time we had a record of what fseventsd said when it started
+going wrong. Combined with the memory figures in the jetsam reports
+that macOS writes to <code>/Library/Logs/DiagnosticReports</code>, we
+could see that fseventsd was at 12MB at 15:24 on the 26th, and at 57GB
+by 02:37 the next morning. In five days of logs, fseventsd had said
+something interesting exactly once, at 17:30 on the 26th:</p>
+
+<pre>event table has grown too large. (filled 196608 / mask 0x3ffff)</pre>
+
+<p>fseventsd isn't open source. The kernel half of FSEvents is (it's
+<code>bsd/vfs/vfs_fsevents.c</code> in XNU), but everything that
+happens after the kernel hands the events to the daemon is in a closed
+binary. So Claude disassembled it.</p>
+
+<p>Here's what it found. fseventsd keeps a record for each path that
+has recently changed, in a chained hash table that starts with 4,096
+buckets and doubles whenever three quarters of its buckets are in use,
+up to a maximum of 262,144 buckets. (Three quarters of 262,144 is
+196,608, and 262,144 buckets means a mask of 0x3ffff. So that log
+message is fseventsd saying it has hit the cap.) Records are reference
+counted, but releasing a record doesn't free it. Instead, an
+incremental sweeper runs each time fseventsd finishes handling a batch
+of events, checks 512 buckets, and frees any records it finds whose
+reference count has dropped to zero. The sweeper remembers where it got
+to with a 32-bit counter in the table. The loop, reconstructed from the
+machine code, amounts to this:</p>
+
+<pre>end = table-&gt;cursor + 512;
+while (table-&gt;cursor &lt; end) {
+  sweep(table-&gt;buckets[table-&gt;cursor &amp; table-&gt;mask]);
+  table-&gt;cursor += 1;
+}</pre>
+
+<p>Spot the bug?</p>
+
+<p>The cursor is masked when it's used, so it never needs to wrap, and
+it never does; it just keeps going up. After 8,388,607 sweeps it
+reaches 0xFFFFFE00. At that point <code>cursor + 512</code> overflows
+to a small number, the loop condition is false on entry, the loop
+doesn't run, the cursor doesn't advance, and it never runs again. (The
+compiler actually hoisted this into a guard at the top of the function
+that just returns if the cursor is at 0xFFFFFE00 or above, which makes
+the bug quite visible in the disassembly if you know to look for
+it.)</p>
+
+<p>From that point on, nothing is ever freed. The only thing that
+resets the cursor is the table being resized. If the table still has
+room to grow, it fills up, doubles, the cursor resets to zero, and
+everything recovers. But if the table is already at its maximum size,
+it can't grow, so the cursor is stuck forever. Every new path that
+changes leaks a record and its string, a few hundred bytes each. The
+hash chains get longer and longer, so every lookup does more and more
+string comparisons, which is where the two cores of CPU were going. On
+a machine with lots of agents running test suites in temporary
+directories, that's over a megabyte a second.</p>
+
+<p>This explains everything about the symptoms. It explains why it
+takes days or weeks to happen (millions of sweeps), why it happens
+sooner on busier machines (more batches of events, so more sweeps), why
+restarting fseventsd fixes it (a fresh process has a fresh counter), and
+why the table-full message shows up right at the start of the leak.</p>
+
+<p>Claude also tried to reproduce it by creating and deleting a few
+hundred thousand files, which didn't do anything, which is consistent
+with the analysis: creating files isn't the problem, running for a
+long time is. We didn't try to force the issue by driving millions of
+sweeps.</p>
+
+<p>At this point I was feeling rather pleased with myself, or at least
+with Claude. Then, while writing this post, I found <a
+href="https://developer.apple.com/forums/thread/849819">a thread on
+Apple's developer forums</a> where someone had posted exactly the same
+analysis three weeks earlier. Same function, same addresses, same
+8,388,607. They'd gone further, too: with a temporary SIP exception
+they'd watched the cursor in a live fseventsd actually stop at
+0xFFFFFE00. They filed it as FB25090184. Other people on that thread
+report similar symptoms on macOS 15 and on macOS 27.0.1. (That's also
+the thread with Apple's reply, which doesn't address the analysis.) So: not
+a new discovery, but an independent confirmation, which is worth
+something. (Thanks, rossc719!)</p>
+
+<p>The fix on Apple's side is basically a one-liner: count 512
+iterations rather than comparing against <code>cursor + 512</code>, or
+keep the cursor masked. Until that happens, the workaround is to
+restart fseventsd before the leak gets going. Conveniently, fseventsd
+tells you when that is: the leak can only become permanent once the
+table is at full size, and the first time the full-size table fills
+up, it logs "event table has grown too large".</p>
+
+<p>So I've added <a
+href="https://github.com/Hixie/contraptions/tree/main/fseventsd-watchdog">fseventsd-watchdog</a>
+to my contraptions repo. It's a small launchd daemon that watches for
+that message and restarts fseventsd when it appears. It also has a
+script that checks whether your copy of fseventsd still has the bug,
+so you can tell when a macOS update fixes it. If you have the same
+problem, please also file a bug with Apple and mention FB25090184; the
+more duplicates they get, the more likely it is that someone gets to
+make that one-line change.</p>
