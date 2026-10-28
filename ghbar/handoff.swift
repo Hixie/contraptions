@@ -4,9 +4,8 @@ import AppKit
 //
 // Codex is given a session that starts working without anyone pressing
 // anything. The Codex command-line tool that ships inside the Codex app
-// creates the session by running a short first turn outside the app, then
-// queues the real request, and the app runs the queued request when it
-// loads the session.
+// creates the session by running the request outside the app, then queues
+// "Execute.", and the app runs that message when it loads the session.
 //
 // Claude is given a new session with the request already written in it.
 // The Claude app does not send a request that arrives by link, so it waits
@@ -74,7 +73,7 @@ func handOff(_ status: BranchStatus, report: String, to agent: Agent, in folder:
             DispatchQueue.main.async {
                 if case .started(_, let url?) = outcome, !NSWorkspace.shared.open(url) {
                     completion(.failed("Could not open the Codex session",
-                                       detail: "Its request runs once \(url.absoluteString) is opened."))
+                                       detail: "It continues once \(url.absoluteString) is opened."))
                     return
                 }
                 completion(outcome)
@@ -103,10 +102,6 @@ func openClaudeSession(prompt: String, folder: URL, target: String) -> HandOffOu
 let codexBundleIdentifier = "com.openai.codex"
 let codexToolPath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 
-/// The first turn, which runs outside the app and only creates the session.
-let codexOpeningPrompt = "ghbar started this session to fix a failing branch, and sends the "
-    + "task in its next message. Reply with OK and do nothing else until then."
-
 /// One line of what `codex exec --json` prints.
 private struct CodexEvent: Decodable {
     struct Failure: Decodable {
@@ -126,15 +121,15 @@ private struct CodexEvent: Decodable {
     }
 }
 
-/// Creates the session and queues the request. Blocks until the first turn
-/// is over, so it runs off the main thread. The returned address loads the
-/// session in the app, which is what makes the app run the request.
+/// Creates the session with the request and queues "Execute.". Blocks until
+/// the first turn is over, so it runs off the main thread. The returned
+/// address loads the session in the app, which runs the queued message.
 func startCodexSession(tool: URL, prompt: String, folder: URL, target: String) -> HandOffOutcome {
     let failed = "Could not start a Codex session"
     do {
         let created = try runTool(tool, [
             "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
-            "--cd", folder.path, codexOpeningPrompt,
+            "--cd", folder.path, prompt,
         ])
         let events = created.output.split(separator: "\n").compactMap { line in
             try? JSONDecoder().decode(CodexEvent.self, from: Data(line.utf8))
@@ -145,7 +140,7 @@ func startCodexSession(tool: URL, prompt: String, folder: URL, target: String) -
             return .failed(failed, detail: reported?.error?.message ?? reported?.message
                 ?? created.failure("codex exec"))
         }
-        let queued = try runTool(tool, ["queue", "--thread", thread, "--message", prompt])
+        let queued = try runTool(tool, ["queue", "--thread", thread, "--message", "Execute."])
         guard queued.status == 0 else {
             return .failed(failed, detail: queued.failure("codex queue"))
         }

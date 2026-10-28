@@ -109,9 +109,9 @@ can say either of these:
 
 - **Start a Codex session to fix it.** The Codex app comes to the front with
   the new session, which starts working without anyone pressing anything.
-  The session begins with a short exchange that runs outside the app, with
-  a read-only sandbox. The request follows, and runs in the app with the
-  app's own sandbox and approval settings.
+  The session begins with the request, which runs outside the app with a
+  read-only sandbox. A second message, "Execute.", runs in the app with
+  the app's own sandbox and approval settings.
 - **Open a Claude session, ready to send.** The Claude app comes to the
   front with a new Code session that has the request written in. The Claude
   app does not send a request that arrives this way, so it waits for you to
