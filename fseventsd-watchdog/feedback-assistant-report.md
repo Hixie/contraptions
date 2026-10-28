@@ -1,3 +1,5 @@
+Filed as FB25346707 on 2026-10-27.
+
 Title: fseventsd leaks memory without bound after its event-table sweep cursor reaches 0xFFFFFE00
 
 Area: macOS > File System Events (fseventsd)

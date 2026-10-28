@@ -75,7 +75,8 @@ FB25090184. Using a temporary SIP exception, its author watched the
 counter in a running fseventsd stop at 0xFFFFFE00, and saw it reset when
 the table next doubled. Other people in that thread report similar
 symptoms on macOS 15 and macOS 27.0.1. Apple's replies there agree that
-FSEvents has bugs, but do not discuss the counter.
+FSEvents has bugs, but do not discuss the counter. The analysis in this
+directory was filed separately as FB25346707.
 
 Bursts of 50,000 and 250,000 new files did not make fseventsd overflow
 or keep memory afterwards. That is what the analysis predicts while the
