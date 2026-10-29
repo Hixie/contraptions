@@ -109,9 +109,10 @@ can say either of these:
 
 - **Start a Codex session to fix it.** The Codex app comes to the front with
   the new session, which starts working without anyone pressing anything.
-  The session begins with the request, which runs outside the app with a
-  read-only sandbox. A second message, "Execute.", runs in the app with
-  the app's own sandbox and approval settings.
+  The session begins with the request, which runs outside the app with
+  the Codex CLI's configured sandbox and approval settings. When that
+  turn finishes, ghbar opens the session in the app, where a second
+  message, "Execute.", runs with the app's sandbox and approval settings.
 - **Open a Claude session, ready to send.** The Claude app comes to the
   front with a new Code session that has the request written in. The Claude
   app does not send a request that arrives this way, so it waits for you to
@@ -328,18 +329,20 @@ commit's checks is in `checks.swift`, the requests to GitHub are in
 `github.swift`, the relay connection and the deliveries it carries are in
 `relay.swift`, and following the branch, and deciding when to ask GitHub,
 are in `monitor.swift`. The plane is `flyby.swift`, and the hand-off to an
-agent is `handoff.swift`.
+agent is `handoff.swift`. Running other programs is in `tool.swift`.
 
 ```sh
 make            # builds ./ghbar
 ./ghbar         # runs an indicator, taking the lowest free instance number
-make test       # tests following a branch, with and without a relay
+make test       # tests following a branch and handing it off to an agent
 ```
 
 The tests run a stand-in relay on the loopback interface, a stand-in for
 GitHub that answers each request when the test says so, and a stand-in for
-GitHub's HTTP API. A test has no time
-limit: it waits until what it is waiting for happens. With `TRACE_WAITS` set
+GitHub's HTTP API. A stand-in Codex executable checks that the hand-off
+preserves its configured permissions, request, and session folder, and
+queues the follow-up on the session it created. A test has no time limit:
+it waits until what it is waiting for happens. With `TRACE_WAITS` set
 in the environment, each wait prints its line number, so a test that never
 finishes shows where it stopped.
 

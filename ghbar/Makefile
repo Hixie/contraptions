@@ -3,9 +3,9 @@ INSTALL_DIR = $(HOME)/.local/bin
 AGENT_DIR = $(HOME)/Library/LaunchAgents
 AGENT_PREFIX = local.ghbar
 
-SOURCES = main.swift checks.swift github.swift relay.swift monitor.swift flyby.swift handoff.swift
+SOURCES = main.swift checks.swift github.swift relay.swift monitor.swift flyby.swift handoff.swift tool.swift
 # Everything the tests exercise, which leaves out main.swift and the menu bar.
-TEST_SOURCES = checks.swift github.swift relay.swift monitor.swift tests/main.swift
+TEST_SOURCES = checks.swift github.swift relay.swift monitor.swift handoff.swift tool.swift tests/main.swift
 # Not named Info.plist: an Info.plist beside an executable named after its
 # directory makes macOS take the directory for an application bundle, and
 # then the binary fails signature verification and launchd will not start

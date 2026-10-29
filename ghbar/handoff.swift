@@ -128,7 +128,7 @@ func startCodexSession(tool: URL, prompt: String, folder: URL, target: String) -
     let failed = "Could not start a Codex session"
     do {
         let created = try runTool(tool, [
-            "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
+            "exec", "--json", "--skip-git-repo-check",
             "--cd", folder.path, prompt,
         ])
         let events = created.output.split(separator: "\n").compactMap { line in

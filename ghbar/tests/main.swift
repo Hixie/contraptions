@@ -2,8 +2,8 @@ import Foundation
 import Network
 
 // Tests for how ghbar keeps track of a branch's checks, from GitHub's
-// answers and from a relay of webhook deliveries, and for when it asks
-// GitHub. Run them with `make test`.
+// answers and from a relay of webhook deliveries, for when it asks GitHub,
+// and for handing a branch off to Codex. Run them with `make test`.
 
 var failures = 0
 
@@ -20,6 +20,94 @@ func waitUntil(_ condition: () -> Bool, line: Int = #line) {
     if ProcessInfo.processInfo.environment["TRACE_WAITS"] != nil { fputs("waiting at line \(line)\n", stderr) }
     while !condition() {
         RunLoop.main.run(mode: .default, before: .distantFuture)
+    }
+}
+
+// MARK: - Launching Codex
+
+for configuredMode in ["danger-full-access", "workspace-write", "read-only"] {
+    do {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ghbar-handoff-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let folder = directory.appendingPathComponent("session folder")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let tool = directory.appendingPathComponent("fake codex")
+        try """
+        #!/bin/sh
+        set -eu
+        directory=$(dirname "$0")
+        operation=$1
+        shift
+        case "$operation" in
+          exec)
+            mode=$(cat "$directory/configured-mode")
+            next=""
+            folder=""
+            prompt=""
+            for argument in "$@"; do
+              case "$next" in
+                sandbox) mode=$argument; next="" ;;
+                folder) folder=$argument; next="" ;;
+                *)
+                  case "$argument" in
+                    --sandbox|-s) next=sandbox ;;
+                    --cd|-C) next=folder ;;
+                  esac
+                  ;;
+              esac
+              prompt=$argument
+            done
+            printf '%s' "$prompt" > "$directory/prompt"
+            printf '%s' "$folder" > "$directory/folder"
+            if [ "$mode" != read-only ]; then
+              printf 'written' > "$folder/receipt"
+            fi
+            printf '%s\\n' '{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}'
+            ;;
+          queue)
+            printf '%s' "$2" > "$directory/queued-thread"
+            printf '%s' "$4" > "$directory/queued-message"
+            ;;
+          *) exit 2 ;;
+        esac
+        """.write(to: tool, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tool.path)
+        try configuredMode.write(
+            to: directory.appendingPathComponent("configured-mode"),
+            atomically: true, encoding: .utf8)
+        let prompt = "Repair the branch's failing check.\nKeep its existing permissions."
+        let outcome = startCodexSession(tool: tool, prompt: prompt, folder: folder, target: "repo main")
+        switch outcome {
+        case .started(_, let url):
+            expect(
+                url?.absoluteString == "codex://threads/00000000-0000-4000-8000-000000000001",
+                "the app opens the session created by Codex")
+        case .failed(_, let detail):
+            expect(false, "the Codex handoff failed: \(detail)")
+        }
+        expect(
+            FileManager.default.fileExists(atPath: folder.appendingPathComponent("receipt").path)
+                == (configuredMode != "read-only"),
+            "the launched task must retain configured \(configuredMode) permissions")
+        expect(
+            try String(contentsOf: directory.appendingPathComponent("prompt"), encoding: .utf8) == prompt,
+            "the actual request is delivered in the first turn")
+        expect(
+            try String(contentsOf: directory.appendingPathComponent("folder"), encoding: .utf8)
+                == folder.path,
+            "a session folder containing spaces is passed intact")
+        expect(
+            try String(contentsOf: directory.appendingPathComponent("queued-thread"), encoding: .utf8)
+                == "00000000-0000-4000-8000-000000000001",
+            "the follow-up is queued on the created session")
+        expect(
+            try String(contentsOf: directory.appendingPathComponent("queued-message"), encoding: .utf8)
+                == "Execute.",
+            "the app receives the execution follow-up")
+    } catch {
+        expect(false, "Codex handoff fixture failed: \(error)")
     }
 }
 
