@@ -23,6 +23,65 @@ func waitUntil(_ condition: () -> Bool, line: Int = #line) {
     }
 }
 
+// MARK: - Agent prompts
+
+do {
+    let instance = Int.random(in: 1_000_000..<Int.max / 2) * 2
+    let settings = Settings(instance: instance)
+    let other = Settings(instance: instance + 1)
+    defer {
+        for number in [instance, instance + 1] {
+            UserDefaults.standard.removePersistentDomain(forName: "\(identifierPrefix).\(number)")
+        }
+    }
+    expect(
+        settings.handOffPrompt == defaultHandOffPrompt && settings.codexFollowUp == "Execute.",
+        "indicators without saved prompts use the existing request and follow-up")
+    let request = "Review {repository} on {branch}.\n\n{report}\nKeep the café's changes."
+    let followUp = "Continue on {branch}.\nRun the tests."
+    settings.handOffPrompt = request
+    settings.codexFollowUp = followUp
+    let reopened = Settings(instance: instance)
+    expect(
+        reopened.handOffPrompt == request && reopened.codexFollowUp == followUp,
+        "both multiline prompts survive reopening the indicator's settings")
+    expect(
+        other.handOffPrompt == defaultHandOffPrompt && other.codexFollowUp == defaultCodexFollowUp,
+        "one indicator's prompts do not change another indicator's prompts")
+    reopened.handOffPrompt = " \n\t"
+    reopened.codexFollowUp = ""
+    expect(
+        settings.handOffPrompt == defaultHandOffPrompt && settings.codexFollowUp == defaultCodexFollowUp,
+        "clearing either prompt restores its default")
+}
+
+do {
+    let status = BranchStatus(
+        repository: .init(owner: "octo", name: "repo"), branch: "feature/{report}",
+        sha: "a1", headline: nil, checks: CommitChecks(), fetched: Date(),
+        rateLimit: nil)
+    let report = "Tests failed.\nKeep {branch} and {checks_url} literal in the report."
+    expect(
+        handOffPrompt(status, report: report)
+            == "Select an appropriate worktree and fix the red feature/{report} on octo/repo: "
+            + "https://github.com/octo/repo/commit/a1/checks\n\n" + report,
+        "the default request retains the branch, checks link, and failure report")
+    expect(
+        handOffPrompt(
+            status, report: report,
+            template: "{report}\n{repository} {branch}\n{checks_url}\n{branch}")
+            == report
+            + "\nocto/repo feature/{report}\nhttps://github.com/octo/repo/commit/a1/checks\nfeature/{report}",
+        "templates expand every occurrence once without expanding inserted values")
+    expect(
+        handOffPrompt(status, report: report, template: "Inspect only {repository}.")
+            == "Inspect only octo/repo.", "templates include only the context they request")
+    expect(
+        handOffPrompt(status, report: report, template: "{\"repo\":\"{repository}\"} {unknown} {branch")
+            == "{\"repo\":\"octo/repo\"} {unknown} {branch",
+        "literal braces and unrecognized or unfinished placeholders are preserved")
+}
+
 // MARK: - Launching Codex
 
 for configuredMode in ["danger-full-access", "workspace-write", "read-only"] {
@@ -50,14 +109,19 @@ for configuredMode in ["danger-full-access", "workspace-write", "read-only"] {
               case "$next" in
                 sandbox) mode=$argument; next="" ;;
                 folder) folder=$argument; next="" ;;
+                prompt) prompt=$argument; next=done ;;
+                done) printf 'unexpected extra argument' >&2; exit 2 ;;
                 *)
                   case "$argument" in
                     --sandbox|-s) next=sandbox ;;
                     --cd|-C) next=folder ;;
+                    --json|--skip-git-repo-check) ;;
+                    --) next=prompt ;;
+                    -*) printf 'unexpected option: %s' "$argument" >&2; exit 2 ;;
+                    *) prompt=$argument; next=done ;;
                   esac
                   ;;
               esac
-              prompt=$argument
             done
             printf '%s' "$prompt" > "$directory/prompt"
             printf '%s' "$folder" > "$directory/folder"
@@ -68,7 +132,17 @@ for configuredMode in ["danger-full-access", "workspace-write", "read-only"] {
             ;;
           queue)
             printf '%s' "$2" > "$directory/queued-thread"
-            printf '%s' "$4" > "$directory/queued-message"
+            case "$3" in
+              --message=*) message=${3#--message=} ;;
+              --message)
+                case "$4" in
+                  -*) printf 'unexpected message option: %s' "$4" >&2; exit 2 ;;
+                  *) message=$4 ;;
+                esac
+                ;;
+              *) exit 2 ;;
+            esac
+            printf '%s' "$message" > "$directory/queued-message"
             ;;
           *) exit 2 ;;
         esac
@@ -77,8 +151,17 @@ for configuredMode in ["danger-full-access", "workspace-write", "read-only"] {
         try configuredMode.write(
             to: directory.appendingPathComponent("configured-mode"),
             atomically: true, encoding: .utf8)
-        let prompt = "Repair the branch's failing check.\nKeep its existing permissions."
-        let outcome = startCodexSession(tool: tool, prompt: prompt, folder: folder, target: "repo main")
+        let prompt =
+            configuredMode == "read-only"
+            ? "- Repair the branch's failing check.\n- Keep its existing permissions."
+            : "Repair the branch's failing check.\nKeep its existing permissions."
+        let followUp =
+            configuredMode == "danger-full-access"
+            ? defaultCodexFollowUp
+            : "- Continue the café's repair.\n- Keep $HOME, $(exit 2), and `exit 3` literal."
+        let outcome = startCodexSession(
+            tool: tool, prompt: prompt, followUp: followUp,
+            folder: folder, target: "repo main")
         switch outcome {
         case .started(_, let url):
             expect(
@@ -104,8 +187,8 @@ for configuredMode in ["danger-full-access", "workspace-write", "read-only"] {
             "the follow-up is queued on the created session")
         expect(
             try String(contentsOf: directory.appendingPathComponent("queued-message"), encoding: .utf8)
-                == "Execute.",
-            "the app receives the execution follow-up")
+                == followUp,
+            "the app receives the configured multiline follow-up unchanged")
     } catch {
         expect(false, "Codex handoff fixture failed: \(error)")
     }

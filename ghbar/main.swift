@@ -13,16 +13,8 @@ import AppKit
 
 // MARK: - Constants
 
-/// Prefix for the preference domain, the lock file names, and the launchd
-/// agent labels. The instance number is appended to it.
-let identifierPrefix = "local.ghbar"
-
 /// Highest instance number that automatic allocation considers.
 let maximumInstances = 64
-
-let defaultBranchName = "main"
-let defaultRefreshSeconds = 60.0
-let minimumRefreshSeconds = 15.0
 
 /// Marks the fields the login shell prints, so the token can be picked out of
 /// whatever else the user's profile writes to standard output.
@@ -32,109 +24,6 @@ let shellFieldSeparator = "\u{1e}"
 /// this is reported as a count and stays reachable through the All Checks
 /// submenu.
 let inlineCheckLimit = 12
-
-// MARK: - Repository references
-
-/// Reads a folder as typed, which may start with a tilde. A relative path is
-/// taken from the home folder, and empty means the home folder.
-func folderURL(_ text: String) -> URL {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.isEmpty {
-        return FileManager.default.homeDirectoryForCurrentUser
-    }
-    return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath, isDirectory: true,
-               relativeTo: FileManager.default.homeDirectoryForCurrentUser).absoluteURL
-}
-
-func isBranchName(_ text: String) -> Bool {
-    guard !text.isEmpty, !text.hasPrefix("/"), !text.hasSuffix("/") else { return false }
-    return !text.contains(where: { $0.isWhitespace }) && !text.contains("..")
-}
-
-// MARK: - Settings
-
-enum SettingsKey {
-    static let repository = "repository"
-    static let branch = "branch"
-    static let menuBarName = "menuBarName"
-    static let showsMenuBarName = "showsMenuBarName"
-    static let refreshSeconds = "refreshSeconds"
-    static let handOff = "handOff"
-    static let handOffFolder = "handOffFolder"
-    static let relay = "relay"
-}
-
-/// One indicator's settings, kept in a preference domain of its own so that
-/// indicators with different instance numbers do not overwrite each other.
-final class Settings {
-    let instance: Int
-    private let store: UserDefaults
-
-    init(instance: Int) {
-        self.instance = instance
-        store = UserDefaults(suiteName: "\(identifierPrefix).\(instance)") ?? .standard
-        store.register(defaults: [
-            SettingsKey.branch: defaultBranchName,
-            SettingsKey.showsMenuBarName: true,
-            SettingsKey.refreshSeconds: defaultRefreshSeconds,
-        ])
-    }
-
-    var repository: RepositoryReference? {
-        get {
-            guard let text = store.string(forKey: SettingsKey.repository) else { return nil }
-            return parseRepository(text)?.repository
-        }
-        set { store.set(newValue?.slug, forKey: SettingsKey.repository) }
-    }
-
-    var branch: String {
-        get { store.string(forKey: SettingsKey.branch) ?? defaultBranchName }
-        set { store.set(newValue, forKey: SettingsKey.branch) }
-    }
-
-    var menuBarName: String {
-        get { store.string(forKey: SettingsKey.menuBarName) ?? "" }
-        set { store.set(newValue, forKey: SettingsKey.menuBarName) }
-    }
-
-    var showsMenuBarName: Bool {
-        get { store.bool(forKey: SettingsKey.showsMenuBarName) }
-        set { store.set(newValue, forKey: SettingsKey.showsMenuBarName) }
-    }
-
-    var refreshSeconds: Double {
-        get { max(minimumRefreshSeconds, store.double(forKey: SettingsKey.refreshSeconds)) }
-        set { store.set(max(minimumRefreshSeconds, newValue), forKey: SettingsKey.refreshSeconds) }
-    }
-
-    /// The agent a branch that turns red is handed to, if any.
-    var handOff: Agent? {
-        get { store.string(forKey: SettingsKey.handOff).flatMap(Agent.init(rawValue:)) }
-        set { store.set(newValue?.rawValue, forKey: SettingsKey.handOff) }
-    }
-
-    /// The folder an agent's session starts in, as typed. Empty means the
-    /// home folder.
-    var handOffFolder: String {
-        get { store.string(forKey: SettingsKey.handOffFolder) ?? "" }
-        set { store.set(newValue, forKey: SettingsKey.handOffFolder) }
-    }
-
-    var handOffFolderURL: URL { folderURL(handOffFolder) }
-
-    /// The webhook relay to hear about changes from, if any.
-    var relay: RelayAddress? {
-        get { store.string(forKey: SettingsKey.relay).flatMap(parseRelayAddress) }
-        set { store.set(newValue?.description, forKey: SettingsKey.relay) }
-    }
-
-    /// The text drawn next to the indicator in the menu bar.
-    var displayName: String {
-        if !menuBarName.isEmpty { return menuBarName }
-        return repository?.name ?? applicationName
-    }
-}
 
 // MARK: - Instance numbers
 
@@ -661,6 +550,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
                                           target: nil, action: nil)
     private let handOffButton = NSPopUpButton()
     private let folderField = NSTextField()
+    private let promptField = NSTextView()
+    private let followUpField = NSTextView()
     private let relayField = NSTextField()
     private let tokenLabel = NSTextField(labelWithString: "Looking…")
     private let messageLabel = NSTextField(labelWithString: "")
@@ -687,6 +578,28 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let label = NSTextField(labelWithString: text)
         label.alignment = .right
         return label
+    }
+
+    private func promptEditor(_ field: NSTextView, height: CGFloat) -> NSScrollView {
+        field.isRichText = false
+        field.allowsUndo = true
+        field.isAutomaticQuoteSubstitutionEnabled = false
+        field.isAutomaticDashSubstitutionEnabled = false
+        field.isAutomaticTextReplacementEnabled = false
+        field.font = .systemFont(ofSize: NSFont.systemFontSize)
+        field.textContainerInset = NSSize(width: 6, height: 6)
+        field.isVerticallyResizable = true
+        field.isHorizontallyResizable = false
+        field.autoresizingMask = [.width]
+        field.textContainer?.widthTracksTextView = true
+        field.setFrameSize(NSSize(width: 400, height: height))
+        let scroll = NSScrollView()
+        scroll.borderType = .bezelBorder
+        scroll.hasVerticalScroller = true
+        scroll.documentView = field
+        scroll.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return scroll
     }
 
     private func buildContent() {
@@ -716,6 +629,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         intervalRow.alignment = .firstBaseline
         intervalRow.spacing = 6
 
+        let promptHelp = NSTextField(
+            wrappingLabelWithString:
+                "Both prompts accept {branch}, {repository}, {checks_url}, and {report}. "
+                + "Empty fields use the default prompts.")
+        promptHelp.textColor = .secondaryLabelColor
+        promptHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        promptHelp.widthAnchor.constraint(equalToConstant: 400).isActive = true
+
         let grid = NSGridView(views: [
             [caption("Repository:"), repositoryField],
             [caption("Branch:"), branchField],
@@ -724,6 +645,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             [NSGridCell.emptyContentView, showNameButton],
             [caption("When it turns red:"), handOffButton],
             [caption("Session folder:"), folderField],
+            [caption("Agent request:"), promptEditor(promptField, height: 96)],
+            [caption("Codex follow-up:"), promptEditor(followUpField, height: 54)],
+            [NSGridCell.emptyContentView, promptHelp],
             [caption("Webhook relay:"), relayField],
             [caption("GitHub token:"), tokenLabel],
         ])
@@ -731,6 +655,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         grid.rowAlignment = .firstBaseline
         grid.rowSpacing = 10
         grid.columnSpacing = 10
+        grid.cell(atColumnIndex: 0, rowIndex: 7).yPlacement = .top
+        grid.cell(atColumnIndex: 0, rowIndex: 8).yPlacement = .top
+        grid.row(at: 7).rowAlignment = .none
+        grid.row(at: 8).rowAlignment = .none
         grid.translatesAutoresizingMaskIntoConstraints = false
 
         let cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancel(_:)))
@@ -774,6 +702,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         showNameButton.state = settings.showsMenuBarName ? .on : .off
         handOffButton.selectItem(at: settings.handOff.map { Agent.allCases.firstIndex(of: $0)! + 1 } ?? 0)
         folderField.stringValue = settings.handOffFolder
+        promptField.string = settings.handOffPrompt
+        followUpField.string = settings.codexFollowUp
+        window?.undoManager?.removeAllActions()
         relayField.stringValue = settings.relay?.description ?? ""
         messageLabel.stringValue = ""
         tokenLabel.stringValue = "Looking…"
@@ -850,6 +781,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         settings.refreshSeconds = seconds
         settings.handOff = handOff
         settings.handOffFolder = folder
+        settings.handOffPrompt = promptField.string
+        settings.codexFollowUp = followUpField.string
         settings.relay = relay
         close()
         onSave?()
@@ -1115,9 +1048,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let agent = settings.handOff else { return }
         let lastGreen = self.lastGreen
         let folder = settings.handOffFolderURL
+        let prompt = settings.handOffPrompt
+        let followUp = settings.codexFollowUp
         credentials.resolve { [weak self] credential in
             self?.reader.failureReport(status, lastGreen: lastGreen, token: credential.token) { report in
-                handOff(status, report: report, to: agent, in: folder) { outcome in
+                handOff(
+                    status, report: report, to: agent,
+                    prompt: prompt, codexFollowUp: followUp, in: folder
+                ) { outcome in
                     self?.show(outcome)
                 }
             }
@@ -1581,8 +1519,12 @@ func runHandOff(options: Options) -> Never {
     }
     fetchOnce(options: options, settings: settings) { status, reader, token in
         reader.failureReport(status, lastGreen: nil, token: token) { report in
-            print(handOffPrompt(status, report: report))
-            handOff(status, report: report, to: agent, in: settings.handOffFolderURL) { outcome in
+            print(handOffPrompt(status, report: report, template: settings.handOffPrompt))
+            handOff(
+                status, report: report, to: agent,
+                prompt: settings.handOffPrompt, codexFollowUp: settings.codexFollowUp,
+                in: settings.handOffFolderURL
+            ) { outcome in
                 print(outcome.summary)
                 if case .failed = outcome {
                     exit(1)

@@ -5,7 +5,7 @@ import AppKit
 // Codex is given a session that starts working without anyone pressing
 // anything. The Codex command-line tool that ships inside the Codex app
 // creates the session by running the request outside the app, then queues
-// "Execute.", and the app runs that message when it loads the session.
+// the follow-up, and the app runs that message when it loads the session.
 //
 // Claude is given a new session with the request already written in it.
 // The Claude app does not send a request that arrives by link, so it waits
@@ -40,21 +40,48 @@ enum HandOffOutcome {
     }
 }
 
-/// The request to the agent, followed by `report`, which says what failed.
-func handOffPrompt(_ status: BranchStatus, report: String) -> String {
-    var prompt = "Select an appropriate worktree and fix the red \(status.branch) on "
-        + status.repository.slug
-    if let url = status.checksURL {
-        prompt += ": \(url.absoluteString)"
+let defaultHandOffPrompt = """
+    Select an appropriate worktree and fix the red {branch} on {repository}: {checks_url}
+
+    {report}
+    """
+let defaultCodexFollowUp = "Execute."
+
+/// Expands placeholders once, preserving other text and the inserted values.
+func handOffPrompt(
+    _ status: BranchStatus, report: String,
+    template: String = defaultHandOffPrompt
+) -> String {
+    let values = [
+        "{branch}": status.branch,
+        "{repository}": status.repository.slug,
+        "{checks_url}": status.checksURL?.absoluteString ?? "",
+        "{report}": report
+    ]
+    var remaining = template[...]
+    var prompt = ""
+    while let start = remaining.firstIndex(of: "{") {
+        prompt += remaining[..<start]
+        if let (token, value) = values.first(where: { remaining[start...].hasPrefix($0.key) }) {
+            prompt += value
+            remaining = remaining[remaining.index(start, offsetBy: token.count)...]
+        } else {
+            prompt += "{"
+            remaining = remaining[remaining.index(after: start)...]
+        }
     }
-    return prompt + "\n\n" + report
+    return prompt + remaining
 }
 
 /// Hands the branch to the agent and calls back on the main thread once the
 /// session has been started, or has failed to start.
-func handOff(_ status: BranchStatus, report: String, to agent: Agent, in folder: URL,
-             completion: @escaping (HandOffOutcome) -> Void) {
-    let prompt = handOffPrompt(status, report: report)
+func handOff(
+    _ status: BranchStatus, report: String, to agent: Agent,
+    prompt template: String, codexFollowUp: String, in folder: URL,
+    completion: @escaping (HandOffOutcome) -> Void
+) {
+    let prompt = handOffPrompt(status, report: report, template: template)
+    let followUp = handOffPrompt(status, report: report, template: codexFollowUp)
     let target = "\(status.repository.name) \(status.branch)"
     switch agent {
     case .claude:
@@ -68,8 +95,9 @@ func handOff(_ status: BranchStatus, report: String, to agent: Agent, in folder:
         }
         let tool = app.appendingPathComponent(codexToolPath)
         DispatchQueue.global(qos: .userInitiated).async {
-            let outcome = startCodexSession(tool: tool, prompt: prompt, folder: folder,
-                                            target: target)
+            let outcome = startCodexSession(
+                tool: tool, prompt: prompt, followUp: followUp, folder: folder,
+                target: target)
             DispatchQueue.main.async {
                 if case .started(_, let url?) = outcome, !NSWorkspace.shared.open(url) {
                     completion(.failed("Could not open the Codex session",
@@ -121,16 +149,19 @@ private struct CodexEvent: Decodable {
     }
 }
 
-/// Creates the session with the request and queues "Execute.". Blocks until
+/// Creates the session with the request and queues the follow-up. Blocks until
 /// the first turn is over, so it runs off the main thread. The returned
 /// address loads the session in the app, which runs the queued message.
-func startCodexSession(tool: URL, prompt: String, folder: URL, target: String) -> HandOffOutcome {
+func startCodexSession(
+    tool: URL, prompt: String, followUp: String,
+    folder: URL, target: String
+) -> HandOffOutcome {
     let failed = "Could not start a Codex session"
     do {
         let created = try runTool(tool, [
             "exec", "--json", "--skip-git-repo-check",
-            "--cd", folder.path, prompt,
-        ])
+                "--cd", folder.path, "--", prompt
+            ])
         let events = created.output.split(separator: "\n").compactMap { line in
             try? JSONDecoder().decode(CodexEvent.self, from: Data(line.utf8))
         }
@@ -140,7 +171,7 @@ func startCodexSession(tool: URL, prompt: String, folder: URL, target: String) -
             return .failed(failed, detail: reported?.error?.message ?? reported?.message
                 ?? created.failure("codex exec"))
         }
-        let queued = try runTool(tool, ["queue", "--thread", thread, "--message", "Execute."])
+        let queued = try runTool(tool, ["queue", "--thread", thread, "--message=\(followUp)"])
         guard queued.status == 0 else {
             return .failed(failed, detail: queued.failure("codex queue"))
         }

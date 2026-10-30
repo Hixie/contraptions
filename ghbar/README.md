@@ -94,8 +94,8 @@ does it too.
 
 ## Handing a red branch to an agent
 
-An indicator can also hand a branch that turns red to a coding agent, which
-is asked to "select an appropriate worktree and fix the red BRANCH on
+An indicator can also hand a branch that turns red to a coding agent. By
+default, the agent is asked to "select an appropriate worktree and fix the red BRANCH on
 OWNER/NAME", followed by a link to the commit's checks page and a report of
 what failed. Before handing the branch off, the indicator asks GitHub for
 that report: each failed job, the step it failed at, and a link to it; each
@@ -112,7 +112,8 @@ can say either of these:
   The session begins with the request, which runs outside the app with
   the Codex CLI's configured sandbox and approval settings. When that
   turn finishes, ghbar opens the session in the app, where a second
-  message, "Execute.", runs with the app's sandbox and approval settings.
+  message, "Execute." by default, runs with the app's sandbox and approval
+  settings.
 - **Open a Claude session, ready to send.** The Claude app comes to the
   front with a new Code session that has the request written in. The Claude
   app does not send a request that arrives this way, so it waits for you to
@@ -138,6 +139,30 @@ relay to hear about changes from, written as `host:port`. The
 repository can be written as `owner/name`, or pasted in any of the forms GitHub
 hands out: the address of the repository, the address of a branch, or the SSH
 remote. Pasting the address of a branch fills in the branch as well.
+
+**Agent request** changes the first message sent to either agent.
+**Codex follow-up** changes the message queued for Codex to run in the app.
+Both accept multiple lines and these placeholders:
+
+| Placeholder | Replaced with |
+| --- | --- |
+| `{branch}` | The branch being handed off. |
+| `{repository}` | The repository as `owner/name`. |
+| `{checks_url}` | The commit's checks page on GitHub. |
+| `{report}` | The report of failed checks and commits since the last passing commit. |
+
+The default request is:
+
+```text
+Select an appropriate worktree and fix the red {branch} on {repository}: {checks_url}
+
+{report}
+```
+
+The default follow-up is `Execute.`. Clearing a prompt restores its default.
+Other text is kept as typed. Text inserted for a placeholder is kept literally,
+so a placeholder in a branch name or a failure report is not expanded again.
+The configured prompts also apply to `--hand-off`.
 
 Settings are remembered per indicator, in `~/Library/Preferences`, under
 `local.ghbar.` followed by the indicator's number.
@@ -328,7 +353,8 @@ project. The menu bar indicator is `main.swift`. What it knows about a
 commit's checks is in `checks.swift`, the requests to GitHub are in
 `github.swift`, the relay connection and the deliveries it carries are in
 `relay.swift`, and following the branch, and deciding when to ask GitHub,
-are in `monitor.swift`. The plane is `flyby.swift`, and the hand-off to an
+are in `monitor.swift`. Settings are in `settings.swift`.
+The plane is `flyby.swift`, and the hand-off to an
 agent is `handoff.swift`. Running other programs is in `tool.swift`.
 
 ```sh
