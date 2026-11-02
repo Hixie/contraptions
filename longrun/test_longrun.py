@@ -834,6 +834,37 @@ class Summaries(unittest.TestCase):
                          "=" * 24 + " test summary " + "=" * 24)
         self.assertIsNone(self.summary_start("my test summary: fine\n"))
 
+    def test_summary_blocks_of_scripts_that_are_not_tests(self):
+        text = ("=== build ===\nbuilt\n=== bench summary: 'U0' is live ===\n"
+                "    gateway: http://127.0.0.1:9966\n\n    Pinned.\n")
+        self.assertEqual(self.summary_start(text),
+                         "=== bench summary: 'U0' is live ===")
+        for line in ("=== e2e test summary ===", "=== summary: 3 passed"):
+            self.assertEqual(self.summary_start("x\n" + line + "\ny\n"), line)
+        # A header without an outcome is a section of some tool's output,
+        # such as a coverage table, not a report.
+        for line in ("==== deploy summary ====", "=== Coverage summary ===",
+                     "=== nosummary: x ===", "=== contest summary ===",
+                     "=== a summary of what follows",
+                     "summary: fine", "=== summary"):
+            self.assertIsNone(self.summary_start(line + "\nmore\n"), line)
+
+    def test_pytest_warnings_summary_is_not_the_summary(self):
+        text = textwrap.dedent("""\
+            ..F
+            =================================== FAILURES ===================================
+            E       assert 1 == 2
+            =============================== warnings summary ===============================
+            tests/test_a.py::test_y
+              DeprecationWarning: old
+            =========================== short test summary info ============================
+            FAILED test_a.py::test_x - assert 1 == 2
+            ===================== 1 failed, 2 passed, 1 warning in 0.12s ===================
+            """)
+        self.assertEqual(self.summary_start(text),
+                         "=========================== short test summary info "
+                         "============================")
+
     def test_summary_header_from_the_environment(self):
         gate = ("gate: row 3 OK\nbuilding\n"
                 "gate: FAILED, 212 rows in 5m3s, 2 failed\nrow 7 FAILED\n")

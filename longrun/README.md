@@ -57,11 +57,18 @@ to 20 earlier lines that report a failure: lines that start with
 hold `: error: `,
 `Test Case '…' failed` and `** BUILD FAILED **`. It recognises:
 
-- a summary block that a project's test runner prints at the end of a
-  run, from its header line: a line such as `==== test summary ====` or
-  `=== unit test summary: FAILED: 2 failed ===`, or the last line that
-  matches the regular expression in `$LONGRUN_SUMMARY`, for a project
-  whose header looks different;
+- a summary block that a project's test runner or other script prints
+  at the end of a run, from its header line: `=` signs and a space,
+  then an optional name, then either `test summary` and more `=` signs,
+  or `summary:` and the outcome, as in `==== test summary ====`,
+  `=== unit test summary: FAILED: 2 failed ===` or
+  `=== bench summary: 'U0' is live ===`. A name holds only letters,
+  digits, spaces, hyphens and underscores, and case matters. Any other
+  header that ends in `summary` with no colon after it, such as pytest's
+  `==== warnings summary ====`, is a section of the output rather than
+  its summary. longrun also takes the last line
+  that matches the regular expression in `$LONGRUN_SUMMARY`, for a
+  project whose header looks different;
 - pytest: the short test summary, or else the final `=== … in 1.2s ===`
   line;
 - Python unittest: from the first `FAIL:` or `ERROR:` block;
@@ -74,6 +81,16 @@ hold `: error: `,
 At most 60 lines are shown. Where lines are left out, a line says how
 many. Only the last 4 MB of the log are searched, so a huge log costs
 no more than a small one.
+
+For the authors of scripts: a script whose result matters should end
+its output with a summary block, since longrun, a person reading a CI
+log and a person at a terminal all look there first. The block's header
+gives the outcome, such as
+`=== verify-builds summary: FAILED, 99 row(s) in 10m45s, 2 failed ===`.
+The lines after it are the ones the outcome rests on: each failure and
+its log file, and what the run did not check. Whatever the script
+prints after the header is shown as part of the block, so the form is
+for the final header only, not for the headers of a run's stages.
 
 ## Stalls
 

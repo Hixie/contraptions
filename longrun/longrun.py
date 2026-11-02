@@ -221,17 +221,17 @@ def first_match(lines: list[str], pattern: str, after: int = 0) -> int | None:
 
 
 def extract(lines: list[str]) -> list[int] | None:
-    """The lines that hold a test runner's own summary, for runners whose
+    """The lines that hold a test runner's or a script's own summary, for
     output this recognises: a block from the last line that matches
     $LONGRUN_SUMMARY or that reads `=== ... test summary ===` or
-    `=== ... test summary: ...`; pytest's short summary or final line;
+    `=== NAME summary: OUTCOME ...`; pytest's short summary or final line;
     deno test's ERRORS and FAILURES sections or final line; Python
     unittest's failures from the first one; and the errors, failed test
     cases and final result of xcodebuild and XCTest."""
     rest = lambda start: list(range(start, len(lines)))
     start = last_match(lines, "|".join(filter(None, [
         os.environ.get("LONGRUN_SUMMARY"),
-        r"^=+ [\w -]*test summary( =+$|: )"])))
+        r"^=+ [\w -]*\b(test summary =+$|summary: )"])))
     if start is None:
         start = last_match(lines, r"^=+ short test summary info =+$")
     if start is None:
