@@ -12,8 +12,8 @@ apart from recognising the summaries that some test runners print.
 ## Running it
 
 ```sh
-longrun run [--quiet MINUTES] [--owner PID] -- COMMAND ARG...
-longrun run 'COMMAND LINE'
+longrun run [--quiet MINUTES] [--owner PID] [--keep] -- COMMAND ARG...
+longrun run [--keep] 'COMMAND LINE'
 longrun wait RUN
 longrun stop RUN
 longrun list
@@ -22,8 +22,11 @@ longrun list
 With one argument, `run` gives it to `/bin/sh -c`, so it can hold pipes,
 `&&` and `cd`. With more than one, it runs them as the program and its
 arguments. The command runs in the current directory, with its standard
-input at `/dev/null`, and with the standard handling of SIGINT, SIGQUIT,
-SIGTERM and SIGHUP even when the caller ignores them.
+input at `/dev/null`, its output and errors written straight to the
+log, and the standard handling of SIGINT, SIGQUIT, SIGTERM and SIGHUP
+even when the caller ignores them. Unless the environment says
+otherwise, it runs with `PYTHONUNBUFFERED=1`, so that what Python
+prints reaches the log at once and in the order it was printed.
 
 Give longrun the command itself. Do not pipe it through `tail` or `grep`
 and do not redirect its output: longrun keeps the whole output in a log
@@ -48,7 +51,11 @@ log: /…/scratchpad/longrun/1026-102900-test-z8ubjjle/log (71601 lines)
 
 The part of the log shown is the test runner's own summary when longrun
 recognises it, and otherwise the last 5 lines of a run that succeeded or
-the last 40 of one that failed. It recognises:
+the last 40 of one that failed. For a run that failed, it also shows up
+to 20 earlier lines that report a failure: lines that start with
+`FAIL`, `FAILED` or `--- FAIL`, lines that start with `error:` or
+hold `: error: `,
+`Test Case '…' failed` and `** BUILD FAILED **`. It recognises:
 
 - a summary block that a project's test runner prints at the end of a
   run, from its header line: a line such as `==== test summary ====` or
@@ -60,8 +67,8 @@ the last 40 of one that failed. It recognises:
 - Python unittest: from the first `FAIL:` or `ERROR:` block;
 - deno test: the `ERRORS` and `FAILURES` sections, or else the final
   `ok | … passed` line;
-- xcodebuild and XCTest: each `error:` line and `Test Case '…' failed`
-  line, and the final `Test Suite '…' passed` or `failed` line, or
+- xcodebuild and XCTest: the first 40 lines that report a failure, as
+  above, and the final `Test Suite '…' passed` or `failed` line, or
   `** BUILD FAILED **` and the like, with what follows it.
 
 At most 60 lines are shown. Where lines are left out, a line says how
@@ -137,11 +144,11 @@ system call it interrupts is restarted rather than failing.
 ## How a run ends
 
 longrun starts a supervisor process, in a session of its own, that runs
-the command, copies its output to the log and tells `run` and `wait`
-when the command stalls or ends. The supervisor ends the command with
-SIGTERM, then SIGKILL 10 seconds later if anything is left, sent to the
-command's process group and to every process descended from it. It does
-this when:
+the command, watches the log for what the command writes, and tells
+`run` and `wait` when the command stalls or ends. The supervisor ends
+the command with SIGTERM, then SIGKILL 10 seconds later if anything is
+left, sent to the command's process group and to every process
+descended from it. It does this when:
 
 - the owner exits. The owner is the process that started the job that
   ran longrun: the parent of the outermost process that shares
@@ -172,11 +179,33 @@ it. `longrun list` shows each run and whether it is still running.
 
 When the command exits by itself, processes it left running in its
 process group get SIGTERM, and SIGKILL 10 seconds later. The result
-lists them. Processes that left the command's process group are not
-signalled, but if they still write to the command's output, they get
-SIGPIPE once longrun has exited. A server that a command starts and
-means to outlive it should therefore leave the process group and
-redirect its output, as daemons do.
+lists them, and says to give `--keep` if the command's job is to start
+them. Processes that left the command's process group are not
+signalled. What any process left running prints still goes to the
+log.
+
+## Commands that start servers
+
+Some commands exist to start a process that outlives them, such as a
+development server, a local service or a copy of an app that later
+commands drive. Most such scripts start it with `&`, which leaves it in
+the script's process group, so longrun ends it when the script exits.
+
+`--keep` declares that the command starts such processes. When the
+command exits by itself, longrun then leaves running what it left in
+its process group, and the result lists them under `kept`. Nothing in
+longrun watches or ends them after that. What they print goes on being
+added to the run's log for as long as they run, so a server that prints
+much should have its output redirected. A run that is ended before the
+command exits, in any of the ways listed above, still ends everything
+the command started.
+
+A script can instead start its server in a process group of its own,
+and redirect its output. In bash and `/bin/sh`, `set -m` before the `&`
+does this, by turning on job control; zsh refuses `set -m` without a
+terminal.
+longrun then leaves the server alone without `--keep`, as do terminals
+and other tools that end a command's process group.
 
 ## Claude Code hooks
 
@@ -272,6 +301,12 @@ once what to do:
 
 For a command that is known to stay silent for longer, give
 `--quiet MINUTES`.
+
+When the command's job is to start a process that outlives it, such as
+a development server, a local service or a copy of an app that later
+commands drive, give `--keep`. Without it, longrun ends whatever the
+command leaves running when it exits, and the result lists what it
+ended.
 
 In a main session, `run_in_background: true` on a `longrun run` call
 lets you work while it runs. You are notified when it ends or stalls,

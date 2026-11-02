@@ -42,13 +42,29 @@ def alive(pid):
     return pid in longrun.processes()
 
 
+def exited(pid):
+    """Blocks until pid has exited."""
+    queue = select.kqueue()
+    try:
+        queue.control([select.kevent(pid, select.KQ_FILTER_PROC,
+                                     select.KQ_EV_ADD, select.KQ_NOTE_EXIT)],
+                      1, None)
+    except ProcessLookupError:
+        pass
+    queue.close()
+
+
 class Runs(unittest.TestCase):
     def setUp(self):
         self.base = tempfile.mkdtemp(prefix="longrun-test-\U0001f989-")
         self.env = dict(os.environ, LONGRUN_DIR=self.base)
         self.env.pop("PYTHONPATH", None)
         self.env.pop("LONGRUN_AGENT", None)
+        self.env.pop("PYTHONUNBUFFERED", None)
         self.env["CLAUDE_CODE_SESSION_ID"] = "test-session"
+        # As inside another run.
+        self.env["LONGRUN_RUN"] = "/an/outer/run"
+        self.env["LONGRUN_PYSTACKS"] = "/an/outer/run/py"
         # The hooks run in this process and look here first.
         old = os.environ.pop("LONGRUN_DIR", None)
         if old is not None:
@@ -170,6 +186,20 @@ class Runs(unittest.TestCase):
              "--", sys.executable, "-c", script],
             env=self.env, capture_output=True, text=True)
         self.assertIn("1| True", result.stdout)
+
+    def test_python_output_arrives_in_order(self):
+        result = self.longrun(
+            "run", "--", sys.executable, "-c",
+            "import sys; print('out'); print('err', file=sys.stderr); "
+            "print('out')")
+        self.assertIn("1| out\n2| err\n3| out\n", result.stdout)
+
+    def test_the_command_is_told_its_own_run(self):
+        result = self.longrun("run",
+                              "echo $LONGRUN_RUN; echo $LONGRUN_PYSTACKS")
+        rundir = os.path.dirname(
+            result.stdout.split("log: ", 1)[1].split(" (", 1)[0])
+        self.assertIn(f"1| {rundir}\n2| {rundir}/py\n", result.stdout)
 
     def test_runs_in_the_callers_directory(self):
         cwd = tempfile.mkdtemp(dir=self.base)
@@ -475,23 +505,69 @@ class Runs(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("1| done", result.stdout)
 
+    def leftover(self, output, verb):
+        """The pid of the first process that a result says was ended or
+        kept."""
+        found = re.search(rf"^{verb} \d+ process(es)? that the command "
+                          rf"left running.*\n  (\d+) ", output, re.M)
+        self.assertIsNotNone(found, output)
+        return int(found[2])
+
     def test_leftover_group_members_are_ended_and_reported(self):
         result = self.longrun("run", "sleep 300 & echo started")
         self.assertEqual(result.returncode, 0)
-        self.assertIn("ended processes the command left behind", result.stdout)
-        self.assertIn("sleep 300", result.stdout)
-        leftover = int(result.stdout.split("left behind: ", 1)[1].split()[0])
-        self.assertFalse(alive(leftover))
+        self.assertIn("run it with `longrun run --keep`", result.stdout)
+        self.assertIn(" sleep 300\n", result.stdout)
+        self.assertFalse(alive(self.leftover(result.stdout, "ended")))
         clean = self.longrun("run", "sleep 0 & wait; echo started")
-        self.assertNotIn("left behind", clean.stdout)
+        self.assertNotIn("left running", clean.stdout)
 
     def test_leftover_that_ignores_sigterm_is_killed(self):
         result = self.longrun(
             "run", "trap '' TERM; (while :; do sleep 1; done) >/dev/null 2>&1 &"
                    " echo started")
         self.assertEqual(result.returncode, 0)
-        leftover = int(result.stdout.split("left behind: ", 1)[1].split()[0])
-        self.assertFalse(alive(leftover))
+        self.assertFalse(alive(self.leftover(result.stdout, "ended")))
+
+    def test_keep_leaves_what_the_command_started(self):
+        result = self.longrun("run", "--keep",
+                              "sleep 300 >/dev/null 2>&1 & echo started")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("1| started", result.stdout)
+        kept = self.leftover(result.stdout, "kept")
+        self.addCleanup(os.kill, kept, signal.SIGKILL)
+        self.assertTrue(alive(kept))
+
+    def test_kept_processes_keep_writing_to_the_log(self):
+        gate, marker = self.fifo("gate"), os.path.join(self.base, "marker")
+        result = self.longrun(
+            "run", "--keep",
+            f"(read x < {gate}; echo later; touch {marker}) &"
+            f" echo started")
+        self.assertEqual(result.returncode, 0)
+        self.addCleanup(longrun.signal_all,
+                        [self.leftover(result.stdout, "kept")], None,
+                        signal.SIGKILL)
+        log = result.stdout.split("log: ", 1)[1].split(" (", 1)[0]
+        exited(self.state(os.path.dirname(log))["supervisor"])
+        self.release(gate)
+        created(marker)
+        with open(log) as f:
+            self.assertEqual(f.read(), "started\nlater\n")
+
+    def test_keep_does_not_keep_what_a_stopped_run_started(self):
+        pid = os.path.join(self.base, "pid")
+        proc, rundir = self.start(
+            "--keep", f"sleep 300 & echo $! > {pid}.new; mv {pid}.new {pid};"
+                      f" sleep 300")
+        created(pid)
+        with open(pid) as f:
+            background = int(f.read())
+        self.owner.kill()
+        output, code = self.finish(proc)
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        self.assertNotIn("left running", output)
+        self.assertFalse(alive(background))
 
     def test_supervisor_failure_ends_the_command(self):
         gate = self.fifo("gate")
@@ -831,6 +907,37 @@ class Summaries(unittest.TestCase):
         self.assertIn("4| ** BUILD FAILED **", shown)
         self.assertIn("7| \tCompileSwift normal arm64 /src/A.swift", shown)
         self.assertNotIn("B.swift", shown)
+
+    def shown(self, text, code):
+        """What a result shows of a log holding text, for a command that
+        exited with code."""
+        rundir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, rundir)
+        with open(os.path.join(rundir, "log"), "w") as f:
+            f.write(text)
+        extent = (text.count("\n"), len(text.encode()))
+        return longrun.summary(rundir, {"display": "x", "keep": False},
+                               {"exit": code, "started": 0, "ended": 1},
+                               extent)
+
+    def test_failures_before_the_last_lines_are_shown(self):
+        text = "".join(f"PASS check {i}\n" for i in range(100))
+        text = text.replace("PASS check 7\n", "FAIL  check 7\n")
+        text += "1 FAILURE(S)\n"
+        failed = self.shown(text, 1)
+        self.assertIn(" 8| FAIL  check 7\n", failed)
+        self.assertIn("[53 lines left out]", failed)
+        self.assertIn("101| 1 FAILURE(S)", failed)
+        self.assertNotIn("PASS check 7\n", failed)
+        self.assertNotIn("FAIL", self.shown(text.replace("1 FAIL", "0 FAIL"),
+                                            0).split("100|")[0])
+
+    def test_every_failed_build_is_shown(self):
+        lines = longrun.clean("one\n** BUILD FAILED **\nx\nx\nx\n"
+                              "** BUILD SUCCEEDED **\n")
+        shown = longrun.section(lines, longrun.extract(lines))
+        self.assertIn("2| ** BUILD FAILED **", shown)
+        self.assertIn("6| ** BUILD SUCCEEDED **", shown)
 
     def test_unrecognised_output(self):
         self.assertIsNone(self.summary_start("compiling\nlinking\ndone\n"))

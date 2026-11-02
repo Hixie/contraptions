@@ -27,6 +27,10 @@ STALLED = 75  # EX_TEMPFAIL: the command is still running; wait again.
 GRACE = 10.0  # Seconds between SIGTERM and SIGKILL when ending processes.
 SAMPLED = 12  # At most this many processes are sampled for a stall report.
 WIDTH = 300  # Longer lines are cut in summaries.
+# Lines that report a failure, from xcodebuild, XCTest, Go, unittest and
+# tools that print FAIL or FAILED before each failed check.
+FAILURE = re.compile(r"^(--- )?FAIL(ED)?\b|^error(\[\w+\])?: |: error: |"
+                     r"^Test Case '.*' failed|^\*\* (BUILD|TEST) FAILED \*\*")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b\n]*(\x07|\x1b\\)")
 
 
@@ -246,10 +250,13 @@ def extract(lines: list[str]) -> list[int] | None:
     start = last_match(lines, r"^(Test Suite '.*' (passed|failed) at |"
                               r"\*\* (BUILD|TEST) (SUCCEEDED|FAILED) \*\*)")
     if start is not None:
-        failures = [i for i in range(start) if re.search(
-            r"^Test Case '.*' failed|: error: ", lines[i])]
-        return failures[:40] + rest(start)
+        return failures(lines, start, 40) + rest(start)
     return None
+
+
+def failures(lines: list[str], end: int, limit: int) -> list[int]:
+    """The first limit lines before end that report a failure."""
+    return [i for i in range(end) if FAILURE.search(lines[i])][:limit]
 
 
 def summary(rundir: str, spec: dict, state: dict,
@@ -258,16 +265,27 @@ def summary(rundir: str, spec: dict, state: dict,
     code = state.get("exit")
     chosen = extract(lines)
     if chosen is None:
-        chosen = list(range(max(0, len(lines) - (5 if code == 0 else 40)),
-                            len(lines)))
+        start = max(0, len(lines) - (5 if code == 0 else 40))
+        chosen = (failures(lines, start, 20) if code else []) + list(
+            range(start, len(lines)))
     parts = [f"longrun: {describe(state)} after "
              f"{duration(state['ended'] - state['started'])}: "
              f"{spec['display']}",
              f"log: {os.path.join(rundir, 'log')} "
              f"({count(total, 'line')})"]
-    if state.get("leftovers"):
-        parts.append("ended processes the command left behind: "
-                     + "; ".join(state["leftovers"]))
+    left = state.get("leftovers", [])
+    if left:
+        number = count(len(left), "process", "processes")
+        if spec["keep"]:
+            parts.append(f"kept {number} that the command left running, "
+                         f"as --keep asked:")
+        else:
+            parts.append(f"ended {number} that the command left running. "
+                         f"If the command's job is to start them, run it "
+                         f"with `longrun run --keep`:")
+        parts.extend(f"  {process}" for process in left[:10])
+        if len(left) > 10:
+            parts.append(f"  [{len(left) - 10} more]")
     if lines:
         parts.append(section(lines, chosen, first))
     return "\n".join(parts) + "\n"
@@ -401,7 +419,7 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
 # The supervisor ------------------------------------------------------------------
 
 class Supervisor:
-    """Runs the command, copies its output to the log, and tells the
+    """Runs the command, watches the log it writes, and tells the
     connected clients when it stalls and when it ends. It outlives the
     client that started it, so that a run can continue after a stall
     report, and it ends the command when the owner exits, when a waiting
@@ -431,34 +449,34 @@ class Supervisor:
         self.lock = open(os.path.join(self.rundir, "lock"), "wb")
         fcntl.flock(self.lock, fcntl.LOCK_EX)
         os.makedirs(os.path.join(self.rundir, "py"), exist_ok=True)
-        env = dict(os.environ, LONGRUN_RUN=self.rundir,
-                   LONGRUN_PYSTACKS=os.path.join(self.rundir, "py"))
+        env = {"PYTHONUNBUFFERED": "1", **os.environ,
+               "LONGRUN_RUN": self.rundir,
+               "LONGRUN_PYSTACKS": os.path.join(self.rundir, "py")}
         env["PYTHONPATH"] = os.pathsep.join(
             filter(None, [os.path.join(HERE, "pystacks"),
                           env.get("PYTHONPATH")]))
         for sig in SIGNALS:
             signal.signal(sig, signal.SIG_IGN)
             self.watch(sig, select.KQ_FILTER_SIGNAL)
-        self.log = open(os.path.join(self.rundir, "log"), "wb")
-        self.reader, writer = os.pipe()
+        output = open(os.path.join(self.rundir, "log"), "ab", buffering=0)
+        self.log = open(os.path.join(self.rundir, "log"), "rb")
         try:
             self.child = subprocess.Popen(
                 self.spec["argv"], cwd=self.spec["cwd"], env=env,
-                stdin=subprocess.DEVNULL, stdout=writer, stderr=writer,
+                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                 start_new_session=True, preexec_fn=default_signals)
         except OSError as error:
-            message = f"longrun: cannot run the command: {error}\n".encode()
-            self.log.write(message)
-            self.log.close()
-            self.extent = (1, len(message))
+            output.write(f"longrun: cannot run the command: {error}\n"
+                         .encode())
             self.finish(127)
             return
         finally:
-            os.close(writer)
+            output.close()
         self.state.update(child=self.child.pid, owner=self.spec["owner"])
         self.save()
-        os.set_blocking(self.reader, False)
-        self.watch(self.reader, select.KQ_FILTER_READ)
+        self.watch(self.log.fileno(), select.KQ_FILTER_VNODE,
+                   select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                   select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)
         self.watch(self.listener.fileno(), select.KQ_FILTER_READ)
         self.watch(self.reports[0], select.KQ_FILTER_READ)
         try:
@@ -485,9 +503,8 @@ class Supervisor:
                 self.kill()
             elif self.stall_at() is not None and now >= self.stall_at():
                 self.stall(now - self.last)
-        self.drain()
-        self.log.close()
         self.finish(self.child.returncode)
+        self.log.close()
 
     def stall_at(self) -> float | None:
         if (self.stalled or "reason" in self.state
@@ -496,11 +513,10 @@ class Supervisor:
         return self.last + self.spec["quiet"]
 
     def handle(self, event: select.kevent) -> None:
-        if event.filter == select.KQ_FILTER_READ:
-            if event.ident == self.reader:
-                if self.drain():
-                    self.last, self.stalled = time.monotonic(), False
-            elif event.ident == self.listener.fileno():
+        if event.filter == select.KQ_FILTER_VNODE:
+            self.last, self.stalled = time.monotonic(), False
+        elif event.filter == select.KQ_FILTER_READ:
+            if event.ident == self.listener.fileno():
                 self.accept()
             elif event.ident == self.reports[0]:
                 self.reported()
@@ -516,36 +532,32 @@ class Supervisor:
             self.ending.discard(event.ident)
 
     def child_exited(self) -> None:
-        """Reaps the command and ends what it left in its process group."""
+        """Reaps the command and ends what it left in its process group,
+        unless the command finished by itself and the run keeps what it
+        leaves."""
         self.child.wait()
         self.ending.discard(self.child.pid)
-        self.drain()
         table = processes()
         left = [pid for pid, v in table.items() if v.pgid == self.child.pid]
-        if left and "reason" not in self.state:
-            self.state["leftovers"] = [f"{pid} {table[pid].command[:80]}"
+        if "reason" in self.state:
+            self.terminate(left)
+        elif left:
+            self.state["leftovers"] = [f"{pid} {table[pid].command[:WIDTH]}"
                                        for pid in left]
-        self.terminate(left)
+            if not self.spec["keep"]:
+                self.terminate(left)
 
-    def drain(self) -> bool:
-        """Copies what the command printed to the log. Returns whether
-        there was anything, and stops watching the pipe at its end."""
-        got = False
-        while self.reader is not None:
-            try:
-                data = os.read(self.reader, 1 << 16)
-            except BlockingIOError:
-                break
-            if not data:
-                os.close(self.reader)
-                self.reader = None
-                break
-            self.log.write(data)
-            self.extent = (self.extent[0] + data.count(b"\n"),
-                           self.extent[1] + len(data))
-            got = True
-        self.log.flush()
-        return got
+    def measure(self) -> tuple[int, int]:
+        """Counts what the command has added to the log since the last
+        count, up to the log's size now, and returns the line breaks and
+        bytes in the log up to there."""
+        newlines, size = self.extent
+        end = os.fstat(self.log.fileno()).st_size
+        while size < end and (data := self.log.read(min(1 << 20,
+                                                         end - size))):
+            newlines, size = newlines + data.count(b"\n"), size + len(data)
+        self.extent = (newlines, size)
+        return self.extent
 
     def save(self) -> None:
         save(self.rundir, "state.json", self.state)
@@ -603,12 +615,12 @@ class Supervisor:
         takes a while, and tells the clients when it is written."""
         self.stalled = True
         self.state["stalls"] += 1
-        number = self.state["stalls"]
+        number, extent = self.state["stalls"], self.measure()
 
         def report() -> None:
             try:
                 text = diagnose(self.rundir, number, self.child.pid, quiet,
-                                self.extent)
+                                extent)
             except Exception as error:
                 run = os.path.basename(self.rundir)
                 text = (f"longrun: STALLED, no output for {duration(quiet)}. "
@@ -678,7 +690,8 @@ class Supervisor:
             if not os.path.getsize(name):
                 os.remove(name)
         with open(os.path.join(self.rundir, "result.txt"), "w") as f:
-            f.write(summary(self.rundir, self.spec, self.state, self.extent))
+            f.write(summary(self.rundir, self.spec, self.state,
+                            self.measure()))
         self.save()
         self.tell("done")
 
@@ -729,7 +742,8 @@ def attach(rundir: str, conn: socket.socket | None, request: bytes = b"",
     return 128 - code if code < 0 else code
 
 
-def start(argv: list[str], quiet: float, owner: int | None) -> int:
+def start(argv: list[str], quiet: float, owner: int | None,
+          keep: bool) -> int:
     if argv and argv[0] == "--":
         argv = argv[1:]
     if not argv:
@@ -744,7 +758,7 @@ def start(argv: list[str], quiet: float, owner: int | None) -> int:
     save(rundir, "spec.json", {"argv": argv, "display": display,
                                "cwd": os.getcwd(),
                                "owner": owner or find_owner(),
-                               "quiet": quiet * 60,
+                               "quiet": quiet * 60, "keep": keep,
                                "agent": os.environ.get("LONGRUN_AGENT"),
                                "session": os.environ.get(
                                    "CLAUDE_CODE_SESSION_ID")})
@@ -896,6 +910,9 @@ def main() -> int:
                           "(default 10)")
     run.add_argument("--owner", type=int, metavar="PID",
                      help="end the command when this process exits")
+    run.add_argument("--keep", action="store_true",
+                     help="leave running what the command leaves running "
+                          "when it exits by itself")
     run.add_argument("command", nargs=argparse.REMAINDER)
     for name, text in [("wait", "wait for a run that stalled"),
                        ("stop", "end a run and wait for it to finish")]:
@@ -907,7 +924,7 @@ def main() -> int:
     supervise.add_argument("fd", type=int)
     args = parser.parse_args()
     if args.action == "run":
-        return start(args.command, args.quiet, args.owner)
+        return start(args.command, args.quiet, args.owner, args.keep)
     if args.action == "supervise":
         supervisor = Supervisor(args.rundir, socket.socket(fileno=args.fd))
         try:
