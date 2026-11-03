@@ -101,10 +101,10 @@ class Source:
     def text(self, *args, **kwargs):
         return text("-C", self.path, *args, **kwargs)
 
-    def tree(self, rev):
+    def resolve(self, rev, kind="tree"):
         if rev.startswith("-"):
             raise Failure(f"{rev} is not a revision")
-        return self.text("rev-parse", "--verify", rev + "^{tree}")
+        return self.text("rev-parse", "--verify", f"{rev}^{{{kind}}}")
 
     def git_path(self, name):
         return os.path.join(self.path, self.text("rev-parse", "--git-path",
@@ -428,6 +428,25 @@ def changed_hunks(previous, current):
     return changed
 
 
+def well_formed(staging):
+    """Whether a staging read from the record has the fields stage() wrote,
+    or those of a record that predates the directory and time fields."""
+    return (type(staging) is dict and type(staging.get("base")) is str
+            and type(staging.get("head")) is str
+            and type(staging.get("forward")) is dict
+            and type(staging.get("out", "")) is str
+            and type(staging.get("time", 0)) is int
+            and ("out" in staging) == ("time" in staging))
+
+
+def label(staging):
+    """Where and when a recorded staging was made."""
+    if "out" not in staging:
+        return "a staging whose directory was not recorded"
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(staging["time"]))
+    return f"{staging['out']} (staged {when})"
+
+
 def readme(changes):
     body = """\
 # Review materials
@@ -473,28 +492,43 @@ def stage(args):
         if not source.ignores(rel):
             raise Failure(f"--copy-ignored {rel}: git does not ignore it")
     record = source.git_path("review-stage.json")
+    try:
+        with open(record) as f:
+            data = json.load(f)
+        stagings = data.get("stagings", [data])
+        if type(stagings) is not list or not all(map(well_formed, stagings)):
+            raise ValueError("a staging is malformed")
+    except FileNotFoundError:
+        stagings = []
+    except (ValueError, AttributeError) as e:
+        raise Failure(f"cannot read {record}: {e!r}")
     previous = None
-    if args.since_last:
-        if not os.path.exists(record):
-            raise Failure("--since-last: nothing has been staged from this"
-                          " worktree yet")
-        try:
-            with open(record) as f:
-                previous = json.load(f)
-            trees = (previous["base"], previous["head"])
-        except (ValueError, KeyError, TypeError) as e:
-            raise Failure(f"--since-last: cannot read {record}: {e}")
-        for tree in trees:
+    if args.since_last or args.since is not None:
+        if not stagings:
+            raise Failure("nothing has been staged from this worktree yet")
+        wanted = args.since is not None and os.path.realpath(args.since)
+        matches = [s for s in stagings if not wanted or s.get("out") == wanted]
+        if not matches:
+            raise Failure(f"--since: nothing from this worktree was staged"
+                          f" into {wanted}. It has staged into:"
+                          + "".join(f"\n  {label(s)}" for s in stagings))
+        previous = matches[-1]
+        for tree in (previous["base"], previous["head"]):
             source.git("cat-file", "-e", tree + "^{tree}")
     if args.base:
-        base = source.tree(args.base)
+        upstream = source.resolve(args.base, "commit")
     else:
         try:
-            base = source.tree(source.text("merge-base", "HEAD",
-                                           "@{upstream}"))
+            upstream = source.resolve("@{upstream}", "commit")
         except Failure as e:
             raise Failure(f"{e}\nName the version before the change with"
                           " --base.")
+    after = source.resolve(args.head or "HEAD", "commit")
+    try:
+        base = source.resolve(source.text("merge-base", upstream, after))
+    except Failure:
+        raise Failure(f"{args.base or '@{upstream}'} and"
+                      f" {args.head or 'HEAD'} share no history")
     try:
         os.mkdir(out)
     except OSError as e:
@@ -502,7 +536,7 @@ def stage(args):
     try:
         scratch = os.path.join(out, ".staging")
         os.mkdir(scratch)
-        head = source.tree(args.head) if args.head else \
+        head = source.resolve(args.head) if args.head else \
             source.worktree_tree(scratch)
         if base == head:
             raise Failure("the base and the head are the same, so there is"
@@ -519,6 +553,12 @@ def stage(args):
         _random.shuffle(made)
         assignment = {n: kept[n] if n in kept else made.pop()
                       for n in args.names}
+        patches = {True: source.diff(base, head),
+                   False: source.diff(head, base)}
+        if previous:
+            old = (previous["base"], previous["head"])
+            listed = {f: changed_hunks(source.diff(*(old if f else old[::-1])),
+                                       patches[f]) for f in (True, False)}
         for name, forward in assignment.items():
             before, after = (base, head) if forward else (head, base)
             place = os.path.join(out, name)
@@ -528,14 +568,11 @@ def stage(args):
             build_tree(trees[after], dirs[before],
                        os.path.join(place, "after"), only[after])
             with open(os.path.join(place, "patch.diff"), "wb") as f:
-                f.write(source.diff(before, after))
+                f.write(patches[forward])
             if previous:
-                old = (previous["base"], previous["head"])
-                old = old if forward else old[::-1]
-                listed = changed_hunks(source.diff(*old),
-                                       source.diff(before, after))
                 with open(os.path.join(place, CHANGES), "w") as f:
-                    f.write("".join(c + "\n" for c in listed) if listed
+                    f.write("".join(c + "\n" for c in listed[forward])
+                            if listed[forward]
                             else "Nothing in the patch has changed.\n")
             with open(os.path.join(place, "README.md"), "w") as f:
                 f.write(readme(previous is not None))
@@ -543,8 +580,11 @@ def stage(args):
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)
         raise
-    with open(record, "w") as f:
-        json.dump({"base": base, "head": head, "forward": assignment}, f)
+    stagings.append({"out": out, "time": int(time.time()), "base": base,
+                     "head": head, "forward": assignment})
+    with open(f"{record}.{os.getpid()}", "w") as f:
+        json.dump({"stagings": stagings}, f)
+    os.replace(f.name, record)
     backup = source.git_path("review-stage.patch")
     with open(backup, "wb") as f:
         f.write(source.diff(base, head, "--binary", "--full-index",
@@ -554,6 +594,11 @@ def stage(args):
     for name, forward in assignment.items():
         print(f"  {os.path.join(out, name)}: "
               + ("the change as made" if forward else "the change reversed"))
+    if previous:
+        print(f"Compared with {label(previous)}: " + source.text(
+            "diff", "--shortstat", previous["base"], previous["head"]))
+        print(f"  New or different since then: {len(listed[True])} of the"
+              f" patch's {len(hunks(patches[True]))} hunks")
     print(f"Patch of the change as made: {backup}")
     return assignment
 
@@ -566,8 +611,9 @@ def parse(argv):
     parser.add_argument("names", nargs="+", help="one name per reviewer")
     parser.add_argument("-C", default=".", metavar="WORKTREE",
                         help="the worktree holding the change")
-    parser.add_argument("--base", help="the version before the change"
-                        " (default: the merge base of HEAD and its upstream)")
+    parser.add_argument("--base", help="the change starts at the merge base"
+                        " of this commit and the head (default: the upstream"
+                        " of HEAD)")
     parser.add_argument("--head", help="the version after the change"
                         " (default: the working tree, untracked files"
                         " included)")
@@ -575,9 +621,14 @@ def parse(argv):
                         metavar="PATH", help="an ignored file or directory,"
                         " relative to the top of the worktree, to copy into"
                         " both trees as it is (repeatable)")
-    parser.add_argument("--since-last", action="store_true",
-                        help="list the parts of the patch that changed since"
-                        " the last staging from this worktree")
+    since = parser.add_mutually_exclusive_group()
+    since.add_argument("--since-last", action="store_true",
+                       help="list the parts of the patch that changed since"
+                       " the last staging from this worktree")
+    since.add_argument("--since", metavar="PREVIOUS",
+                       help="list the parts of the patch that changed since"
+                       " the last staging from this worktree into the"
+                       " directory PREVIOUS")
     return parser.parse_args(argv)
 
 

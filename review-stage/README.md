@@ -32,10 +32,17 @@ that are not ignored, but not untracked nested repositories. Edits to
 files marked `assume-unchanged` count; files marked `skip-worktree`
 count as the index has them. Two options choose other versions:
 
-- `--base REV` names the version before the change, for example
-  `HEAD~1` to review only the last commit.
-- `--head REV` names the version after the change, for example `HEAD`
-  to leave uncommitted edits out.
+- `--base REV` names a commit to use in place of the upstream branch,
+  for example `HEAD~1` to review only the last commit. The change runs
+  from the merge base of `REV` and the version after the change, so
+  `--base upstream/main` gives the same change however far
+  `upstream/main` has moved since the branch last took it in. This
+  matters because remote branches are shared by every worktree of a
+  repository, so a `git fetch` in another worktree can move them at
+  any time.
+- `--head REV` names the commit after the change, for example `HEAD`
+  to leave uncommitted edits out. The merge base is then taken with
+  `REV` rather than with `HEAD`.
 
 `-C WORKTREE` runs the command on another worktree.
 
@@ -133,16 +140,37 @@ After fixing what a review found, stage the change again with
 
 Each reviewer directory then also has
 `changed-since-previous-round.txt`. It lists, by file and line numbers
-in both `before/` and `after/`, the hunks of the patch that the previous
-staging from this worktree did not have. A hunk that only moved
+in both `before/` and `after/`, the hunks of the patch that the
+previous staging from this worktree did not have. A hunk that only moved
 because lines above it changed is not listed. The list says which parts
 of the patch changed, but not on which side, so a reviewer that did not
 see the previous round cannot tell the direction from it. A reviewer
 that remembers the previous round's patch can, because the fixes land
 on the side holding the version as made. Use new reviewers, with new
 names, for each round. A reviewer that is named again keeps the
-orientation it had, so that a reviewer continued from the previous
-round still sees the patch the same way round.
+orientation it had in the staging compared with, so that a reviewer
+continued from that round still sees the patch the same way round.
+
+The command prints which staging it compared with: the directory it was
+staged into, when, and how many files it covered. It then prints how
+many of the patch's hunks the list holds.
+
+A mistaken staging, for example one with the wrong `--base`, is
+recorded like any other. Its reviewers never saw it, so the next round
+should be compared with the round before it. To do that, use `--since`
+in place of `--since-last`, naming the directory that round was staged
+into:
+
+```sh
+~/dev/contraptions/review-stage/review_stage.py --since OUT OUT3 🐧 🐔
+```
+
+The directory need not still exist. The comparison, and the
+orientation of any reviewer named again, are then with the last staging
+into it from this worktree. If there is none, the command fails and
+lists every staging from this worktree. The list in
+`changed-since-previous-round.txt` then compares with that staging in
+place of the last one.
 
 ## Files kept in the repository
 
@@ -150,8 +178,9 @@ Each run writes two files into the worktree's git directory. Their
 paths are given by `git rev-parse --git-path review-stage.json` and
 `git rev-parse --git-path review-stage.patch`.
 
-- `review-stage.json` records the two versions and each reviewer's
-  orientation, for `--since-last`.
+- `review-stage.json` records every staging from the worktree: the
+  directory it was staged into, when, the two versions, and each
+  reviewer's orientation, for `--since-last` and `--since`.
 - `review-stage.patch` is the change as made, in a form `git apply`
   accepts, binary files included. With the default `--head`, it is a
   copy of the working tree's changes, from which the worktree can be
@@ -160,8 +189,8 @@ paths are given by `git rev-parse --git-path review-stage.json` and
 When the working tree is staged, the command stores its files' contents
 in the repository's object database without referring to them from any
 commit or branch. Git's garbage collection deletes such contents once
-they are two weeks old (by default), so `--since-last` only works on a
-working tree staged within that time.
+they are two weeks old (by default), so `--since-last` and `--since`
+only work on a working tree staged within that time.
 
 ## Requirements and tests
 

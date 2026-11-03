@@ -4,6 +4,7 @@ import contextlib
 import ctypes
 import glob
 import io
+import json
 import os
 import re
 import struct
@@ -104,8 +105,8 @@ class Staging(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def stage(self, out, *args, names=("🦜", "🦆")):
-        with contextlib.redirect_stdout(io.StringIO()):
+    def stage(self, out, *args, names=("🦜", "🦆"), printed=None):
+        with contextlib.redirect_stdout(printed or io.StringIO()):
             return review_stage.stage(review_stage.parse(
                 ["-C", self.repo, *args, os.path.join(self.tmp.name, out),
                  *names]))
@@ -253,6 +254,76 @@ class Staging(unittest.TestCase):
         self.assertNotIn(review_stage.CHANGES, os.listdir(
             os.path.join(self.tmp.name, "one", name)))
 
+    def test_any_staging_can_be_the_one_compared_with(self):
+        record = os.path.join(self.repo, git(
+            self.repo, "rev-parse", "--git-path", "review-stage.json").strip())
+        write(self.repo, "a.txt", LINES.replace("line 3\n", "line three\n"))
+        git(self.repo, "commit", "-q", "-am", "change")
+        self.stage("one", "--base", "HEAD~1")
+        first = read(self.repo, record)
+        write(self.repo, "a.txt", read(self.repo, "a.txt").replace(
+            "line 30\n", "line thirty\n"))
+        # A mistaken staging, which leaves out the commit, is compared with
+        # the last one, and says so.
+        printed = io.StringIO()
+        self.stage("wrong", "--base", "HEAD", "--since-last",
+                   names=("🐓", "🦢"), printed=printed)
+        self.assertIn("Compared with " + os.path.join(
+            os.path.realpath(self.tmp.name), "one") + " (staged ",
+            printed.getvalue())
+        self.assertIn("1 file changed, 1 insertion(+), 1 deletion(-)\n"
+                      "  New or different since then: 1 of the patch's 1"
+                      " hunks\n", printed.getvalue())
+
+        def listed(out, *since):
+            assignment = self.stage(out, "--base", "HEAD~1", *since,
+                                    names=("🦉", "🦤"))
+            forward = next(n for n, f in assignment.items() if f)
+            return read(os.path.join(self.tmp.name, out, forward),
+                        review_stage.CHANGES)
+        self.assertEqual(listed("again", "--since-last"),
+                         "a.txt: before lines 1-6, after lines 1-6\n")
+        self.assertEqual(listed("right", "--since", os.path.join(
+            self.tmp.name, "x", "..", "one")),
+                         "a.txt: before lines 27-33, after lines 27-33\n")
+
+        with self.assertRaisesRegex(review_stage.Failure,
+                                    r"staged into:\n  \S+/one \(staged "
+                                    r".*\n  \S+/wrong .*\n.*again.*\n.*right"):
+            self.stage("missing", "--since", "elsewhere")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name,
+                                                     "missing")))
+        # A record with only one staging, whose directory it lacks.
+        staging = json.loads(first)["stagings"][0]
+        del staging["out"], staging["time"]
+        write(self.repo, record, json.dumps(staging))
+        self.assertEqual(listed("old", "--since-last"),
+                         "a.txt: before lines 27-33, after lines 27-33\n")
+        with self.assertRaisesRegex(
+                review_stage.Failure,
+                "staged into:\n  a staging whose directory was not recorded"
+                "\n  .*/old "):
+            self.stage("missing", "--since", "one")
+
+    def test_the_base_is_where_the_head_branched_from_it(self):
+        git(self.repo, "checkout", "-q", "-b", "topic")
+        write(self.repo, "a.txt", LINES.replace("line 3\n", "line three\n"))
+        git(self.repo, "commit", "-q", "-am", "change")
+        git(self.repo, "checkout", "-q", "main")
+        write(self.repo, "c.txt", "moved on\n")
+        git(self.repo, "commit", "-q", "-am", "unrelated")
+        git(self.repo, "checkout", "-q", "topic")
+        git(self.repo, "branch", "-q", "--set-upstream-to", "main")
+        write(self.repo, "dir/b.txt", "uncommitted\n")
+        for out, args in (("default", []), ("named", ["--base", "main"]),
+                          ("head", ["--base", "main", "--head", "HEAD"])):
+            for name, forward in self.stage(out, *args).items():
+                patch = read(os.path.join(self.tmp.name, out, name),
+                             "patch.diff")
+                self.assertIn("line three", patch)
+                self.assertNotIn("c.txt", patch)
+                self.assertEqual("dir/b.txt" in patch, out != "head")
+
     def test_a_change_of_attributes_rewrites_every_file(self):
         def stage(out, adds):
             for name, forward in self.stage(out, "--base", "HEAD").items():
@@ -355,11 +426,28 @@ class Staging(unittest.TestCase):
             ("out", ["--copy-ignored", "nothing"], "no such"),
             ("out", ["--copy-ignored", "../x"], "not inside"),
             ("out", ["--base=-x"], "not a revision"),
+            ("out", ["--base", "HEAD", "--head=-x"], "not a revision"),
+            ("out", ["--base", "HEAD", "--since", ""],
+             "nothing has been staged"),
+            ("out", ["--base", git(self.repo, "commit-tree", "-m", "x",
+                                   "HEAD^{tree}").strip()],
+             "and HEAD share no history"),
         ]
         for out, args, message in cases:
             with self.assertRaisesRegex(review_stage.Failure, message):
                 self.stage(out, *args)
             self.assertFalse(os.path.exists(os.path.join(self.tmp.name, out)))
+        record = os.path.join(self.repo, git(
+            self.repo, "rev-parse", "--git-path", "review-stage.json").strip())
+        good = '{"base": "x", "head": "y", "forward": {}'
+        for content in ("[]", "{", '{"stagings": [1]}', '{"stagings": {}}',
+                        '{"base": "x"}', '{"base": 1, "head": "y",'
+                        ' "forward": {}}', good + ', "forward": "x"}',
+                        good + ', "out": "z"}', good + ', "time": 1.5}'):
+            write(self.repo, record, content)
+            with self.assertRaisesRegex(review_stage.Failure, "cannot read"):
+                self.stage("out", "--base", "HEAD")
+        os.remove(record)
         with self.assertRaisesRegex(review_stage.Failure, "distinct"):
             self.stage("out", "--base", "HEAD", names=("🦜", "🦜"))
         self.change_worktree()
