@@ -221,6 +221,24 @@ class Staging(unittest.TestCase):
         self.assertEqual(len(seen["readme"]), 1)
         self.assertEqual(seen[True], seen[False][::-1])
 
+    def test_edits_made_as_the_index_was_written_count(self):
+        # The index records a modification time long past for the file.
+        # The edit keeps the file's size and that time, and the index is
+        # given that time too, so only git's check for files changed as
+        # the index was written finds the edit.
+        git(self.repo, "config", "core.trustctime", "false")
+        past = 10**18
+        os.utime(os.path.join(self.repo, "dir/b.txt"), ns=(past, past))
+        git(self.repo, "update-index", "--refresh")
+        write(self.repo, "dir/b.txt", "B\n")
+        for rel in ("dir/b.txt", ".git/index"):
+            os.utime(os.path.join(self.repo, rel), ns=(past, past))
+        assignment = self.stage("out", "--base", "HEAD")
+        for name, forward in assignment.items():
+            self.assertIn("-b\n+B\n" if forward else "-B\n+b\n",
+                          read(os.path.join(self.tmp.name, "out", name),
+                               "patch.diff"))
+
     def test_later_rounds_list_only_the_hunks_that_changed(self):
         write(self.repo, "a.txt", LINES.replace("line 3\n", "line three\n")
               .replace("line 30\n", "line thirty\n"))

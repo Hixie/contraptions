@@ -115,8 +115,10 @@ class Source:
         current contents plus untracked files that are not ignored, leaving
         out nested repositories. The real index is not touched."""
         index = os.path.join(scratch, "worktree-index")
+        # The copy keeps the index's modification time, which git compares
+        # with each file's to find files changed as the index was written.
         if os.path.exists(self.git_path("index")):
-            shutil.copyfile(self.git_path("index"), index)
+            shutil.copy2(self.git_path("index"), index)
         env = {"GIT_INDEX_FILE": index}
         assumed = [line[2:] for line in split(self.git(
             "ls-files", "-z", "-v", env=env)) if line[:1].islower()]
