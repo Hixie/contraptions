@@ -262,8 +262,9 @@ After moving the list, `move` lists the sessions the previous account had
 filed in groups that the signed-in account has not filed the same way,
 leaving out sessions that no longer exist.  It also leaves out archived
 sessions, because the app's sidebar does not show archived sessions in
-groups or let anyone file them there; `groups` still lists them.  If it cannot read the record,
-it says so and still succeeds, because the list has already moved.
+groups or let anyone file them there; `groups` still lists them.  If it
+cannot read the record, it says so and still succeeds, because the list
+has already moved.
 
 A script cannot file sessions in groups.  The tools that create groups
 and file sessions in them belong to the running app, which gives them
@@ -339,6 +340,18 @@ each section's sorting and grouping where they differ.  Each account
 gives its custom sections identifiers of its own, so the instructions
 name a custom section by its label, and Claude looks up its identifier
 with `list_sections`.
+
+The instructions leave out a custom section in which the sidebar shows
+nothing at the time they are printed: one with nothing filed in it, or
+one whose Code sessions are all archived or no longer exist here.  Such
+a section is taken to be one the other account has finished with, so it
+is not carried over.  The record does not say whether an item that is
+not a Code session is archived, so such an item counts as shown, and a
+section holding one is listed.  The check for duplicate names covers
+only what the instructions list.  So two groups with the same name are
+refused only if both show something.  Sections are matched with groups
+by name, so two sections with the same name are refused if a group of
+that name shows something.
 
 The instructions also give the calls that file each session the other
 account had filed, with the same exceptions as `move`.  Filing a pinned
@@ -563,7 +576,8 @@ Verified on a real switch between two accounts:
   sections' names, and each section's settings were in the same form,
   and with no grouping recorded, sections were reported as described
   under "Steps for Claude".  `test-steps.py` checks the instructions on
-  made-up records, and `test-move.sh` checks that `move` records the
+  made-up records, including that they leave out sections the sidebar
+  shows nothing in, and `test-move.sh` checks that `move` records the
   account `for-claude` copies from, and that a second `move` keeps it.
 - `move` and then `recover --apply` on the machine where the failure
   happened.  `move` removed the two links, and `recover` wrote the 81

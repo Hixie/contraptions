@@ -78,16 +78,21 @@ def sessions(support):
     return result
 
 
+def shown(member, known):
+    """Whether the sidebar shows member in its group here.  It does not show
+    a Code session that no longer exists here, nor an archived one, which it
+    also does not let anyone file in a group."""
+    return not member.startswith("code:") or (member in known and not known[member].get("isArchived"))
+
+
 def missing(scopes, known, source, target):
     """The filings of account/org source that target lacks, as (group name,
-    [member, ...]) in sidebar order.  Sessions that no longer exist here are
-    left out, and so are archived sessions, which the app's sidebar does not
-    show in groups or let anyone file there."""
+    [member, ...]) in sidebar order, leaving out members the sidebar does not
+    show."""
     have = {(name, m) for name, members in scopes.get(target, []) for m in members}
     result = []
     for name, members in scopes.get(source, []):
-        members = [m for m in members if (name, m) not in have
-                   and (not m.startswith("code:") or (m in known and not known[m].get("isArchived")))]
+        members = [m for m in members if (name, m) not in have and shown(m, known)]
         if members:
             result.append((name, members))
     return result

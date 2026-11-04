@@ -9,7 +9,8 @@
 # with what the app's sidebar tools report and to set with those tools.
 # Settings those tools cannot make are listed for Claude to ask the user to
 # make.  Like "move", the steps add what the second account lacks and leave
-# alone what only it has.
+# alone what only it has.  They leave out a custom section in which the
+# sidebar shows nothing, such as one holding only archived sessions.
 #
 #   sidebar-steps.py <support-dir> <from account/org> <to account/org> [<name of from>]
 
@@ -60,9 +61,13 @@ def main():
     known = groups.sessions(support)
     if source not in sections and source not in scopes:
         sys.exit("nothing is recorded about the sidebar of %s" % source)
-    want = sections.get(source, [])
+    # A custom section is listed only if the sidebar shows something in it.
+    occupied = [name for name, members in scopes.get(source, [])
+                if any(groups.shown(m, known) for m in members)]
+    want = [s for s in sections.get(source, [])
+            if s["kind"] in layout.BUILT_IN or s["name"] in occupied]
     refs = [ref(s) for s in want]
-    named = [json.dumps(name) for name, _ in scopes.get(source, [])]
+    named = [json.dumps(name) for name in occupied]
     for names in (refs, named):
         twice = sorted({r for r in names if names.count(r) > 1})
         if twice:

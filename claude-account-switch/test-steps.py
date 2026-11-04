@@ -73,17 +73,18 @@ def main():
                              section("manual", 2, "Blocked", groupBy="date", collapsed=True,
                                      show={"metadata": True}),
                              section("manual", 3, "Later"),
-                             section("future", 4, "From a later version"),
-                             section("sessions", 5, sortBy="created")]},
+                             section("manual", 4, "Done", show={"metadata": True}),
+                             section("future", 5, "From a later version"),
+                             section("sessions", 6, sortBy="created")]},
             B: {"sections": [section("pinned", 0), section("routines", 1, shown=False),
                              section("sessions", 2), section("manual", 3, "Later", groupBy="date"),
                              section("manual", 4, "Mine")]},
         }
         filings = {
             A: {"groups": [{"id": "g1", "name": "Blocked"}, {"id": "g2", "name": "Later"},
-                           {"id": "g3", "name": "Unlisted"}],
-                "assignments": {"code:local_s1": "g1", "code:local_s2": "g1", "chat:c9": "g1",
-                                "code:local_s3": "g3"}},
+                           {"id": "g3", "name": "Unlisted"}, {"id": "g4", "name": "Done"}],
+                "assignments": {"code:local_s1": "g1", "code:local_s2": "g4", "code:local_gone": "g4",
+                                "chat:c9": "g1", "code:local_s3": "g3"}},
             B: {"groups": [{"id": "h1", "name": "Mine"}], "assignments": {"code:local_s3": "h1"}},
         }
         write_config(support, layouts, filings)
@@ -98,11 +99,11 @@ def main():
             ("pinned", dict(default, group_by="none")),
             ("routines", dict(default, group_by="none", shown=False)),
             ('"Blocked"', dict(default, group_by="date", collapsed=True)),
-            ('"Later"', dict(default, group_by="none")),
             ("sessions", dict(default, sort_by="created")),
             ('"Unlisted"', {}),
         ], "lists the sections in order with their settings, taking no recorded grouping as "
-           "none except for Sessions, and ignoring sections of kinds it does not know")
+           "none except for Sessions, ignoring sections of kinds it does not know, and leaving "
+           "out a custom section with nothing in it or only sessions the sidebar does not show")
         check(step(out, 1), ["Call list_sections."], "starts by listing the sections")
         check(step(out, 2)[0].startswith("For each section above written in quotes"), True,
               "then creates the sections that are missing")
@@ -123,6 +124,7 @@ def main():
         check(step(out, 6), ["Tell the user what changed, and what is left for them to do."],
               "ends by reporting to the user")
         check('"Mine"' in dict(rows(out)), False, "lists no section that only the signed-in account has")
+        check('"Done"' in out, False, "says nothing about a section it leaves out")
 
         print("== an account named only by its directory")
         code, out, _ = run(support, B, A)
@@ -134,17 +136,41 @@ def main():
         code, out, err = run(support, A + "x", B)
         check((code, "nothing is recorded about the sidebar of" in err), (1, True),
               "an account with nothing recorded fails")
-        layouts[A]["sections"].append(section("manual", 6, "Later"))
+        layouts[A]["sections"].append(section("manual", 7, "Blocked"))
         write_config(support, layouts, filings)
         code, out, err = run(support, A, B)
-        check((code, 'more than one section named "Later"' in err), (1, True),
+        check((code, 'more than one section named "Blocked"' in err), (1, True),
               "two sections with the same name fail")
         layouts[A]["sections"].pop()
-        layouts[A]["sections"].append(section("manual", 6, "Sessions"))
+        layouts[A]["sections"] += [section("manual", 7, "Later"), section("manual", 8, "Done")]
+        filings[A]["groups"].append({"id": "g6", "name": "Done"})
+        filings[A]["assignments"]["code:local_gone2"] = "g6"
+        write_config(support, layouts, filings)
+        code, out, err = run(support, A, B)
+        check((code, '"Later"' in out, '"Done"' in out), (0, False, False),
+              "two sections or groups with the same name succeed when it leaves both out")
+        layouts[A]["sections"][-2:] = []
+        filings[A]["groups"].pop()
+        filings[A]["groups"].append({"id": "g6", "name": "Blocked"})
+        write_config(support, layouts, filings)
+        code, out, err = run(support, A, B)
+        check(code, 0, "a group it leaves out does not clash with one of the same name it lists")
+        filings[A]["assignments"]["chat:c7"] = "g6"
+        write_config(support, layouts, filings)
+        code, out, err = run(support, A, B)
+        check((code, 'more than one section named "Blocked"' in err), (1, True),
+              "two groups with the same name fail when both show something")
+        filings[A]["groups"].pop()
+        del filings[A]["assignments"]["code:local_gone2"]
+        del filings[A]["assignments"]["chat:c7"]
+        layouts[A]["sections"].append(section("manual", 7, "Sessions"))
+        filings[A]["groups"].append({"id": "g5", "name": "Sessions"})
+        filings[A]["assignments"]["chat:c8"] = "g5"
         write_config(support, layouts, filings)
         code, out, _ = run(support, A, B)
         check(('"Sessions"' in dict(rows(out)), "sessions" in dict(rows(out))), (True, True),
-              "a section named like a built-in one is told apart from it")
+              "a section named like a built-in one is told apart from it, and one holding "
+              "only items that are not Code sessions is listed")
         layouts[A]["sections"].pop()
 
         print("== many sessions to file")
