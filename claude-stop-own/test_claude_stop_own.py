@@ -27,6 +27,17 @@ LAUNCHER = ("import subprocess, sys; "
             "p = subprocess.Popen(sys.argv[3:], cwd=sys.argv[2]); "
             "sys.argv[1] == 'wait' and p.wait()")
 
+# Runs the script named by argv[1] with the remaining arguments, with
+# every signal failing as it does for a process that root owns.
+FAILING_KILL = """
+import errno, os, runpy, sys
+def kill(pid, sig):
+    raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+os.kill = kill
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
 
 class Process:
     """A test process, started directly, as the child of a launcher
@@ -84,15 +95,26 @@ class StopOwnTest(unittest.TestCase):
         os.makedirs(path, exist_ok=True)
         return path
 
-    def stop(self, *args, cwd=None, claude_pid=None, home=None):
+    def environment(self, claude_pid=None, home=None):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PID"}
         env.update(HOME=home or self.home,
                    CLAUDE_CODE_SESSION_ID=self.session_id)
         if claude_pid is not None:
             env["CLAUDE_PID"] = str(claude_pid)
-        return subprocess.run([sys.executable, SCRIPT, *map(str, args)],
-                              cwd=cwd or self.elsewhere, env=env,
-                              capture_output=True, text=True)
+        return env
+
+    def stop(self, *args, cwd=None, claude_pid=None, home=None,
+             kill_fails=False, merged=False):
+        """Runs the script the way Claude Code does: under a shell that
+        leads a new process group, with this test process, standing in
+        for the Claude process, as that shell's parent."""
+        script = ["-c", FAILING_KILL] if kill_fails else []
+        return subprocess.run(
+            ["sh", "-c", '"$@"; exit $?', "sh", sys.executable, *script,
+             SCRIPT, *map(str, args)],
+            cwd=cwd or self.elsewhere, env=self.environment(claude_pid, home),
+            start_new_session=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merged else subprocess.PIPE, text=True)
 
     def assertRefused(self, result, process, cwd):
         self.assertIn(f"refused {process.pid}", result.stderr)
@@ -112,16 +134,51 @@ class StopOwnTest(unittest.TestCase):
         self.assertTrue(child.finish())
         self.assertRefused(result, stranger, self.elsewhere)
 
-    def test_claude_pid_must_be_an_ancestor(self):
+    def test_claude_pid_must_be_the_process_group_leaders_parent(self):
+        # PID 1 and this process's parent are ancestors of the script,
+        # but above the parent of its process group's leader.
         process = Process(self, self.mine)
-        for claude_pid in (process.pid, "x"):
+        for claude_pid in (process.pid, "x", os.getppid(), 1):
             with self.subTest(claude_pid=claude_pid):
                 result = self.stop(process.pid, cwd=self.mine,
                                    claude_pid=claude_pid)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn(f"CLAUDE_PID {claude_pid} is not an ancestor",
-                              result.stderr)
+                self.assertIn(f"CLAUDE_PID {claude_pid} is not this "
+                              "command's Claude Code process", result.stderr)
         self.assertFalse(process.finish())
+
+    def test_claude_pid_is_never_pid_1(self):
+        # An orphan that leads its own process group has PID 1 as the
+        # leader's parent.
+        runner = ("import os, subprocess, sys; os.setsid(); "
+                  "sys.stdin.readline(); "
+                  "r = subprocess.run(sys.argv[1:], stderr=subprocess.PIPE); "
+                  "print(r.returncode, r.stderr.decode(), end='')")
+        stranger = Process(self, self.elsewhere, parent="orphan")
+        launcher = subprocess.Popen(
+            [sys.executable, "-c", LAUNCHER, "orphan", self.elsewhere,
+             sys.executable, "-c", runner, sys.executable, SCRIPT,
+             str(stranger.pid)],
+            env=self.environment(claude_pid=1), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True)
+        launcher.wait()
+        launcher.stdin.close()
+        output = launcher.stdout.read()
+        launcher.stdout.close()
+        self.assertRegex(output, "^2 (?s:.)*CLAUDE_PID 1 is not this "
+                                 "command's Claude Code process")
+        self.assertFalse(stranger.finish())
+
+    def test_report_keeps_the_order_of_the_pids(self):
+        mine = Process(self, self.mine)
+        theirs = Process(self, self.theirs)
+        result = self.stop(mine.pid, theirs.pid, cwd=self.mine, merged=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertRegex(result.stdout, f"^claude-stop-own: sent SIGTERM to "
+                                        f"{mine.pid} .*\n.*refused "
+                                        f"{theirs.pid}")
+        self.assertTrue(mine.finish())
+        self.assertFalse(theirs.finish())
 
     def test_orphan_naming_own_scratchpad_is_stopped(self):
         mine = Process(self, self.elsewhere,
@@ -241,20 +298,13 @@ class StopOwnTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn(f"{gone.pid}: no such process", result.stderr)
 
-    @unittest.skipIf(os.geteuid() == 0, "root can signal any process")
     def test_unsignallable_pid_fails(self):
-        # Every process descends from PID 1, and this user cannot signal
-        # processes that root owns.
-        listing = subprocess.run(["ps", "-Ao", "pid=,ppid=,ruser=,user="],
-                                 capture_output=True, text=True,
-                                 check=True).stdout
-        pid = next(int(p) for p, ppid, ruser, user
-                   in map(str.split, listing.splitlines())
-                   if ruser == user == "root" and ppid == "1")
-        result = self.stop(pid, claude_pid=1)
+        process = Process(self, self.mine)
+        result = self.stop(process.pid, cwd=self.mine, kill_fails=True)
         self.assertEqual(result.returncode, 1)
-        self.assertIn(f"could not signal {pid}: Operation not permitted",
-                      result.stderr)
+        self.assertIn(f"could not signal {process.pid}: Operation not "
+                      "permitted", result.stderr)
+        self.assertFalse(process.finish())
 
     def test_signal_option(self):
         process = Process(self, self.mine)

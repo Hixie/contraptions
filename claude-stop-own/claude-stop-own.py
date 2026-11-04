@@ -17,8 +17,9 @@ The command that runs this script, and every process above it, is never
 signalled. With --tree, every descendant of each PID is judged the same
 way.
 
-$CLAUDE_PID, when set, must be an ancestor of this command, or the
-command fails with status 2. Otherwise the exit status is 1 if any PID
+$CLAUDE_PID, when set, must be the parent of the nearest process-group
+leader among this command and its ancestors, and must not be PID 1, or
+the command fails with status 2. Otherwise the exit status is 1 if any PID
 was refused or could not be signalled, and 0 otherwise.
 """
 
@@ -34,14 +35,20 @@ from typing import NamedTuple, Optional
 WORKTREE_CODE = re.compile(r"[0-9A-Z]{1,2}")
 
 
+class Process(NamedTuple):
+    ppid: int
+    pgid: int
+    command: str
+
+
 def snapshot():
-    """Returns {pid: (ppid, command)} for every process."""
-    out = subprocess.run(["ps", "-Aww", "-o", "pid=,ppid=,command="],
+    """Returns {pid: Process} for every process."""
+    out = subprocess.run(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,command="],
                          capture_output=True, text=True, check=True).stdout
     table = {}
     for line in out.splitlines():
-        pid, ppid, command = (line.split(None, 2) + [""])[:3]
-        table[int(pid)] = (int(ppid), command)
+        pid, ppid, pgid, command = (line.split(None, 3) + [""])[:4]
+        table[int(pid)] = Process(int(ppid), int(pgid), command)
     return table
 
 
@@ -78,7 +85,7 @@ def ancestors(pid, table):
     """Yields the PIDs above pid, nearest first."""
     seen = {pid}
     while pid in table:
-        pid = table[pid][0]
+        pid = table[pid].ppid
         if pid in seen:
             return
         seen.add(pid)
@@ -109,7 +116,7 @@ def ownership(pid, table, cwds, caller):
             and worktree_of(cwd) == caller.worktree:
         return f"runs in {caller.worktree}"
     marker = caller.scratchpad_marker
-    if marker is not None and marker in table[pid][1]:
+    if marker is not None and marker in table[pid].command:
         return "command line names this session's scratchpad"
     if marker is not None and cwd is not None and marker in cwd:
         return "runs in this session's scratchpad"
@@ -135,13 +142,20 @@ def main(argv):
     parser.add_argument("pids", metavar="PID", type=int, nargs="+")
     args = parser.parse_args(argv)
 
+    sys.stdout.reconfigure(line_buffering=True)
     table = snapshot()
-    protected = {os.getpid(), *ancestors(os.getpid(), table)}
+    chain = [os.getpid(), *ancestors(os.getpid(), table)]
+    protected = set(chain)
+    # Claude Code starts each command's shell as the leader of a new
+    # process group, so its own process is that leader's parent.
+    owner = table[next(pid for pid in chain
+                       if pid in table and table[pid].pgid == pid)].ppid
     claude_pid = os.environ.get("CLAUDE_PID")
-    if claude_pid and not (claude_pid.isdigit()
-                           and int(claude_pid) in protected):
-        parser.error(f"CLAUDE_PID {claude_pid} is not an ancestor of "
-                     "this command")
+    if claude_pid and (owner == 1 or claude_pid != str(owner)):
+        parser.error(f"CLAUDE_PID {claude_pid} is not this command's "
+                     "Claude Code process, which is the parent of the "
+                     "nearest process-group leader among this command and "
+                     "its ancestors, and is never PID 1")
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
     caller = Caller(
         claude_pid=int(claude_pid) if claude_pid else None,
@@ -149,8 +163,8 @@ def main(argv):
         scratchpad_marker=f"/{session_id}/scratchpad" if session_id else None,
     )
     children = {}
-    for child, (ppid, _) in table.items():
-        children.setdefault(ppid, []).append(child)
+    for child, process in table.items():
+        children.setdefault(process.ppid, []).append(child)
 
     failed = False
     targets = []
@@ -174,7 +188,7 @@ def main(argv):
                 else "is not this session's"
             print(f"claude-stop-own: refused {pid}, which {whose}\n"
                   f"  cwd: {cwds.get(pid, '(unknown)')}\n"
-                  f"  command: {table[pid][1]}", file=sys.stderr)
+                  f"  command: {table[pid].command}", file=sys.stderr)
             continue
         try:
             os.kill(pid, args.signal)
