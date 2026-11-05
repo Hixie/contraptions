@@ -703,7 +703,7 @@ class Hooks(unittest.TestCase):
                 ("longrun wait r1", "longrun wait r1")]:
             reply = self.pre(command, agent_id="a1f3")
             rewritten = reply["hookSpecificOutput"]["updatedInput"]["command"]
-            self.assertEqual(rewritten, expected)
+            self.assertEqual(rewritten, "sleep 0; " + expected)
             # The shell agents use passes the assignment to the command.
             probe = re.sub(r"\S*longrun(\.py)? \w+ \w+$", "env", rewritten)
             out = subprocess.run(["/bin/zsh", "-c", probe.replace(
@@ -730,7 +730,8 @@ class Hooks(unittest.TestCase):
                          agent_id="a1")
         self.assertEqual(
             reply["hookSpecificOutput"]["updatedInput"]["command"],
-            "git commit -m 'a; longrun run b' && LONGRUN_AGENT=a1 longrun run c")
+            "sleep 0; git commit -m 'a; longrun run b' && "
+            "LONGRUN_AGENT=a1 longrun run c")
 
     def test_background_calls_keep_their_timeout(self):
         self.assertIsNone(longrun.hook({
@@ -757,7 +758,32 @@ class Hooks(unittest.TestCase):
             reply = self.pre(command, agent_id="a1")
             self.assertEqual(
                 reply["hookSpecificOutput"]["updatedInput"]["command"],
-                expected)
+                "sleep 0; " + expected)
+
+    def test_subagent_calls_start_with_sleep(self):
+        # Claude Code does not move a call whose first command is `sleep`
+        # to the background, which it otherwise does to a subagent's call
+        # after a few minutes, whatever the call's timeout.
+        for command, expected in [
+                ("longrun stop r1", "sleep 0; longrun stop r1"),
+                ("  cd x\nlongrun wait r1", "sleep 0;   cd x\nlongrun wait r1"),
+                ("sleep 1; longrun wait r1", "sleep 1; longrun wait r1"),
+                ("sleeper; longrun wait r1",
+                 "sleep 0; sleeper; longrun wait r1")]:
+            reply = self.pre(command, agent_id="a1")
+            self.assertEqual(
+                reply["hookSpecificOutput"]["updatedInput"]["command"],
+                expected, command)
+        # Whatever the form of the subagent's id.
+        reply = self.pre("longrun run x", agent_id="a1.f3")
+        self.assertEqual(
+            reply["hookSpecificOutput"]["updatedInput"]["command"],
+            "sleep 0; longrun run x")
+        # The main agent has no such limit.
+        reply = self.pre("longrun wait r1")
+        self.assertEqual(
+            reply["hookSpecificOutput"]["updatedInput"]["command"],
+            "longrun wait r1")
 
     def test_subagent_stop_without_a_scratchpad(self):
         base = tempfile.mkdtemp()

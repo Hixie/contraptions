@@ -242,7 +242,8 @@ that no stalled run is forgotten:
   it would have. In a subagent, it also puts `LONGRUN_AGENT=ID` before
   `longrun run`, with the subagent's id, which the run records. Claude
   Code ignores leading assignments when it matches a command against
-  permission rules.
+  permission rules. It also starts a subagent's call with `sleep 0;`,
+  for the reason given under "Calls from subagents" below.
 - When a subagent finishes, it ends the runs that subagent started that
   nothing is waiting for, such as one whose stall the subagent was told
   about.
@@ -274,6 +275,70 @@ name:
 ```sh
 ln -s ~/dev/contraptions/longrun/longrun.py ~/.local/bin/longrun
 ```
+
+If agents are told to run longrun by its full path instead, name that
+path in the `if` condition and in each `command`, as in
+`"if": "Bash(/Users/me/dev/contraptions/longrun/longrun.py *)"`.
+
+### Calls from subagents
+
+When a subagent runs in the background, as the subagents that the Claude
+desktop app starts do, Claude Code limits how long each of its
+foreground Bash calls may block. Once a call has run for as many
+milliseconds as the server-side feature flag `tengu_maple_ferry` says,
+Claude Code moves the call to the background, whatever the call's
+timeout. The server set the flag to 180000 when this was written, with
+Claude Code 2.1.317. The subagent then gets
+something like this in place of longrun's report:
+
+```
+Command was moved to the background (ID: bey80em1e) after running for
+180s. Output is being written to: .../tasks/bey80em1e.output.
+```
+
+No setting changes the limit. The Bash tool uses the smaller of the
+call's timeout and the flag. `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS`
+applies only to the main agent. Claude Code ignores local overrides of
+its feature flags. `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` lifts the
+limit, but it also turns off background tasks and background subagents
+everywhere.
+
+Claude Code applies the limit only to a call that it could move to the
+background, and it never moves a call whose first command is `sleep`.
+In Claude Code 2.1.317, the check compares the first word of the first
+command in the call with a list that holds only `sleep`. The hook
+therefore puts `sleep 0;` at the start of each foreground call to
+longrun that a subagent makes. `sleep 0` returns at once, so the call
+then runs as the subagent wrote it, and blocks until longrun returns.
+Claude Code refuses a call that starts with a `sleep` of 25 seconds or
+more followed by other commands, which a `sleep` of 0 seconds is not. A
+call that already starts with `sleep` is exempt already, and is left as
+it is, so that the hook neither adds a second `sleep` nor gets such a
+call past that refusal.
+
+This was found by reading the code bundled in Claude Code 2.1.317, and
+confirmed with subagents that the desktop app ran in the background. A
+foreground call of `sleep 0; sleep 220; echo finished` ran for 220
+seconds. A foreground call of `longrun run 'sleep 240'` was moved to
+the background after 180 seconds without the hook, and blocked for the
+whole run once the hook had added `sleep 0;`. The exemption is not
+documented, so a Claude Code release could remove it. If that happens,
+a subagent's longrun calls get the message above again. To check, have
+a subagent that runs in the background run
+`sleep 0; sleep 220; echo finished` in the foreground with a `timeout`
+of 600000, and see whether it prints `finished`. A subagent that does
+not run in the background has no limit, and so proves nothing.
+
+If the call no longer prints `finished`, the hook needs another way past
+the limit. One way works without the exemption, at the cost of a call to
+the model every few minutes. The hook reads the flag's value, which
+Claude Code caches as `cachedGrowthBookFeatures.tengu_maple_ferry` in
+`.claude.json`, and gives each `longrun run` and `longrun wait` in the
+call a time a little before the limit. At that time the call tells the
+supervisor that it is leaving, so that the supervisor does not end the
+run as it would for an interrupted call. The call then exits with status
+75 and a report that names the run, and the subagent runs `longrun wait`
+again.
 
 ## Instructions for agents
 

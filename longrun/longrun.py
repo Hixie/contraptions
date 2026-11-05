@@ -819,9 +819,12 @@ def hook(event: dict) -> dict | None:
     """Claude Code hooks. Before a Bash call that runs longrun, raise its
     timeout to the largest Claude Code allows, so that the call blocks
     instead of moving to the background, and tell runs which subagent
-    started them. When a subagent finishes, end the runs it started that
-    nothing is waiting for. When the main agent is about to finish, send
-    it back to any run that stalled and that nothing is waiting for."""
+    started them. In a subagent, also start the call with `sleep 0;`, which
+    Claude Code exempts from the time limit it puts on a subagent's calls
+    (see README.md). When a subagent finishes, end the runs it started
+    that nothing is waiting for. When the main agent is about to finish,
+    send it back to any run that stalled and that nothing is waiting
+    for."""
     name, agent = event["hook_event_name"], event.get("agent_id")
     if name == "PreToolUse":
         tool = dict(event["tool_input"])
@@ -843,6 +846,10 @@ def hook(event: dict) -> dict | None:
                     at = call.start("at")
                     command = (f"{command[:at]}LONGRUN_AGENT={agent} "
                                f"{command[at:]}")
+        if agent and not tool.get("run_in_background") and not re.match(
+                r"\s*sleep\s", command):
+            command = f"sleep 0; {command}"
+        if command != tool["command"]:
             tool["command"] = command
         if tool == event["tool_input"]:
             return None
