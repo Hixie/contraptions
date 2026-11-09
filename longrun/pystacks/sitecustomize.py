@@ -12,8 +12,11 @@ _dir = os.environ.get("LONGRUN_PYSTACKS")
 if _dir and os.path.isdir(_dir):
     import faulthandler
     import signal
-    _file = open(os.path.join(_dir, "%d.txt" % os.getpid()), "a")
-    faulthandler.register(signal.SIGINFO, file=_file, all_threads=True)
+    # A bare descriptor, which faulthandler writes to directly, leaves no
+    # file object for Python to finalize, and warn about, at exit.
+    _fd = os.open(os.path.join(_dir, "%d.txt" % os.getpid()),
+                  os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+    faulthandler.register(signal.SIGINFO, file=_fd, all_threads=True)
 
 _own = os.path.abspath(os.path.dirname(__file__))
 _after = sys.path[sys.path.index(_own) + 1:]

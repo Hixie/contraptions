@@ -38,6 +38,11 @@ def created(path):
     until(os.path.dirname(path), lambda: os.path.exists(path))
 
 
+def log_path(result):
+    """The path of the log that a finished `longrun run` names."""
+    return result.stdout.split("log: ", 1)[1].split(" (", 1)[0]
+
+
 def alive(pid):
     return pid in longrun.processes()
 
@@ -128,7 +133,7 @@ class Runs(unittest.TestCase):
         self.assertIn("exit 3 after", result.stdout)
         self.assertIn("1| one", result.stdout)
         self.assertIn("2| two", result.stdout)
-        log = result.stdout.split("log: ", 1)[1].split(" (", 1)[0]
+        log = log_path(result)
         with open(log) as f:
             self.assertEqual(f.read(), "one\ntwo\n")
         success = self.longrun("run", "true")
@@ -197,8 +202,7 @@ class Runs(unittest.TestCase):
     def test_the_command_is_told_its_own_run(self):
         result = self.longrun("run",
                               "echo $LONGRUN_RUN; echo $LONGRUN_PYSTACKS")
-        rundir = os.path.dirname(
-            result.stdout.split("log: ", 1)[1].split(" (", 1)[0])
+        rundir = os.path.dirname(log_path(result))
         self.assertIn(f"1| {rundir}\n2| {rundir}/py\n", result.stdout)
 
     def test_runs_in_the_callers_directory(self):
@@ -375,6 +379,22 @@ class Runs(unittest.TestCase):
                               "'SEEN'))")
         self.assertIn("1| False", result.stdout)
 
+    def test_python_stack_hook_leaves_no_file_to_warn_about(self):
+        # Interpreter shutdown finalizes what the hook made in some
+        # versions of Python, such as 3.12. The second program drops
+        # every reference that the hook made, which finalizes it in all.
+        drop = ("import faulthandler, gc, signal, sys; "
+                "faulthandler.unregister(signal.SIGINFO); "
+                "sys.modules.pop('sitecustomize').__dict__.clear(); "
+                "gc.collect()")
+        for program in ["pass", drop]:
+            result = self.longrun("run", "--", sys.executable, "-X", "dev",
+                                  "-c", program)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            log = log_path(result)
+            with open(log) as f:
+                self.assertEqual(f.read(), "", program)
+
     def test_python_stack_hook_chains_with_one_that_chains_the_same_way(self):
         # Each directory's sitecustomize records its letter. A and C run
         # the one they hide with a copy of the hook's own code, which
@@ -479,8 +499,7 @@ class Runs(unittest.TestCase):
             [sys.executable, SCRIPT, "run", "--owner", str(gone.pid),
              "sleep 300"], env=self.env, capture_output=True, text=True)
         self.assertIn("its owner had already exited", result.stdout)
-        rundir = os.path.dirname(
-            result.stdout.split("log: ", 1)[1].split(" (", 1)[0])
+        rundir = os.path.dirname(log_path(result))
         self.assertFalse(alive(self.state(rundir)["child"]))
 
     def test_interrupted_client_ends_the_run(self):
@@ -548,7 +567,7 @@ class Runs(unittest.TestCase):
         self.addCleanup(longrun.signal_all,
                         [self.leftover(result.stdout, "kept")], None,
                         signal.SIGKILL)
-        log = result.stdout.split("log: ", 1)[1].split(" (", 1)[0]
+        log = log_path(result)
         exited(self.state(os.path.dirname(log))["supervisor"])
         self.release(gate)
         created(marker)
