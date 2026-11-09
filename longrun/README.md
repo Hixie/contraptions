@@ -192,7 +192,11 @@ A run whose stall was reported and that nothing waits for lives on
 until one of these happens. In a subagent, the hooks below end it when
 the subagent finishes. In the main session, they keep the agent from
 finishing its turn until it has either waited for the run or stopped
-it. `longrun list` shows each run and whether it is still running.
+it. A `run` or `wait` call that reports a stall returns only after the
+supervisor has either recorded that the call no longer waits or
+exited, so the hooks never count a call that has returned as one that
+is still waiting for a live run.
+`longrun list` shows each run and whether it is still running.
 
 When the command exits by itself, processes it left running in its
 process group get SIGTERM, and SIGKILL 10 seconds later. The result

@@ -6,6 +6,7 @@ See README.md."""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import glob
 import json
@@ -597,9 +598,9 @@ class Supervisor:
         anything was interrupted, and if it was the last one, nothing is
         waiting for the run any more."""
         conn, told = self.clients.pop(fd)
-        conn.close()
         self.state["waiting"] = len(self.clients)
         self.save()
+        conn.close()
         if not told and not self.clients:
             self.end("the call waiting for it was interrupted")
 
@@ -716,17 +717,23 @@ def connect(rundir: str) -> socket.socket | None:
 def attach(rundir: str, conn: socket.socket | None, request: bytes = b"",
            announce: bool = False) -> int:
     """Waits for the run to stall or end, prints the report, and returns
-    the exit status to use."""
+    the exit status to use. After a stall, it returns once the supervisor
+    closes the connection, which the supervisor does after it has
+    stopped counting the call as waiting, or when it exits."""
     if conn is not None:
         if request:
             conn.sendall(request)
-        for message in conn.makefile():
+        messages = conn.makefile()
+        for message in messages:
             kind, _, arg = message.strip().partition(" ")
             if kind == "running" and announce:
                 print(f"longrun: started {rundir}", flush=True)
             elif kind == "stall" and not request:
                 sys.stdout.write(read(os.path.join(rundir,
                                                    f"stall-{arg}.txt")))
+                with contextlib.suppress(OSError):  # The supervisor is gone.
+                    conn.shutdown(socket.SHUT_WR)
+                messages.read()
                 return STALLED
             if kind == "done":
                 break

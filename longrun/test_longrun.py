@@ -2,6 +2,8 @@
 `sample`, SIGINFO). Commands that have to wait for the test block on a
 FIFO that the test opens when it is ready."""
 
+import contextlib
+import io
 import os
 import re
 import select
@@ -686,6 +688,29 @@ class Runs(unittest.TestCase):
         self.longrun("stop", watched)
         self.finish(waited)
 
+    def test_stop_hook_sees_a_stall_as_soon_as_the_call_returns(self):
+        scratchpad = tempfile.mkdtemp(dir=self.base)
+        self.env["LONGRUN_DIR"] = os.path.join(scratchpad, "longrun")
+        gate = self.fifo("gate")
+        proc, rundir = self.start("--quiet", "0.04",
+                                  f"read x < {gate}; echo middle; sleep 300")
+        self.assertEqual(self.finish(proc)[1], longrun.STALLED)
+        # The connection stays open until the end of the with statement,
+        # so only what attach does before it returns can tell the
+        # supervisor that the call has returned.
+        with longrun.connect(rundir) as conn:
+            self.release(gate)
+            with contextlib.redirect_stdout(io.StringIO()) as report:
+                self.assertEqual(longrun.attach(rundir, conn),
+                                 longrun.STALLED)
+            self.assertIn("1| middle", report.getvalue())
+            reply = longrun.hook({"hook_event_name": "Stop",
+                                  "scratchpad_dir": scratchpad,
+                                  "session_id": "test-session"})
+            self.assertIsNotNone(reply)
+            self.assertIn(os.path.basename(rundir), reply["reason"])
+        self.longrun("stop", rundir)
+
     def test_run_directory_of_another_user_is_refused(self):
         self.env["LONGRUN_DIR"] = "/usr"
         result = self.longrun("list")
@@ -836,6 +861,19 @@ class Reports(unittest.TestCase):
         os.write(supervisor.reports[1], b"3\n")
         supervisor.reported()
         self.assertEqual((told, supervisor.written), (["stall 3"], 3))
+
+    def test_a_stall_is_reported_when_the_supervisor_is_gone_after_it(self):
+        rundir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, rundir)
+        with open(os.path.join(rundir, "stall-1.txt"), "w") as f:
+            f.write("the report\n")
+        conn, supervisor = socket.socketpair()
+        self.addCleanup(conn.close)
+        supervisor.sendall(b"running 1\nstall 1\n")
+        supervisor.close()
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(longrun.attach(rundir, conn), longrun.STALLED)
+        self.assertEqual(output.getvalue(), "the report\n")
 
 
 class Summaries(unittest.TestCase):
