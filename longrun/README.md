@@ -2,8 +2,9 @@
 
 Runs a long command, such as a test suite, a build or a gate, for an
 agent that has to wait for it. Waiting costs one tool call. If the
-command stops printing for a while, longrun says so once, with what
-each of its processes is doing, and leaves it running. The command ends
+command stops printing for a while, longrun says so, with what each of
+its processes is doing, and leaves it running. If it stays silent,
+longrun says so again less and less often. The command ends
 when whoever started it is gone.
 
 It works for any command. It knows nothing about any one test suite,
@@ -125,17 +126,22 @@ pid 51206, 0% CPU: …/.venv/bin/python -u -c import sys;exec(eval(sys.stdin.rea
       File ".../lib/python3.12/subprocess.py", line 2115 in _communicate
       File "tests/test_cleanup.py", line 88 in test_interrupted_run_removes_its_files
 …
+If it stays silent, waiting reports it again after another 20m00s.
 To keep waiting: longrun wait 0412-093015-pytest-k3v8a2qd
 To end it:       longrun stop 0412-093015-pytest-k3v8a2qd
 ```
 
-`wait` blocks again, until the command ends or stalls again. A stall is
-reported once: `wait` does not return for the stall it was told about,
-only for a new one, which starts when the command prints something and
-then falls silent again. If a new stall happened while nothing was
-waiting, `wait` reports it at once. `stop` ends the command and prints
-the same result as `run` would. A run that was ended this way, or in
-any of the ways listed below, exits with the command's status, or 143
+`wait` blocks again, until the command ends or stalls again. If the
+command prints something, the next stall is reported after `--quiet`
+minutes of silence, as the first was. If it prints nothing, the next
+report comes after twice as long as the time before, counted from when
+`wait` starts: with the default of 10 minutes, `wait` reports the stall
+again after another 20 minutes, then 40, then 80, and so on. Each
+report says how long that is for the next `wait`, if the command stays
+silent. If a new stall happened while nothing was waiting, `wait`
+reports it at once. `stop` ends the command and prints the same result
+as `run` would. A run that was ended this way, or in any of the ways
+listed below, exits with the command's status, or 143
 (128 plus SIGTERM) if the command exited with 0, since it did not
 finish.
 
@@ -380,8 +386,9 @@ once what to do:
 
 - If a process is waiting for something that will come, such as a free
   slot in a queue, or is busy in a long silent step, run
-  `longrun wait RUN`. It blocks until the command ends or stalls again,
-  and never reports the same stall twice.
+  `longrun wait RUN`. It blocks until the command ends or stalls
+  again. If the command stays silent, that is after twice as long as
+  the last time, as the report says.
 - If a process is waiting for something that will never happen, run
   `longrun stop RUN`, then fix the cause.
 

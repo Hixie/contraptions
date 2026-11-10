@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 import zipfile
 
@@ -224,7 +225,7 @@ class Runs(unittest.TestCase):
         self.assertIn("500| 500", passing)
         self.assertNotIn("495| 495", passing)
 
-    def test_stall_hands_back_once_and_run_continues(self):
+    def test_stall_hands_back_and_run_continues(self):
         gate = self.fifo("gate")
         proc, rundir = self.start("--quiet", "0.04",
                                   f"echo before; read x < {gate}; echo after")
@@ -234,7 +235,8 @@ class Runs(unittest.TestCase):
         self.assertIn("1| before", report)
         self.assertIn("longrun wait " + os.path.basename(rundir), report)
         self.assertTrue(alive(self.state(rundir)["child"]))
-        # The stall was reported, so wait blocks until the command ends.
+        # The stall was reported, so wait blocks until the command ends,
+        # since that happens before twice the quiet time has passed.
         waiting = self.client("wait", os.path.basename(rundir))
         self.release(gate)
         output, code = self.finish(waiting)
@@ -264,6 +266,35 @@ class Runs(unittest.TestCase):
         self.release(second)
         self.assertEqual(self.finish(waiting)[1], 0)
         self.assertEqual(self.state(rundir)["stalls"], 2)
+
+    def test_silence_after_a_stall_is_reported_less_and_less_often(self):
+        gate, marker = self.fifo("gate"), os.path.join(self.base, "marker")
+        quiet = 0.02 * 60
+        again = lambda n: f"after another {longrun.duration(n * quiet)}."
+        # The marker appears more than twice the quiet time after the
+        # first report, so the wait below would return as soon as it
+        # started if the interval were counted from the report.
+        proc, rundir = self.start(
+            "--quiet", "0.02", f"sleep 5; touch {marker}; read x < {gate}; "
+            f"echo middle; sleep 300")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn(again(2), report)
+        created(marker)
+        began = time.monotonic()
+        report, code = self.finish(self.client("wait", rundir))
+        self.assertEqual(code, longrun.STALLED)
+        self.assertGreaterEqual(time.monotonic() - began, 2 * quiet)
+        self.assertIn(again(4), report)
+        self.assertEqual(self.state(rundir)["stalls"], 2)
+        # Output starts the intervals again.
+        waiting = self.client("wait", rundir)
+        self.release(gate)
+        report, code = self.finish(waiting)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("1| middle", report)
+        self.assertIn(again(2), report)
+        self.longrun("stop", rundir)
 
     def test_stall_while_detached_is_reported_on_wait(self):
         gate = self.fifo("gate")
@@ -668,7 +699,8 @@ class Runs(unittest.TestCase):
         self.env["LONGRUN_DIR"] = os.path.join(scratchpad, "longrun")
         proc, forgotten = self.start("--quiet", "0.04", "sleep 300")
         self.assertEqual(self.finish(proc)[1], longrun.STALLED)
-        proc, watched = self.start("--quiet", "0.04", "sleep 300")
+        # The wait on this run has to outlast the checks below.
+        proc, watched = self.start("--quiet", "0.1", "sleep 300")
         self.assertEqual(self.finish(proc)[1], longrun.STALLED)
         waited = self.client("wait", watched)
         until(watched, lambda: self.state(watched).get("waiting") == 1)

@@ -358,8 +358,18 @@ def python_stack(path: str, offset: int, cwd: str) -> list[str]:
     return out
 
 
+def continuing(rundir: str, again: float) -> str:
+    """When waiting for a run that stalled reports it again if the
+    command stays silent, and how to continue the run."""
+    run = os.path.basename(rundir)
+    return (f"If it stays silent, waiting reports it again after another "
+            f"{duration(again)}.\n"
+            f"To keep waiting: longrun wait {run}\n"
+            f"To end it:       longrun stop {run}\n")
+
+
 def diagnose(rundir: str, number: int, child: int, quiet: float,
-             extent: tuple[int, int]) -> str:
+             again: float, extent: tuple[int, int]) -> str:
     """Describes a run that has printed nothing for a while: its
     processes, what each is doing, and how to continue. Processes that
     run the same command and are doing the same thing are listed once."""
@@ -411,10 +421,7 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
     if log:
         lines.append(section(log, list(range(max(0, len(log) - 10),
                                              len(log))), first))
-    run = os.path.basename(rundir)
-    lines.append(f"To keep waiting: longrun wait {run}")
-    lines.append(f"To end it:       longrun stop {run}")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n" + continuing(rundir, again)
 
 
 # The supervisor ------------------------------------------------------------------
@@ -436,7 +443,12 @@ class Supervisor:
         self.told = 0  # The last stall that a client was told about.
         self.written = 0  # The last stall whose report is written.
         self.reports = os.pipe()  # The number of each report written.
-        self.stalled = False
+        # How long a waiting call hears nothing before the next stall
+        # report, which doubles with each report and is reset by output,
+        # and when that report is due, which is None from a report until
+        # a call next waits.
+        self.interval = self.spec["quiet"]
+        self.due: float | None = None
         self.ending: set[int] = set()  # Processes sent SIGTERM.
         self.kill_at: float | None = None  # When to send them SIGKILL.
         self.killed = False
@@ -490,7 +502,7 @@ class Supervisor:
                        fflags=select.KQ_NOTE_EXIT)
         except ProcessLookupError:
             self.end("its owner had already exited")
-        self.last = time.monotonic()
+        self.heard()
         while self.child.returncode is None or (self.ending and
                                                 not self.killed):
             deadlines = [t for t in (self.kill_at, self.stall_at())
@@ -508,14 +520,20 @@ class Supervisor:
         self.log.close()
 
     def stall_at(self) -> float | None:
-        if (self.stalled or "reason" in self.state
+        if (self.due is None or "reason" in self.state
                 or self.child.returncode is not None):
             return None
-        return self.last + self.spec["quiet"]
+        return self.due
+
+    def heard(self) -> None:
+        """Counts the command's silence from now, starting the intervals
+        between stall reports again."""
+        self.last, self.interval = time.monotonic(), self.spec["quiet"]
+        self.due = self.last + self.interval
 
     def handle(self, event: select.kevent) -> None:
         if event.filter == select.KQ_FILTER_VNODE:
-            self.last, self.stalled = time.monotonic(), False
+            self.heard()
         elif event.filter == select.KQ_FILTER_READ:
             if event.ident == self.listener.fileno():
                 self.accept()
@@ -569,9 +587,12 @@ class Supervisor:
         self.watch(conn.fileno(), select.KQ_FILTER_READ)
         self.state["waiting"] = len(self.clients)
         self.save()
-        if (self.send(conn.fileno(), f"running {self.child.pid}")
-                and self.written > self.told):
+        if not self.send(conn.fileno(), f"running {self.child.pid}"):
+            return
+        if self.written > self.told:
             self.tell(f"stall {self.written}")
+        elif self.due is None and self.state["stalls"] == self.told:
+            self.due = time.monotonic() + self.interval
 
     def hear(self, fd: int) -> None:
         try:
@@ -614,21 +635,20 @@ class Supervisor:
     def stall(self, quiet: float) -> None:
         """Writes a stall report on a thread of its own, since sampling
         takes a while, and tells the clients when it is written."""
-        self.stalled = True
+        self.due, again = None, self.interval * 2
+        self.interval = again
         self.state["stalls"] += 1
         number, extent = self.state["stalls"], self.measure()
 
         def report() -> None:
             try:
                 text = diagnose(self.rundir, number, self.child.pid, quiet,
-                                extent)
+                                again, extent)
             except Exception as error:
-                run = os.path.basename(self.rundir)
                 text = (f"longrun: STALLED, no output for {duration(quiet)}. "
                         f"The command is still running. Describing its "
                         f"processes failed: {error!r}\n"
-                        f"To keep waiting: longrun wait {run}\n"
-                        f"To end it:       longrun stop {run}\n")
+                        + continuing(self.rundir, again))
             try:
                 with open(os.path.join(self.rundir, f"stall-{number}.txt"),
                           "w") as f:
