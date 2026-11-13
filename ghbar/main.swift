@@ -236,7 +236,12 @@ enum LoginItem {
         let service = "\(domain)/\(label(instance: instance))"
         do {
             if try runTool(launchctl, ["print", service]).status == 0 {
-                let result = try runTool(launchctl, ["bootout", service])
+                // Given the job's plist, launchctl bootout returns once launchd
+                // has removed the job. Given the job's name, it returns while
+                // the job's process is still exiting, and launchctl bootstrap
+                // then fails.
+                let result = try runTool(launchctl,
+                                         ["bootout", domain, plistURL(instance: instance).path])
                 guard result.status == 0 else {
                     return result.failure("launchctl bootout")
                 }

@@ -14,23 +14,29 @@ check:
 test:
 	python3 -I test_fseventsd_watchdog.py
 
+# Given a job's plist, launchctl bootout returns once launchd has removed the
+# job. Given the job's name, it returns while the job's process is still
+# exiting, and a launchctl bootstrap straight after fails. The uninstall
+# targets fall back to the name when the plist is missing.
 install: $(WATCHDOG_LABEL).plist
 	sudo install -o root -g wheel -m 644 $(WATCHDOG_LABEL).plist "$(DAEMON_PLIST)"
-	sudo launchctl bootout system/$(WATCHDOG_LABEL) 2>/dev/null || true
+	sudo launchctl bootout system "$(DAEMON_PLIST)" 2>/dev/null || true
 	sudo launchctl bootstrap system "$(DAEMON_PLIST)"
 
 uninstall:
-	sudo launchctl bootout system/$(WATCHDOG_LABEL) 2>/dev/null || true
+	sudo launchctl bootout system "$(DAEMON_PLIST)" 2>/dev/null \
+	  || sudo launchctl bootout system/$(WATCHDOG_LABEL) 2>/dev/null || true
 	sudo rm -f "$(DAEMON_PLIST)"
 
 install-recorder:
 	mkdir -p "$(LOG_DIR)" "$(AGENT_DIR)"
 	sed "s|@LOGDIR@|$(LOG_DIR)|g" $(RECORDER_LABEL).plist.template > "$(AGENT_PLIST)"
-	launchctl bootout gui/$$(id -u)/$(RECORDER_LABEL) 2>/dev/null || true
+	launchctl bootout gui/$$(id -u) "$(AGENT_PLIST)" 2>/dev/null || true
 	launchctl bootstrap gui/$$(id -u) "$(AGENT_PLIST)"
 
 uninstall-recorder:
-	launchctl bootout gui/$$(id -u)/$(RECORDER_LABEL) 2>/dev/null || true
+	launchctl bootout gui/$$(id -u) "$(AGENT_PLIST)" 2>/dev/null \
+	  || launchctl bootout gui/$$(id -u)/$(RECORDER_LABEL) 2>/dev/null || true
 	rm -f "$(AGENT_PLIST)"
 
 clean:
