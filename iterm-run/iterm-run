@@ -1,0 +1,53 @@
+#!/bin/zsh -f
+# Usage: iterm-run COMMAND
+#
+# Runs COMMAND in the current session of iTerm2's frontmost window if, and
+# only if, that session's foreground process is a zsh that sourced
+# iterm-run.zsh and is idle at an empty prompt. Prints "ran" and exits 0
+# once the command has started, or prints "busy" and exits 1. ITERM_RUN_PID
+# names a shell to use instead of asking iTerm2, and ITERM_RUN_DIR names the
+# directory of the shells' FIFOs. README.md describes the protocol.
+
+zmodload zsh/system
+unsetopt multibyte
+
+dir=${ITERM_RUN_DIR:-$(getconf DARWIN_USER_TEMP_DIR)iterm-run}
+reply=$dir/reply-$$
+request=$reply$'\t'$1
+# The request must reach the pipe in one write, which the system only
+# promises for writes of up to PIPE_BUF (512) bytes.
+if [[ $# -ne 1 || -z $1 || $1 == *$'\n'* ]] || (( $#request >= 512 )); then
+  print -u2 "usage: iterm-run COMMAND (one line, under $(( 511 - $#reply )) bytes)"
+  exit 2
+fi
+pid=${ITERM_RUN_PID:-$(osascript \
+  -e 'if application "iTerm2" is not running then error "iTerm2 is not running"' \
+  -e 'tell application "iTerm2" to tell current session of current window to return variable named "jobPid"')} || exit 2
+
+mkdir -p -m 700 -- $dir || exit 2
+trap 'exit 1' INT TERM HUP
+trap 'rm -f -- $reply; [[ -n $watcher ]] && kill $watcher 2>/dev/null' EXIT
+rm -f -- $reply
+mkfifo -m 600 -- $reply || exit 2
+# Opened for reading and writing, so that the shell's nonblocking open of
+# the reply FIFO finds a reader.
+sysopen -r -w -u rfd -- $reply || exit 2
+
+# The open fails when the foreground process is not a listening shell, or
+# is one that is running a command.
+if ! sysopen -w -o nonblock -u wfd -- $dir/$pid 2>/dev/null; then
+  print busy
+  exit 1
+fi
+# The shell creates and locks this file before it listens, and holds the
+# lock until it exits, so acquiring the lock, or finding the file gone,
+# means the shell exited without replying.
+{ zsystem flock $dir/$pid.lock; print busy > $reply } >/dev/null 2>&1 &
+watcher=$!
+if ! print -r -u $wfd -- $request 2>/dev/null; then
+  print busy
+  exit 1
+fi
+read -r -u $rfd answer
+print -r -- $answer
+[[ $answer == ran ]]
