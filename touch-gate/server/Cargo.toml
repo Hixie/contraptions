@@ -1,0 +1,15 @@
+[package]
+name = "touch-gate-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
