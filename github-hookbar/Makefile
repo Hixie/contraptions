@@ -4,9 +4,9 @@ AGENT_LABEL = local.github-hookbar
 AGENT_DIR = $(HOME)/Library/LaunchAgents
 AGENT_PLIST = $(AGENT_DIR)/$(AGENT_LABEL).plist
 
-SOURCES = main.swift timing.swift
+SOURCES = main.swift timing.swift configuration.swift prlist.swift
 # Everything the tests exercise, which leaves out main.swift and the menu bar.
-TEST_SOURCES = timing.swift tests/main.swift
+TEST_SOURCES = timing.swift configuration.swift prlist.swift tests/main.swift
 
 $(BINARY): $(SOURCES)
 	swiftc -O -o $(BINARY) $(SOURCES)

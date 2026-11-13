@@ -4,6 +4,9 @@ A macOS menu bar indicator that keeps a connection open to a relay of GitHub
 webhook deliveries, and runs a command whenever a chosen author opens a pull
 request. The command is given the pull request's URL, so it can open the pull
 request, announce it, or hand it to whatever should start work on it.
+github-hookbar also keeps a file listing those pull requests and their
+branches until they are closed, so that other programs can find the pull
+request for a branch.
 
 ## What the indicator means
 
@@ -28,8 +31,13 @@ when it exits with status 0, and a cross otherwise. Hovering over one shows
 the exit status and everything the command printed. Choosing one opens the
 pull request on GitHub.
 
+When a change to the pull request list fails, the menu says so until the
+list is next refreshed, and hovering over that line shows the whole error.
+
 **Reconnect** reads the configuration file again and opens a new connection.
-**Settings…** opens the settings window.
+**Refresh Pull Request List** rebuilds the pull request list from GitHub, as
+described in the section on the pull request list. **Settings…** opens the
+settings window.
 
 ## The relay
 
@@ -84,9 +92,9 @@ not exist yet, has a field for each setting:
 
 - **Relay**: the host and port where the relay accepts connections.
 - **Authors**: comma-separated GitHub logins whose pull requests run the
-  command. Empty means every author.
-- **Repository owners**: comma-separated repository owners to accept. Empty
-  means any owner.
+  command and go on the pull request list. Empty means every author.
+- **Repository owners**: comma-separated repository owners to accept, for
+  both the command and the pull request list. Empty means any owner.
 - **Actions**: which pull request actions run the command. The default,
   `opened`, covers new pull requests, including drafts, and is what an empty
   field means.
@@ -126,10 +134,75 @@ A delivery redelivered from the webhook's page on GitHub runs the command
 again, which is how to recover a pull request opened while github-hookbar was
 not connected.
 
+## The pull request list
+
+github-hookbar keeps a list of the open pull requests it tracks in
+`~/.cache/github-prs.tsv`. A tracked pull request is one whose author and
+repository owner the settings choose. Each line of the file is one pull
+request: the repository's full name, a tab, the name of the pull request's
+branch, a tab, and the pull request's number. For example:
+
+```
+octocat/hello-world	fix-typo	1347
+```
+
+Each delivery about a tracked pull request updates the list, whatever its
+action. When the pull request is open, github-hookbar adds its line, which
+replaces any line already there for the same repository and number, so a
+redelivered webhook does not add a second line. When the pull request is
+closed, whether or not it was merged, github-hookbar removes its line. Lines
+about other pull requests, and lines that are not about a pull request, stay
+as they are. The relay keeps no history, so a pull request opened or closed
+while github-hookbar is not connected changes the list only when the list is
+next refreshed, or when another delivery about it arrives. A delivery says
+what state the pull request was in when GitHub made it, so redelivering an
+old delivery from GitHub can put a closed pull request back on the list until
+the next refresh.
+
+**Refresh Pull Request List** replaces the whole list with the open pull
+requests that GitHub's search finds for the authors and repository owners in
+the settings. It runs the `gh` command in your login shell, so `gh` must be
+installed and signed in to GitHub. Refreshing needs at least one author or
+repository owner in the settings, because otherwise every open pull request
+on GitHub would count as tracked, so the item is disabled without one.
+GitHub's search returns at most 1,000 pull requests, so a refresh fails when
+the search finds more. When the search fails, the list stays as it was.
+Choosing the item while a refresh runs starts the refresh again, and the
+earlier search is ignored if it has not finished, so a search that never
+finishes does not stop later refreshes. A refresh does not read the old list,
+so it also repairs a file that is not UTF-8 text. Without repository owners
+in the settings, a refresh also lists the authors' pull requests in
+repositories whose webhooks do not reach the relay; those come off the list
+only at a refresh after they are closed.
+
+GitHub's search can take a while to include a pull request that was just
+opened, or to leave out one that was just merged. A refresh therefore adds
+and removes again the pull requests that github-hookbar added or removed in
+the ten minutes before the refresh started, and while it ran.
+
+github-hookbar rewrites the file in place while it holds an exclusive lock on
+the file, taken with `flock(2)`. A program that holds a shared lock on the
+file while reading it therefore never sees the file half written. A program
+that changes the file must hold an exclusive lock while it does so, and must
+change the file in place rather than replace it. A refresh drops any lines
+that other programs added. macOS has no `flock` command, but Homebrew's
+`flock` package provides one:
+
+```sh
+flock -s ~/.cache/github-prs.tsv cat ~/.cache/github-prs.tsv
+```
+
+github-hookbar changes the file on a thread of its own, so a reader that
+holds its lock for a long time delays changes to the list but not the menu
+bar.
+
 ## Building and running
 
-Requires the Xcode command line tools, for `swiftc`. There is no Xcode
-project; the app is two Swift files, `main.swift` and `timing.swift`.
+Requires the Xcode command line tools, for `swiftc`. The tests also need
+`/usr/bin/jq`, which macOS includes from macOS 15 on. There is no Xcode
+project; the app is four Swift files: `main.swift`, which holds the menu bar
+app, and `timing.swift`, `configuration.swift`, and `prlist.swift`, which hold
+what the tests cover.
 
 ```sh
 make              # builds ./github-hookbar
@@ -139,10 +212,12 @@ make test         # builds and runs the tests in tests/main.swift
 
 github-hookbar logs each time it connects, each time it loses the connection
 or fails to connect, each `pull_request` delivery with whether it runs the
-command, and each time the command finishes, with its exit status and
-output, one line of output per log line. The lines go to standard error
-and to the system log, which keeps them however github-hookbar was
-started. They include the URLs of pull requests in private repositories.
+command or changes the pull request list, each time the command finishes,
+with its exit status and output, one line of output per log line, each
+refresh of the pull request list, and each failure to change the list. The
+lines go to standard error and to the system log, which keeps them however
+github-hookbar was started. They include the URLs of pull requests in private
+repositories.
 zsh has a `log` command of its own, so give the full path:
 
 ```sh

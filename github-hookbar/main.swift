@@ -3,12 +3,14 @@ import Network
 import os
 
 // github-hookbar: a menu bar indicator that keeps a connection open to a relay of
-// GitHub webhook deliveries, and runs a command for each pull request that a
-// chosen author opens.
+// GitHub webhook deliveries, runs a command for each pull request that a
+// chosen author opens, and keeps a list of those pull requests until they
+// are closed.
 
 // MARK: - Constants
 
 let defaultConfigurationPath = "~/.config/github-hookbar/config.ini"
+let pullRequestListPath = NSHomeDirectory() + "/.cache/github-prs.tsv"
 
 /// After the connection fails, the first attempt to connect again waits this
 /// long, and each failure after that doubles the wait, up to the maximum.
@@ -38,178 +40,6 @@ func log(_ message: String) {
     // Once the terminal github-hookbar was started from has gone, writing
     // fails, and the line is dropped.
     fputs("\(stamp) \(message)\n", stderr)
-}
-
-// MARK: - Configuration
-
-struct Problem: Error, CustomStringConvertible {
-    let description: String
-}
-
-/// The settings the configuration file holds, each named by its section and
-/// key, with how the settings window shows it.
-let settings: [(name: String, label: String, placeholder: String)] = [
-    ("relay.address", "Relay:", "host:port"),
-    ("github.authors", "Authors:", "everyone"),
-    ("github.orgs", "Repository owners:", "anyone"),
-    ("github.actions", "Actions:", "opened"),
-    ("command.run", "Command:", "open"),
-]
-
-/// What one line of INI text is: a "[section]" header, a "key = value"
-/// setting, nothing (a blank line, or a comment starting with "#" or ";"),
-/// or none of those.
-enum INILine {
-    case section(String)
-    case setting(key: String, value: String)
-    case nothing
-    case invalid
-
-    init(_ line: String) {
-        let line = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") {
-            self = .nothing
-        } else if line.hasPrefix("["), line.hasSuffix("]") {
-            self = .section(line.dropFirst().dropLast().trimmingCharacters(in: .whitespaces)
-                .lowercased())
-        } else if let equals = line.firstIndex(of: "=") {
-            self = .setting(key: line[..<equals].trimmingCharacters(in: .whitespaces).lowercased(),
-                            value: line[line.index(after: equals)...]
-                                .trimmingCharacters(in: .whitespaces))
-        } else {
-            self = .invalid
-        }
-    }
-}
-
-/// INI text, with the line each setting is on. Settings are named
-/// "section.key", and each may be set only once. Changing a setting changes
-/// only its own line, so the rest of the text stays as it was.
-struct INIFile {
-    /// The settings, in the order the text sets them.
-    private(set) var names: [String] = []
-    private(set) var values: [String: String] = [:]
-    private var lines: [String]
-    private var lineOfSetting: [String: Int] = [:]
-    /// Where a new setting in each section goes: after the section's last
-    /// setting, or after its header when it has none.
-    private var endOfSection: [String: Int] = [:]
-
-    init(_ text: String) throws {
-        lines = text.components(separatedBy: "\n")
-        if lines.last == "" {
-            lines.removeLast()
-        }
-        var section = ""
-        for (index, line) in lines.enumerated() {
-            switch INILine(line) {
-            case .section(let name):
-                section = name
-                endOfSection[name] = index + 1
-            case .setting(let key, let value):
-                let name = "\(section).\(key)"
-                guard values[name] == nil else {
-                    throw Problem(description: "\(name) is set more than once")
-                }
-                names.append(name)
-                values[name] = value
-                lineOfSetting[name] = index
-                endOfSection[section] = index + 1
-            case .nothing:
-                break
-            case .invalid:
-                throw Problem(description: "a line is not \"key = value\": \(line)")
-            }
-        }
-    }
-
-    var text: String {
-        lines.joined(separator: "\n") + "\n"
-    }
-
-    /// Sets a setting, adding it after the last setting in its section, or
-    /// adding the section at the end, when the text does not set it yet. A
-    /// new line ends the way the text's first line does, so CRLF text stays
-    /// CRLF text.
-    mutating func set(_ name: String, to value: String) throws {
-        let parts = name.split(separator: ".", maxSplits: 1).map(String.init)
-        let ending = lines.first?.hasSuffix("\r") == true ? "\r" : ""
-        let line = (value.isEmpty ? "\(parts[1]) =" : "\(parts[1]) = \(value)") + ending
-        if let index = lineOfSetting[name] {
-            lines[index] = line
-        } else if let index = endOfSection[parts[0]] {
-            lines.insert(line, at: index)
-        } else {
-            lines += (lines.isEmpty ? [] : [ending]) + ["[\(parts[0])]" + ending, line]
-        }
-        self = try INIFile(text)
-    }
-}
-
-struct Configuration {
-    let host: String
-    let port: UInt16
-    let authors: [String]
-    let orgs: [String]
-    let actions: [String]
-    let command: String
-
-    var relay: String { "\(host):\(port)" }
-
-    init(contentsOf url: URL) throws {
-        let text: String
-        do {
-            text = try String(contentsOf: url, encoding: .utf8)
-        } catch {
-            throw Problem(description: "cannot read \(url.path): \(error.localizedDescription)")
-        }
-        do {
-            try self.init(try INIFile(text))
-        } catch {
-            throw Problem(description: "\(url.path): \(error)")
-        }
-    }
-
-    init(_ file: INIFile) throws {
-        for name in file.names where !settings.contains(where: { $0.name == name }) {
-            throw Problem(description: "\(name) is not a setting github-hookbar knows")
-        }
-        let values = file.values
-        func required(_ key: String) throws -> String {
-            guard let value = values[key], !value.isEmpty else {
-                throw Problem(description: "\(key) is not set")
-            }
-            return value
-        }
-        func list(_ key: String) -> [String] {
-            (values[key] ?? "").split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-                .filter { !$0.isEmpty }
-        }
-
-        // An IPv6 address is written in brackets, as in [::1]:8081.
-        let address = try required("relay.address")
-        guard let colon = address.lastIndex(of: ":"),
-              let port = UInt16(address[address.index(after: colon)...]) else {
-            throw Problem(description: "the relay address \(address) is not host:port")
-        }
-        var host = address[..<colon]
-        if host.hasPrefix("["), host.hasSuffix("]") {
-            host = host.dropFirst().dropLast()
-        } else if host.contains(":") {
-            host = ""
-        }
-        guard !host.isEmpty else {
-            throw Problem(description: "the relay address \(address) is not host:port")
-        }
-        self.host = String(host)
-        self.port = port
-        authors = list("github.authors")
-        orgs = list("github.orgs")
-        let actions = list("github.actions")
-        self.actions = actions.isEmpty ? ["opened"] : actions
-        command = try required("command.run")
-    }
 }
 
 // MARK: - The relay connection
@@ -352,45 +182,6 @@ struct Delivery {
     }
 }
 
-/// The parts of a pull_request delivery that decide whether to run the
-/// command, and what to run it with.
-struct PullRequestEvent: Decodable {
-    struct Account: Decodable {
-        let login: String
-    }
-
-    struct PullRequest: Decodable {
-        let htmlUrl: URL
-        let number: Int
-        let title: String
-        let user: Account
-    }
-
-    struct Repository: Decodable {
-        let fullName: String
-        let owner: Account
-    }
-
-    let action: String
-    let pullRequest: PullRequest
-    let repository: Repository
-
-    init(_ body: Data) throws {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        self = try decoder.decode(PullRequestEvent.self, from: body)
-    }
-
-    func matches(_ configuration: Configuration) -> Bool {
-        func allows(_ list: [String], _ value: String) -> Bool {
-            list.isEmpty || list.contains(value.lowercased())
-        }
-        return allows(configuration.actions, action)
-            && allows(configuration.authors, pullRequest.user.login)
-            && allows(configuration.orgs, repository.owner.login)
-    }
-}
-
 // MARK: - Running the command
 
 /// One run of the command for one pull request.
@@ -418,28 +209,28 @@ func loginShellPath() -> String {
     return "/bin/sh"
 }
 
-/// Runs the command line in the user's shell, as an interactive login shell
-/// so that it sees the environment a terminal sees, with the pull request's
-/// URL added as its last argument. Calls back on the main thread with the
-/// exit status and the end of the output, standard output and standard
-/// error together.
+/// Runs a script in the user's shell, as an interactive login shell so that
+/// it sees the environment a terminal sees, with the given arguments as $1,
+/// $2, and so on. Calls back on the main thread with the exit status and the
+/// end of the output, standard output and standard error together.
 ///
 /// The output goes to a file whose name is removed as soon as it is made, so
-/// a background process that the command leaves running, still holding the
+/// a background process that the script leaves running, still holding the
 /// file, does not keep the run from finishing.
-func runCommand(_ command: String, with url: URL,
-                completion: @escaping (Int32, String) -> Void) {
-    var template = Array("\(NSTemporaryDirectory())github-hookbar.XXXXXX".utf8CString)
-    let descriptor = mkstemp(&template)
-    guard descriptor >= 0 else {
-        completion(-1, "could not make a file for the output: \(String(cString: strerror(errno)))")
+func runInLoginShell(_ script: String, arguments: [String],
+                     completion: @escaping (Int32, String) -> Void) {
+    let output: FileHandle
+    do {
+        let (file, path) = try makeTemporaryFile()
+        unlink(path)
+        output = file
+    } catch {
+        completion(-1, "\(error)")
         return
     }
-    unlink(template)
-    let output = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     let process = Process()
     process.executableURL = URL(fileURLWithPath: loginShellPath())
-    process.arguments = ["-ilc", command + " \"$1\"", "github-hookbar", url.absoluteString]
+    process.arguments = ["-ilc", script, "github-hookbar"] + arguments
     process.standardInput = FileHandle.nullDevice
     process.standardOutput = output
     process.standardError = output
@@ -454,6 +245,41 @@ func runCommand(_ command: String, with url: URL,
         try process.run()
     } catch {
         completion(-1, "could not start \(loginShellPath()): \(error.localizedDescription)")
+    }
+}
+
+/// Makes a new, empty file that only this user can read, and opens it.
+func makeTemporaryFile() throws -> (FileHandle, String) {
+    var template = Array("\(NSTemporaryDirectory())github-hookbar.XXXXXX".utf8CString)
+    let descriptor = mkstemp(&template)
+    guard descriptor >= 0 else {
+        throw Problem(description: "could not make a temporary file: "
+                      + String(cString: strerror(errno)))
+    }
+    return (FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), String(cString: template))
+}
+
+/// Asks GitHub, with the gh command, for the pull requests a search finds.
+/// The login shell can print to standard output as it starts, so the pull
+/// requests go to a file of their own.
+func lookUpPullRequests(_ search: String,
+                        completion: @escaping (Result<[TrackedPullRequest], Error>) -> Void) {
+    let path: String
+    do {
+        path = try makeTemporaryFile().1
+    } catch {
+        completion(.failure(error))
+        return
+    }
+    runInLoginShell(searchScript, arguments: [path, search]) { status, output in
+        defer { unlink(path) }
+        completion(Result {
+            guard status == 0 else {
+                throw Problem(description: "the search exited with status \(status)\n\(output)")
+            }
+            return try trackedPullRequests(fromSearchOutput: String(contentsOfFile: path,
+                                                                    encoding: .utf8))
+        })
     }
 }
 
@@ -623,6 +449,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// arrived, when its delivery ID says when that was.
     private var lastDeliveryAge: TimeInterval?
     private var dimming = Dimming()
+    private let pullRequestList = PullRequestList(path: pullRequestListPath)
+    /// Why a change to the pull request list failed, if one has since the
+    /// last refresh that succeeded.
+    private var pullRequestListProblem: String?
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private let settingsWindow: SettingsWindow
@@ -745,15 +575,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let url = event.pullRequest.htmlUrl
         let described = "pull_request delivery \(delivery.headers["x-github-delivery"] ?? "without an ID")"
             + " for \(url.absoluteString), \(event.action) by \(event.pullRequest.user.login)"
+        if let change = event.listChange(configuration) {
+            log("\(described): \(change)")
+            pullRequestList.make(change) { [weak self] error in
+                self?.pullRequestListChanged(error)
+            }
+        }
         guard event.matches(configuration) else {
-            log("\(described): not one the configuration chooses")
+            log("\(described): not one the configuration runs the command for")
             return
         }
         let item = Run(event)
         log("\(described): running the command")
         recent = Array(([item] + recent).prefix(recentLength))
         updateMenu()
-        runCommand(configuration.command, with: url) { [weak self] status, output in
+        runInLoginShell(configuration.command + " \"$1\"",
+                        arguments: [url.absoluteString]) { [weak self] status, output in
             item.outcome = (status, output)
             // The system log cuts a message off after about a kilobyte, so
             // each line of output is a log line of its own.
@@ -765,6 +602,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             self?.updateMenu()
         }
+    }
+
+    /// Replaces the pull request list with the open pull requests the
+    /// configuration tracks, as GitHub's search finds them.
+    @objc private func refreshPullRequestList() {
+        guard let search = trackedPullRequestSearch else { return }
+        log("refreshing the pull request list from GitHub's search for \(search)")
+        pullRequestList.refresh({ lookUpPullRequests(search, completion: $0) }) { [weak self] error in
+            if error == nil {
+                log("refreshed the pull request list")
+                self?.pullRequestListProblem = nil
+            }
+            self?.pullRequestListChanged(error)
+        }
+        updateMenu()
+    }
+
+    private var trackedPullRequestSearch: String? {
+        configuration.flatMap { openPullRequestSearch(authors: $0.authors, owners: $0.orgs) }
+    }
+
+    /// Notes a change to the pull request list that failed. One that
+    /// succeeded leaves the problem with an earlier change in place, since
+    /// only a refresh makes up for that.
+    private func pullRequestListChanged(_ error: Error?) {
+        if let error {
+            pullRequestListProblem = "\(error)"
+            log("could not change the pull request list: \(error)")
+        }
+        updateMenu()
     }
 
     private func show(_ state: ConnectionState) {
@@ -844,6 +711,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(withTitle: "Command: \(configuration.command)", action: nil,
                          keyEquivalent: "")
         }
+        if let pullRequestListProblem {
+            let item = menu.addItem(withTitle: "Could not change the pull request list: "
+                                    + pullRequestListProblem.prefix { !$0.isNewline },
+                                    action: nil, keyEquivalent: "")
+            item.toolTip = pullRequestListProblem
+        }
         if !recent.isEmpty {
             menu.addItem(.separator())
             for (index, item) in recent.enumerated() {
@@ -870,6 +743,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    keyEquivalent: "r")
         reconnect.target = self
         menu.addItem(reconnect)
+        // An item without an action is disabled.
+        let refresh = NSMenuItem(
+            title: pullRequestList.isRefreshing
+                ? "Refreshing Pull Request List…" : "Refresh Pull Request List",
+            action: trackedPullRequestSearch == nil ? nil : #selector(refreshPullRequestList),
+            keyEquivalent: "")
+        refresh.target = self
+        if configuration != nil {
+            refresh.toolTip = trackedPullRequestSearch == nil
+                ? "Refreshing needs the settings to name authors or repository owners."
+                : "Replaces \(pullRequestList.path) with the open pull requests the settings "
+                    + "track. Choosing it while a refresh runs starts again."
+        }
+        menu.addItem(refresh)
         let settings = NSMenuItem(title: "Settings…", action: #selector(showSettings),
                                   keyEquivalent: ",")
         settings.target = self
