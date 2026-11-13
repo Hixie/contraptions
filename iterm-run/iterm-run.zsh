@@ -98,6 +98,8 @@ _iterm_run_execute() {
     BUFFER=$_iterm_run_cmd
     zle -R
     zle -I
+    # Asks iTerm2 to bring this session's window, tab and pane forward.
+    [[ $TERM_PROGRAM == iTerm.app ]] && print -rn -- $'\e]1337;StealFocus\a'
     _iterm_run_add_history
     for _iterm_run_f in preexec $preexec_functions; do
       (( $+functions[$_iterm_run_f] )) &&

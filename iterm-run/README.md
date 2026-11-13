@@ -43,6 +43,11 @@ program may control iTerm2. The sender needs this to ask iTerm2 which
 session is frontmost. The question names the application that started
 the sender, such as Terminal or Claude.
 
+The first time a shell runs a sent command, iTerm2 asks "A control
+sequence attempted to activate a session. Allow it?", because the shell
+asks iTerm2 to bring its session forward (see below). Choose Allow, and
+let iTerm2 remember the choice.
+
 iterm-run needs macOS, zsh 5.9 (earlier versions are untested), and the
 `perl` that ships with macOS. The sender also needs iTerm2 to be
 running, unless the caller names the target shell itself (see
@@ -144,6 +149,15 @@ operator such as `d` that waits for its motion. A command sent in either
 state runs, and then the key sequence carries on.
 
 ## What a sent command looks like
+
+Before it runs a sent command, a shell in iTerm2 prints iTerm2's
+`StealFocus` control sequence (`ESC ] 1337 ; StealFocus BEL`), which
+makes iTerm2 bring the shell's window to the front, select its tab and
+split pane, and become the active application. iTerm2 does this only if
+the user allowed it when it asked, and never if "Disable potentially
+insecure escape sequences" is on in its advanced settings. The shell
+checks `TERM_PROGRAM`, and does not print the sequence in any other
+terminal.
 
 A sent command behaves like a typed one in these ways:
 

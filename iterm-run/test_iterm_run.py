@@ -68,12 +68,13 @@ def answer(process):
 
 
 class Shell:
-    def __init__(self, directory):
+    def __init__(self, directory, **env):
         self.directory = directory
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            os.environ.pop("TERM_PROGRAM", None)
             os.environ.update(PS1="READY> ", TERM="xterm-256color",
-                              ITERM_RUN_DIR=directory)
+                              ITERM_RUN_DIR=directory, **env)
             os.execvp("zsh", ["zsh", "-f", "-i"])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", 24, 80, 0, 0))
@@ -208,6 +209,17 @@ class ShellTest(TemporaryDirectoryTest):
         self.assertEqual(sh.screen_since(mark)[-6:], [
             "READY> false", "hook=1", "READY> echo after", "after",
             "hook=0", "READY>"])
+
+    def test_brings_iterm2_session_forward(self):
+        iterm = Shell(self.directory, TERM_PROGRAM="iTerm.app")
+        self.addCleanup(iterm.close)
+        self.assertEqual(iterm.ask("echo shown-$((4+5))"), ("ran", 0))
+        iterm.expect("\x1b]1337;StealFocus\x07")
+        iterm.expect("shown-9")
+        self.assertEqual(self.shell.ask("echo hidden-$((4+6))"), ("ran", 0))
+        self.shell.expect("hidden-10")
+        self.assertFalse(self.shell.printed("StealFocus"),
+                         "only iTerm2 is sent the request")
 
     def test_preexec_hooks_see_command(self):
         sh = self.shell
