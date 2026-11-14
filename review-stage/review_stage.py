@@ -28,6 +28,7 @@ IDENTITY = {
 DIFF = ["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
         "--no-relative", "-M", "--src-prefix=a/", "--dst-prefix=b/"]
 CHANGES = "changed-since-previous-round.txt"
+MARKER = ".review-stage"
 
 
 class Failure(Exception):
@@ -536,6 +537,7 @@ def stage(args):
     except OSError as e:
         raise Failure(f"cannot create {out}: {e.strerror}")
     try:
+        open(os.path.join(out, MARKER), "x").close()
         scratch = os.path.join(out, ".staging")
         os.mkdir(scratch)
         head = source.resolve(args.head) if args.head else \
@@ -605,12 +607,80 @@ def stage(args):
     return assignment
 
 
+def spellings(path):
+    """path, and each path that names it through a symbolic link at the top
+    of the file system, such as /tmp for /private/tmp."""
+    names = [path]
+    with os.scandir("/") as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                real = os.path.realpath(entry.path)
+                if (path + os.sep).startswith(real + os.sep):
+                    names.append(entry.path + path[len(real):])
+    return names
+
+
+def deno_cache():
+    """Where Deno keeps the compiled code of local modules: the directory
+    under which a module at the absolute path P has its file at P plus
+    '.js'."""
+    root = (os.environ.get("DENO_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME")
+        or os.path.expanduser("~/Library/Caches"), "deno"))
+    return os.path.join(os.path.abspath(root), "gen", "file")
+
+
+def remove(out):
+    """Delete a directory that stage() made, after deleting what Deno
+    cached elsewhere for the code in it under each name it can be
+    reached by."""
+    out = os.path.realpath(out)
+    if not os.path.isfile(os.path.join(out, MARKER)):
+        raise Failure(f"{out} has no {MARKER} file, so it is not a directory"
+                      " that review-stage made")
+    cache = deno_cache()
+    try:
+        for name in spellings(out):
+            mirror = cache + name
+            if os.path.lexists(mirror):
+                shutil.rmtree(mirror)
+                print(f"Removed {mirror}")
+        # Some tools, such as Go's module cache, make their directories
+        # read only.
+        def unlock(path):
+            os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode)
+                     | stat.S_IRWXU, follow_symlinks=False)
+        unlock(out)
+        for top, subdirs, _ in os.walk(out):
+            for name in subdirs:
+                unlock(os.path.join(top, name))
+        # The marker goes last, so that a removal that fails can be run
+        # again.
+        with os.scandir(out) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+                elif entry.name != MARKER:
+                    os.remove(entry.path)
+        os.remove(os.path.join(out, MARKER))
+        os.rmdir(out)
+    except OSError as e:
+        raise Failure(f"{e}\nRun --remove again once that is fixed.")
+    print(f"Removed {out}")
+
+
 def parse(argv):
     parser = argparse.ArgumentParser(
         description="Stage a change for reviewers who must not be able to"
         " tell which version came first.")
-    parser.add_argument("out", help="the directory to create")
-    parser.add_argument("names", nargs="+", help="one name per reviewer")
+    parser.add_argument("out", help="the directory to create (or, with"
+                        " --remove, to delete)")
+    parser.add_argument("names", nargs="*", default=[],
+                        help="one name per reviewer")
+    parser.add_argument("--remove", action="store_true",
+                        help="in place of staging, delete OUT, which this"
+                        " command must have made, and the compiled code that"
+                        " Deno cached for the files in it")
     parser.add_argument("-C", default=".", metavar="WORKTREE",
                         help="the worktree holding the change")
     parser.add_argument("--base", help="the change starts at the merge base"
@@ -631,12 +701,23 @@ def parse(argv):
                        help="list the parts of the patch that changed since"
                        " the last staging from this worktree into the"
                        " directory PREVIOUS")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.remove and any(value != parser.get_default(key) for key, value
+                           in vars(args).items() if key not in ("out",
+                                                                "remove")):
+        parser.error("--remove takes nothing but OUT")
+    if not args.remove and not args.names:
+        parser.error("name at least one reviewer")
+    return args
 
 
 def main(argv=None):
     try:
-        stage(parse(argv))
+        args = parse(argv)
+        if args.remove:
+            remove(args.out)
+        else:
+            stage(args)
     except Failure as e:
         print(f"review-stage: {e}", file=sys.stderr)
         return 1

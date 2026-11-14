@@ -7,10 +7,13 @@ import io
 import json
 import os
 import re
+import shutil
+import stat
 import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 _home = tempfile.mkdtemp()
 _config = os.path.join(_home, "gitconfig")
@@ -132,10 +135,12 @@ class Staging(unittest.TestCase):
         self.assertEqual(len({os.lstat(os.path.join(top, n)).st_atime_ns
                               for top, dirs, files in os.walk(out)
                               if ".git" not in top.split(os.sep)
-                              for n in files if n != "README.md"
-                              and n != "patch.diff"}), 1)
+                              for n in files if n not in (
+                                  "README.md", "patch.diff",
+                                  review_stage.MARKER)}), 1)
         self.assertEqual(sorted(assignment.values()), [False, True])
-        self.assertEqual(sorted(os.listdir(out)), sorted(assignment))
+        self.assertEqual(sorted(os.listdir(out)),
+                         sorted([*assignment, review_stage.MARKER]))
         self.assertEqual(state, (
             git(self.repo, "status", "--porcelain"),
             git(self.repo, "rev-parse", "HEAD"),
@@ -479,6 +484,123 @@ class Staging(unittest.TestCase):
         with self.assertRaisesRegex(review_stage.Failure, "submodules"):
             self.stage("sub", "--base", "HEAD~1", "--head", "HEAD")
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "sub")))
+
+    def remove(self, out, deno):
+        printed, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"DENO_DIR": deno}), \
+                contextlib.redirect_stdout(printed), \
+                contextlib.redirect_stderr(errors):
+            rc = review_stage.main(["--remove", out])
+        return rc, printed.getvalue(), errors.getvalue()
+
+    def test_removal_deletes_the_staging_and_only_its_cached_code(self):
+        self.change_worktree()
+        self.stage("out", "--base", "HEAD")
+        # The temporary directory is under /var, a symbolic link to
+        # /private/var, and Deno names each module by the path it was given.
+        out = os.path.join(self.tmp.name, "out")
+        real = os.path.realpath(out)
+        self.assertIn(out, review_stage.spellings(real))
+        self.assertIn("/tmp", review_stage.spellings("/private/tmp"))
+        self.assertEqual(review_stage.spellings("/private/tmpx"),
+                         ["/private/tmpx"])
+        deno = os.path.join(self.tmp.name, "deno")
+        locked = os.path.join(out, "🦆/after/modules/pkg")
+        write(locked, "x.go", "package x\n")
+        os.chmod(locked, 0)
+        os.chmod(os.path.dirname(locked), 0o555)
+        # Links to a directory outside OUT are removed, and what they link
+        # to is left as it is.
+        outside = os.path.join(self.tmp.name, "outside")
+        write(outside, "x.txt", "outside\n")
+        os.chmod(outside, 0o555)
+        for link in ("link", "🦆/after/link"):
+            os.symlink(outside, os.path.join(out, link))
+        # A file that cannot be deleted stops the removal, which can be run
+        # again once it can be.
+        stuck = os.path.join(out, "🦜/after/stuck.txt")
+        write("/", stuck, "stuck\n")
+        os.chflags(stuck, stat.UF_IMMUTABLE)
+        os.chmod(out, 0o555)
+        rc, printed, errors = self.remove(out, deno)
+        self.assertEqual(rc, 1)
+        self.assertRegex(errors, r"^review-stage: \[Errno 1\] Operation not"
+                         r" permitted: .*\nRun --remove again once that is"
+                         r" fixed\.\n$")
+        self.assertTrue(os.path.isfile(os.path.join(out, review_stage.MARKER)))
+        os.chflags(stuck, 0)
+        cache = os.path.join(deno, "gen", "file")
+        compiled = [cache + root + "/🦜/after/mod.ts.js"
+                    for root in (out, real)]
+        kept = [cache + real + "2/mod.ts.js",
+                cache + os.path.dirname(real) + "/mod.ts.js",
+                cache + self.repo + "/mod.ts.js"]
+        for path in compiled + kept:
+            write("/", path, "compiled\n")
+        rc, printed, errors = self.remove(out, deno)
+        self.assertEqual((rc, errors), (0, ""))
+        self.assertEqual(printed, f"Removed {cache + real}\n"
+                         f"Removed {cache + out}\nRemoved {real}\n")
+        for path in [out, cache + out, cache + real]:
+            self.assertFalse(os.path.lexists(path), path)
+        for path in kept:
+            self.assertEqual(read("/", path), "compiled\n")
+        self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o555)
+        self.assertEqual(read(outside, "x.txt"), "outside\n")
+        printed = io.StringIO()
+        self.stage("again", "--base", "HEAD", "--since", out, printed=printed)
+        self.assertIn(f"Compared with {real} (staged ", printed.getvalue())
+
+        # Nothing review-stage did not make is touched, including a staging
+        # that is already gone.
+        for path in (out, self.repo, os.path.dirname(self.repo)):
+            write("/", cache + path + "/mod.ts.js", "compiled\n")
+            rc, printed, errors = self.remove(path, deno)
+            self.assertEqual((rc, printed), (1, ""))
+            self.assertIn("not a directory that review-stage made", errors)
+            self.assertEqual(read("/", cache + path + "/mod.ts.js"),
+                             "compiled\n")
+        self.assertEqual(read(self.repo, "a.txt").count("line"), 40)
+
+    @unittest.skipUnless(shutil.which("deno"), "needs Deno")
+    def test_deno_caches_code_where_removal_looks_for_it(self):
+        deno = os.path.join(self.tmp.name, "deno")
+        write(self.tmp.name, "🦜/mod.ts", "export const x: number = 1;\n")
+        paths = review_stage.spellings(os.path.realpath(self.tmp.name))
+        self.assertIn(self.tmp.name, paths)
+        with mock.patch.dict(os.environ, {"DENO_DIR": deno,
+                                          "DENO_NO_UPDATE_CHECK": "1"}):
+            for root in paths:
+                subprocess.run(["deno", "run", "--no-config",
+                                os.path.join(root, "🦜/mod.ts")],
+                               check=True, capture_output=True)
+                self.assertTrue(os.path.isfile(
+                    review_stage.deno_cache() + root + "/🦜/mod.ts.js"))
+
+    def test_the_deno_cache_is_where_deno_puts_it(self):
+        t = self.tmp.name
+        for env, root in (
+                ({"DENO_DIR": t + "/d", "XDG_CACHE_HOME": t + "/x"}, t + "/d"),
+                ({"DENO_DIR": os.path.relpath(t + "/d"),
+                  "XDG_CACHE_HOME": t + "/x"}, t + "/d"),
+                ({"DENO_DIR": "", "XDG_CACHE_HOME": t + "/x"}, t + "/x/deno"),
+                ({"DENO_DIR": "", "XDG_CACHE_HOME": ""},
+                 t + "/Library/Caches/deno")):
+            with mock.patch.dict(os.environ, {**env, "HOME": t}):
+                self.assertEqual(review_stage.deno_cache(), root + "/gen/file")
+                if shutil.which("deno"):
+                    info = subprocess.run(["deno", "info", "--json"],
+                                          check=True, capture_output=True)
+                    self.assertEqual(os.path.normpath(
+                        json.loads(info.stdout)["denoDir"]), root)
+
+    def test_removal_takes_only_the_directory(self):
+        for argv in (["--remove", "out", "🦜"], ["--remove", "--base", "HEAD",
+                                                "out"], ["out"]):
+            with self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                review_stage.parse(argv)
+        self.assertTrue(review_stage.parse(["--remove", "out"]).remove)
 
 
 class Hunks(unittest.TestCase):

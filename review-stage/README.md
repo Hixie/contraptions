@@ -24,7 +24,8 @@ the worktree, if `--copy-ignored` is used). Each name after it gets a
 directory of its own inside `OUT`. The command prints
 which reviewers see the change as made and which see it reversed. Give
 each reviewer the path of its own directory and nothing about its
-orientation. Delete `OUT` once the review is over.
+orientation. Once the reviewers are done, delete `OUT` with `--remove`,
+as described [below](#removing-a-staging).
 
 By default the change runs from the merge base of `HEAD` and its
 upstream branch to the working tree as it is, including untracked files
@@ -171,6 +172,40 @@ into it from this worktree. If there is none, the command fails and
 lists every staging from this worktree. The list in
 `changed-since-previous-round.txt` then compares with that staging in
 place of the last one.
+
+## Removing a staging
+
+Once a round's reviewers are done, remove what was staged for them:
+
+```sh
+~/dev/contraptions/review-stage/review_stage.py --remove OUT
+```
+
+This deletes `OUT`, and first deletes the compiled code that Deno
+cached for the files in it. When Deno runs a local module that it has
+to compile, such as a TypeScript one, it saves the compiled JavaScript
+in its cache directory, at `gen/file` followed by
+the module's absolute path, with `.js` added to the file name. The
+cache directory is `$DENO_DIR`, else `$XDG_CACHE_HOME/deno`, else
+`~/Library/Caches/deno`. Deno deletes these files only when told to
+delete its whole cache (`deno clean`), so they would otherwise outlive
+`OUT`. Deno names each module by the path it was given, so a reviewer
+that reached its trees through `/tmp` rather than `/private/tmp` leaves
+files under both names. The command deletes the files under every name
+that reaches `OUT` through a symbolic link at the top of the file
+system, but not under names that go through other symbolic links.
+
+Deno's databases next to `gen` also hold entries for module paths. The
+layout of their tables is internal to Deno and changes between versions,
+so the command leaves them alone.
+
+Staging writes an empty `.review-stage` file at the top of `OUT`, where
+no reviewer's directory includes it. `--remove` refuses any directory
+without that file. It deletes that file last, after giving the owner
+full access to every directory in `OUT` (some tools, such as Go's
+module cache, make their directories read only), so a removal that
+fails partway can be run again. It leaves the record of stagings in the
+repository alone, so `--since OUT` still works after `OUT` is removed.
 
 ## Files kept in the repository
 
