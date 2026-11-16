@@ -200,7 +200,7 @@ record omits the cache-write TTL breakdown, it uses the standard five-minute
 write rate.
 
 The **FOOTER LINE and status emoji convention** comes from the
-[common-fabric system prompts](https://github.com/Hixie/settings/tree/main/system-prompts/common-fabric).
+[common-fabric system prompts](https://github.com/Hixie/settings/tree/main/common-fabric/system-prompts).
 Those prompts define the status emoji and the Agent Instructions Version (AIV)
 included in the footer. The report groups recorded emoji; it does not infer a
 turn's status from the session's current title. Each generated HTML and JSON

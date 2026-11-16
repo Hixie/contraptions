@@ -11,7 +11,7 @@ import re
 import sqlite3
 
 WEEK = 7 * 24 * 3600
-CONVENTION_SOURCE = 'https://github.com/Hixie/settings/tree/main/system-prompts/common-fabric'
+CONVENTION_SOURCE = 'https://github.com/Hixie/settings/tree/main/common-fabric/system-prompts'
 
 
 def stamp(value, fallback=0):
