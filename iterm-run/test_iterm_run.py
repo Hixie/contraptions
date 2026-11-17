@@ -4,8 +4,8 @@ Each shell test starts an interactive zsh under a pseudo-terminal with a
 real window size (without one, zsh redraws the prompt after every job
 because it thinks the window changed size), sources iterm-run.zsh in it,
 and drives it with keystrokes and with the iterm-run sender, which
-ITERM_RUN_PID points at the shell. The FIFOs live in a temporary
-ITERM_RUN_DIR.
+ITERM_RUN_SESSION points at the shell and its terminal. The FIFOs live
+in a temporary ITERM_RUN_DIR.
 
 A thread reads the terminal all the time, because zsh's line editor
 waits for its output to be read before it changes terminal settings.
@@ -41,8 +41,8 @@ LIMIT = 30
 ESCAPES = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 
 # Pretends to be a listening shell: holds the lock and the FIFO open,
-# prints "ready", prints the command of the first request it reads, and
-# then waits until it is killed.
+# prints its terminal, prints the command of the first request it reads,
+# and then waits until it is killed.
 FAKE_LISTENER = """
 import fcntl, os, sys
 fifo = os.path.join(sys.argv[1], str(os.getpid()))
@@ -50,14 +50,14 @@ lock = open(fifo + ".lock", "a")
 fcntl.lockf(lock, fcntl.LOCK_EX)
 os.mkfifo(fifo)
 requests = os.fdopen(os.open(fifo, os.O_RDWR))
-print("ready", flush=True)
+print(os.ttyname(0), flush=True)
 print(requests.readline().split("\\t", 1)[1], end="", flush=True)
 sys.stdin.read()
 """
 
 
-def send(directory, command, target):
-    env = dict(os.environ, ITERM_RUN_DIR=directory, ITERM_RUN_PID=str(target))
+def send(directory, command, session):
+    env = dict(os.environ, ITERM_RUN_DIR=directory, ITERM_RUN_SESSION=session)
     return subprocess.Popen([SENDER, command], env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -75,7 +75,11 @@ class Shell:
             os.environ.pop("TERM_PROGRAM", None)
             os.environ.update(PS1="READY> ", TERM="xterm-256color",
                               ITERM_RUN_DIR=directory, **env)
-            os.execvp("zsh", ["zsh", "-f", "-i"])
+            try:
+                os.write(1, os.ttyname(0).encode() + b"\n")
+                os.execvp("zsh", ["zsh", "-f", "-i"])
+            finally:
+                os._exit(127)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", 24, 80, 0, 0))
         self.output = bytearray()
@@ -84,6 +88,8 @@ class Shell:
         self.reaped = None
         self.changed = threading.Condition()
         threading.Thread(target=self._read, daemon=True).start()
+        self.tty = self.expect("\r\n").decode().strip()
+        self.session = f"{self.pid} {self.tty}"
         self.prompt()
         self.run(f"setopt noclobber; source {SCRIPT}")
 
@@ -129,7 +135,7 @@ class Shell:
         return self.prompt()
 
     def ask(self, command):
-        return answer(send(self.directory, command, self.pid))
+        return answer(send(self.directory, command, self.session))
 
     def printed(self, text):
         with self.changed:
@@ -308,7 +314,7 @@ class ShellTest(TemporaryDirectoryTest):
         link = os.path.join(tempfile.mkdtemp(), "link")
         self.addCleanup(shutil.rmtree, os.path.dirname(link))
         os.symlink(self.directory, link)
-        self.assertEqual(answer(send(link, "echo linked-$((3+3))", sh.pid)),
+        self.assertEqual(answer(send(link, "echo linked-$((3+3))", sh.session)),
                          ("ran", 0))
         sh.expect("linked-6")
 
@@ -322,9 +328,22 @@ class ShellTest(TemporaryDirectoryTest):
         sh.type("/bin/sh -c 'echo started; exec cat'\n")
         sh.expect("started\r\n")
         self.assertEqual(sh.ask("echo refused-5"), ("busy", 1))
+        with self.assertRaises(PermissionError):
+            self.open_requests()
         sh.type("\x04")
         sh.prompt()
         self.assertFalse(sh.printed("refused-5"))
+
+    def test_refuses_while_shell_runs_builtin(self):
+        sh = self.shell
+        sh.type("print started; read -r line\n")
+        sh.expect("started\r\n")
+        self.assertEqual(sh.ask("echo refused-11"), ("busy", 1))
+        sh.type("typed\n")
+        sh.prompt()
+        self.assertEqual(sh.ask("print -r got-$line"), ("ran", 0))
+        sh.expect("got-typed")
+        self.assertFalse(sh.printed("refused-11"))
 
     def test_refuses_requests_queued_during_program(self):
         sh = self.shell
@@ -400,6 +419,34 @@ class ShellTest(TemporaryDirectoryTest):
         self.assertEqual(sh.ask("print -r km-$KEYMAP"), ("ran", 0))
         sh.expect("km-vicmd")
 
+    def test_targets_shell_in_terminal_foreground(self):
+        sh = self.shell
+        sh.run("where=outer")
+        sh.type("zsh -f -i\n")
+        sh.prompt()
+        sh.run(f"setopt noclobber; source {SCRIPT}; where=inner")
+        self.assertEqual(sh.ask("print -r at-$where"), ("ran", 0))
+        sh.expect("at-inner")
+        sh.prompt()
+        sh.run("exit")
+        self.assertEqual(sh.ask("print -r at-$where"), ("ran", 0))
+        sh.expect("at-outer")
+
+    def test_refuses_session_that_has_ended(self):
+        sh = self.shell
+        other = Shell(self.directory)
+        self.addCleanup(other.close)
+        ended = subprocess.Popen(["true"])
+        ended.wait()
+        for session in (f"{ended.pid} {sh.tty}", f"{other.pid} {sh.tty}",
+                        f"{sh.pid} {other.tty}"):
+            self.assertEqual(answer(send(self.directory, "echo refused-12",
+                                         session)), ("busy", 1), session)
+        self.assertEqual(sh.ask("echo after-$((6+7))"), ("ran", 0))
+        sh.expect("after-13")
+        self.assertFalse(sh.printed("refused-12"))
+        self.assertFalse(other.printed("refused-12"))
+
     def test_declined_exit_keeps_listening(self):
         sh = self.shell
         sh.run("sleep 100 &")
@@ -428,44 +475,64 @@ class ShellTest(TemporaryDirectoryTest):
 
 
 class SenderTest(TemporaryDirectoryTest):
-    def start_fake_listener(self):
-        fake = subprocess.Popen(
-            [sys.executable, "-I", "-c", FAKE_LISTENER, self.directory],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    def start_on_terminal(self, *argv):
+        """Runs argv as the foreground process of a new terminal, and
+        returns its process ID and a text file reading the terminal's
+        output."""
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.execvp(argv[0], argv)
+            finally:
+                os._exit(127)
+        output = os.fdopen(fd, newline="")
 
         def stop():
-            fake.kill()
-            fake.wait()
-            fake.stdin.close()
-            fake.stdout.close()
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            output.close()
         self.addCleanup(stop)
-        self.assertEqual(fake.stdout.readline(), "ready\n")
-        return fake
+        return pid, output
+
+    def start_fake_listener(self):
+        pid, output = self.start_on_terminal(
+            sys.executable, "-I", "-c", FAKE_LISTENER, self.directory)
+        return pid, output, f"{pid} {output.readline().strip()}"
+
+    def check_rejected(self, command, session, message):
+        process = send(self.directory, command, session)
+        out, err = process.communicate(timeout=LIMIT)
+        self.assertEqual((out, process.returncode), ("", 2))
+        self.assertIn(message, err)
 
     def test_rejects_requests_it_cannot_send(self):
-        self.assertEqual(answer(send(self.directory, "x" * 600, 1))[1], 2)
-        self.assertEqual(answer(send(self.directory, "echo a\necho b", 1))[1], 2)
-        self.assertEqual(answer(send(self.directory, "", 1))[1], 2)
+        for command in ("x" * 600, "echo a\necho b", ""):
+            self.check_rejected(command, "1 /dev/console", "usage:")
+
+    def test_rejects_malformed_session(self):
+        for session in ("x /dev/console", "1", "1 console", "1 ", " /dev/x"):
+            self.check_rejected("echo x", session,
+                                "not a process ID and a terminal")
 
     def test_busy_when_nothing_listens(self):
-        self.assertEqual(answer(send(self.directory, "echo x", 1)),
-                         ("busy", 1))
-        self.fifo("999999")
-        self.assertEqual(answer(send(self.directory, "echo x", 999999)),
+        pid, output = self.start_on_terminal("/bin/sh", "-c", "tty; exec cat")
+        self.fifo(str(pid))
+        session = f"{pid} {output.readline().strip()}"
+        self.assertEqual(answer(send(self.directory, "echo x", session)),
                          ("busy", 1))
 
     def test_busy_when_listener_dies(self):
-        fake = self.start_fake_listener()
-        sender = send(self.directory, "echo x", fake.pid)
-        self.assertEqual(fake.stdout.readline(), "echo x\n")
+        pid, output, session = self.start_fake_listener()
+        sender = send(self.directory, "echo x", session)
+        self.assertEqual(output.readline(), "echo x\r\n")
         self.assertIsNone(sender.poll(), "the sender waits for a reply")
-        os.kill(fake.pid, signal.SIGKILL)
+        os.kill(pid, signal.SIGKILL)
         self.assertEqual(answer(sender), ("busy", 1))
 
     def test_killed_sender_cleans_up(self):
-        fake = self.start_fake_listener()
-        sender = send(self.directory, "echo x", fake.pid)
-        self.assertEqual(fake.stdout.readline(), "echo x\n")
+        _, output, session = self.start_fake_listener()
+        sender = send(self.directory, "echo x", session)
+        self.assertEqual(output.readline(), "echo x\r\n")
         sender.terminate()
         answer(sender)
         self.assertFalse(os.path.lexists(

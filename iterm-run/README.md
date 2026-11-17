@@ -50,8 +50,8 @@ let iTerm2 remember the choice.
 
 iterm-run needs macOS, zsh 5.9 (earlier versions are untested), and the
 `perl` that ships with macOS. The sender also needs iTerm2 to be
-running, unless the caller names the target shell itself (see
-`ITERM_RUN_PID` below). The sender never launches iTerm2.
+running, unless the caller names the target terminal itself (see
+`ITERM_RUN_SESSION` below). The sender never launches iTerm2.
 
 ## Using it
 
@@ -74,7 +74,7 @@ The sender prints one word and exits with a matching status:
 |--|--|--|
 | `ran` | 0 | The shell was idle and has started running the command. |
 | `busy` | 1 | The shell was not idle, or nothing was listening, or the shell exited before answering. Nothing ran. |
-| (a message on standard error) | 2 | The request was not sent: the arguments were not exactly one non-empty line short enough to send, iTerm2 was not running or had no windows, or the sender could not create its reply pipe. |
+| (a message on standard error) | 2 | The request was not sent: the arguments were not exactly one non-empty line short enough to send, iTerm2 was not running or had no windows, `ITERM_RUN_SESSION` or iTerm2 did not give a process ID and a terminal device, or the sender could not create its reply pipe. |
 
 `ran` means that the shell has started the command, not that the
 command has finished. Its output goes to the terminal, not to the
@@ -95,18 +95,41 @@ cannot answer:
 
 The target is the current session of iTerm2's frontmost window, that is,
 the focused split pane of the selected tab, even when another
-application is active. The sender asks iTerm2 for that session's
-foreground process (its `jobPid` variable) and sends the command to that
-process. If the foreground process is not a listening shell, for
-instance because the shell is running a program, the answer is `busy`.
-The sender never tries another session.
+application is active. The sender asks iTerm2 for the process ID of
+that session's first process (its `pid` variable, usually `login`) and
+for its terminal device. It then asks the kernel which terminal that
+process has and which process group is in the foreground on that
+terminal, and sends the command to the process that leads the group. A
+shell leads the foreground group while it waits at its prompt if it has
+job control, which interactive zsh has unless the `monitor` option is
+turned off. If the leader is not a listening shell, for instance because
+the shell is running a program, the answer is `busy`. The sender never
+tries another session.
+
+iTerm2 can go on showing a session after its first process has exited.
+The system may by then have given the session's terminal device to
+another session, and the process ID to another process. The sender
+answers `busy` unless the process still exists and still has the
+terminal iTerm2 named, so it sends a command into another session's
+terminal only if both the terminal and the process ID have been reused,
+and the reused ID belongs to a process on the reused terminal.
+
+The sender does not use iTerm2's own record of a session's foreground
+job (its `jobPid` variable). iTerm2 refreshes that record at most every
+half second while it is the active application, and at most every five
+seconds while it is not (see `sources/ProcessInfo/iTermProcessCache.m`
+in iTerm2's source), so for several seconds after a program ends it can
+still name the program.
 
 Two environment variables change what the sender does:
 
-- `ITERM_RUN_PID` names the process ID of the target shell, and the
-  sender then does not ask iTerm2. A caller that wants a session other
-  than the frontmost one can find its `jobPid` with iTerm2's scripting
-  interface and pass it here. The shell does not have to be in iTerm2.
+- `ITERM_RUN_SESSION`, if it is not empty, names the target session as
+  the process ID of a process on its terminal, a space, and the
+  terminal device, such as `1234 /dev/ttys004`, and the sender then does
+  not ask iTerm2. A caller that wants a session other than the frontmost
+  one can find its `pid` variable and `tty` with iTerm2's scripting
+  interface and pass them here. The terminal does not have to be in
+  iTerm2.
 - `ITERM_RUN_DIR` names the directory that holds the shells' named pipes
   (see "How it works"). A shell reads it when it sources the script, so
   set it in the environment before that. The shells and the sender must
@@ -251,8 +274,10 @@ shell refusing requests.
 
 The sender does the following:
 
-1. It asks iTerm2 for the frontmost session's foreground process with
-   `osascript`, unless `ITERM_RUN_PID` is set.
+1. It asks iTerm2 for the frontmost session's first process and
+   terminal device with `osascript`, unless `ITERM_RUN_SESSION` is set,
+   and asks `ps` for that process's terminal and the terminal's
+   foreground process group.
 2. It creates its reply pipe and opens it for reading and writing, so
    that the shell's attempt to answer finds a reader.
 3. It opens the shell's request pipe without waiting. That fails if
@@ -290,7 +315,7 @@ python3 -m unittest test_iterm_run
 ```
 
 The tests start real interactive zsh shells under pseudo-terminals with
-a temporary `ITERM_RUN_DIR`, and send them commands with `ITERM_RUN_PID`,
+a temporary `ITERM_RUN_DIR`, and send them commands with `ITERM_RUN_SESSION`,
 so they need macOS, zsh and `perl` but not iTerm2. They check the
 terminal output by rendering it into screen lines with `vt.py`, a small
 renderer for the output zsh's line editor produces.

@@ -2,11 +2,13 @@
 # Usage: iterm-run COMMAND
 #
 # Runs COMMAND in the current session of iTerm2's frontmost window if, and
-# only if, that session's foreground process is a zsh that sourced
-# iterm-run.zsh and is idle at an empty prompt. Prints "ran" and exits 0
-# once the command has started, or prints "busy" and exits 1. ITERM_RUN_PID
-# names a shell to use instead of asking iTerm2, and ITERM_RUN_DIR names the
-# directory of the shells' FIFOs. README.md describes the protocol.
+# only if, the foreground process group of that session's terminal is led
+# by a zsh that sourced iterm-run.zsh and is idle at an empty prompt. Prints
+# "ran" and exits 0 once the command has started, or prints "busy" and
+# exits 1. ITERM_RUN_SESSION names a session, as the process ID of its first
+# process and its terminal device separated by a space, to use instead of
+# asking iTerm2, and ITERM_RUN_DIR names the directory of the shells' FIFOs.
+# README.md describes the protocol.
 
 zmodload zsh/system
 unsetopt multibyte
@@ -20,9 +22,22 @@ if [[ $# -ne 1 || -z $1 || $1 == *$'\n'* ]] || (( $#request >= 512 )); then
   print -u2 "usage: iterm-run COMMAND (one line, under $(( 511 - $#reply )) bytes)"
   exit 2
 fi
-pid=${ITERM_RUN_PID:-$(osascript \
+session=${ITERM_RUN_SESSION:-$(osascript \
   -e 'if application "iTerm2" is not running then error "iTerm2 is not running"' \
-  -e 'tell application "iTerm2" to tell current session of current window to return variable named "jobPid"')} || exit 2
+  -e 'tell application "iTerm2" to tell current session of current window to return (variable named "pid") & " " & tty')} || exit 2
+first=${session%% *}
+if [[ $first != <1-> || ${session#* } != /dev/* ]]; then
+  print -ru2 -- "iterm-run: not a process ID and a terminal: $session"
+  exit 2
+fi
+# The kernel reports the terminal of the session's first process, and the
+# foreground process group of that terminal, as they are at this moment. A
+# shell with job control leads that group while it waits at its prompt, so
+# the group's ID is the shell's process ID. After a session ends, its first
+# process is gone, or its ID usually belongs to a process on another
+# terminal.
+ps -o tty=,tpgid= -p $first | read -r tty pid
+[[ /dev/$tty == ${session#* } ]] || pid=
 
 mkdir -p -m 700 -- $dir || exit 2
 trap 'exit 1' INT TERM HUP
@@ -33,9 +48,10 @@ mkfifo -m 600 -- $reply || exit 2
 # the reply FIFO finds a reader.
 sysopen -r -w -u rfd -- $reply || exit 2
 
-# The open fails when the foreground process is not a listening shell, or
-# is one that is running a command.
-if ! sysopen -w -o nonblock -u wfd -- $dir/$pid 2>/dev/null; then
+# There is no group when the session has ended. The open fails when the
+# group's leader is not a listening shell, or is one that is running a
+# command.
+if [[ -z $pid ]] || ! sysopen -w -o nonblock -u wfd -- $dir/$pid 2>/dev/null; then
   print busy
   exit 1
 fi

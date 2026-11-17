@@ -1,8 +1,8 @@
 # Runs commands that other programs send to this shell, but only while the
 # shell is idle at an empty primary prompt. Nothing is typed into the
 # terminal: the line editor's handler runs the command itself. Senders find
-# the shell by its process ID, which iTerm2 reports as the session's jobPid
-# while the shell is the terminal's foreground process. Source this file
+# the shell by its process ID, which is the ID of the terminal's foreground
+# process group while the shell waits at its prompt. Source this file
 # from ~/.zshrc; the sender is the iterm-run script. ITERM_RUN_DIR, if set,
 # names the directory of the FIFOs. README.md describes the protocol.
 
