@@ -166,8 +166,11 @@ Sessions with user activity but no priced requests can appear with zero cost.
 The dollar amounts are **API-equivalent estimates**, not subscription invoices
 or quota percentages. `rates.json` records the pricing snapshot and source
 links. Update it, or pass `--rates /path/to/rates.json`, when model prices
-change. A model with no catalog entry remains explicitly unpriced; its request
-count and tokens are retained rather than treated as free.
+change. If any request in a report's interval comes from a model with no
+catalog entry, that report fails, and the error names each missing model and
+its request count. With `--ignore-missing-prices`, those requests are reported
+as unpriced instead; their request counts and tokens are retained rather than
+treated as free.
 
 The `codex-auto-review` alias uses GPT-5.6 Luna rates, based on
 [OpenAI's July 30, 2026 announcement](https://x.com/OpenAI/status/2082878180478910571).
@@ -194,7 +197,10 @@ The readers deduplicate streamed records and copied fork history. Codex uses
 response IDs when present, with support for older cumulative token
 notifications. Cached input and reasoning output are subsets of Codex's input
 and output totals; they are not added twice. The catalog supports long-context
-and service-tier multipliers. Claude accounting includes cache writes by TTL,
+and service-tier multipliers. A Claude model whose catalog entry has a
+`long_context` object is charged that object's rates for every part of a
+request whose prompt (uncached input, cache reads, and cache writes together)
+exceeds its `threshold`. Claude accounting includes cache writes by TTL,
 cache reads, output, and recorded server-side web searches. When an older Claude
 record omits the cache-write TTL breakdown, it uses the standard five-minute
 write rate.

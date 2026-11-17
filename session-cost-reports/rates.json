@@ -1,5 +1,5 @@
 {
-  "checked": "2026-09-24",
+  "checked": "2026-11-17",
   "services": {
     "claude": {
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
@@ -31,6 +31,28 @@
           "write_1h": 20,
           "cached": 1,
           "output": 50
+        },
+        "claude-sonnet-5-5": {
+          "input": 2,
+          "write_5m": 2.5,
+          "write_1h": 4,
+          "cached": 0.1,
+          "output": 10
+        },
+        "claude-haiku-5-5": {
+          "input": 0.1,
+          "write_5m": 0.125,
+          "write_1h": 0.2,
+          "cached": 0.01,
+          "output": 0.5,
+          "long_context": {
+            "threshold": 100000,
+            "input": 0.5,
+            "write_5m": 0.625,
+            "write_1h": 1,
+            "cached": 0.05,
+            "output": 2.5
+          }
         },
         "claude-sonnet-5": {
           "input": 2,
@@ -79,6 +101,22 @@
     "codex": {
       "source": "https://developers.openai.com/api/docs/pricing",
       "models": {
+        "gpt-6.2-sol": {
+          "input": 2,
+          "cached": 0.1,
+          "write": 2.5,
+          "output": 10,
+          "long_context_threshold": 272000,
+          "fast_multiplier": 2
+        },
+        "gpt-6.1-sol": {
+          "input": 2,
+          "cached": 0.1,
+          "write": 2.5,
+          "output": 10,
+          "long_context_threshold": 272000,
+          "fast_multiplier": 2
+        },
         "gpt-6-astra": {
           "input": 10,
           "cached": 1,

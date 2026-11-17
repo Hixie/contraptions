@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate local Claude and Codex reports for effective quota windows."""
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 import json
 import os
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo
 import claude_context
 import claude_reader
 import codex_reader
-from reporting import (aggregate, claude_logs, compact_quotas, iso,
+from reporting import (aggregate, claude_logs, compact_quotas, iso, model_rates,
                        detected_windows, select_window, save_report, scan_codex)
 
 
@@ -83,6 +84,9 @@ def main(argv=None):
                         help='In Claude cost breakdowns, replace path components that name parallel checkouts, '
                              'such as /B0/ or the .Z of labs.Z/, with /.../')
     parser.add_argument('--rates', type=Path, default=Path(__file__).with_name('rates.json'), help='Versioned USD-per-million-token price catalog')
+    parser.add_argument('--ignore-missing-prices', action='store_true',
+                        help='Report requests from models missing from the price catalog as unpriced '
+                             'instead of failing')
     args = parser.parse_args(argv)
     if args.window and (args.claude_window or args.codex_window):
         parser.error('--window cannot be combined with explicit --claude-window or --codex-window bounds')
@@ -143,6 +147,11 @@ def main(argv=None):
                         records, names, diagnostics = claude_reader.read(root.expanduser() / 'projects',
                             home / 'Library/Application Support/Claude/claude-code-sessions',
                             window['start'], window['end'], asof, titles)
+                    missing = Counter(r['model'] for r in records if model_rates(service, r['model'], catalog) is None)
+                    if missing and not args.ignore_missing_prices:
+                        raise ValueError(f'{args.rates} has no price for '
+                                         + ', '.join(f'{m} ({n} requests)' for m, n in missing.most_common())
+                                         + '; add the missing prices, or pass --ignore-missing-prices')
                     breakdown = None
                     if service == 'claude':
                         breakdown = claude_context.attribute(records, catalog, home, root,

@@ -101,6 +101,12 @@ class Accounting(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'inconsistent'):
             price('claude', r, RATES)
 
+    def test_claude_long_prompt_rates_start_above_threshold(self):
+        r = {'response_id': 'r', 'model': 'claude-haiku-5-5', 'usage': {'input_tokens': 1000, 'output_tokens': 1000, 'cache_read_input_tokens': 89_000, 'cache_creation_input_tokens': 10_000}}
+        self.assertAlmostEqual(price('claude', r, RATES), .00274)
+        r['usage']['input_tokens'] = 1001
+        self.assertAlmostEqual(price('claude', r, RATES), .0137005)
+
     def test_unpriced_remains_null(self):
         r = {'response_id': 'r', 'session_id': ROOT, 'model': 'future-model', 'usage': {'input_tokens': 42}, 'footer': '🧱', 'subagent': False}
         report = aggregate('codex', [r], {ROOT: ('Name', 'first_user')}, {'start': 1, 'end': 2}, RATES, {})

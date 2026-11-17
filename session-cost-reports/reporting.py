@@ -370,6 +370,9 @@ def claude_unit_prices(record, catalog):
         return None
     usage = record['usage']
     creation = usage.get('cache_creation_input_tokens', 0) or 0
+    prompt = (usage.get('input_tokens', 0) or 0) + (usage.get('cache_read_input_tokens', 0) or 0) + creation
+    if 'long_context' in rates and prompt > rates['long_context']['threshold']:
+        rates = rates['long_context']
     cache = usage.get('cache_creation') or {}
     one = cache.get('ephemeral_1h_input_tokens', 0) or 0
     five = cache.get('ephemeral_5m_input_tokens', 0) or 0

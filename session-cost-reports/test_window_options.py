@@ -220,7 +220,7 @@ class Percentages(unittest.TestCase):
 
 
 class CommandWindows(unittest.TestCase):
-    def run_report(self, selection=None, only_current=False):
+    def run_report(self, selection=None, only_current=False, models={}, options=()):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             sessions = base / 'codex/sessions'
@@ -233,7 +233,7 @@ class CommandWindows(unittest.TestCase):
                 if only_current and text == 'last':
                     continue
                 events += [
-                    {'type': 'turn_context', 'timestamp': ts, 'payload': {'turn_id': text, 'model': 'gpt-6-astra'}},
+                    {'type': 'turn_context', 'timestamp': ts, 'payload': {'turn_id': text, 'model': models.get(text, 'gpt-6-astra')}},
                     {'type': 'token_usage_record', 'timestamp': ts + 1, 'payload': {
                         'response_id': text, 'thread_id': ROOT, 'session_id': ROOT,
                         'turn_id': text, 'usage': {'input_tokens': 100, 'output_tokens': 10}}},
@@ -243,7 +243,7 @@ class CommandWindows(unittest.TestCase):
                 ]
             (sessions / (ROOT + '.jsonl')).write_text(''.join(json.dumps(e) + '\n' for e in events))
             args = ['--service', 'codex', '--codex-home', str(base / 'codex'), '--output', str(base / 'reports'),
-                    '--as-of', '2001-07-08T00:01:40Z', '--timezone', 'UTC']
+                    '--as-of', '2001-07-08T00:01:40Z', '--timezone', 'UTC', *options]
             if selection:
                 args += ['--window', selection]
             with patch('builtins.print'):
@@ -253,6 +253,16 @@ class CommandWindows(unittest.TestCase):
                         for line in (Path(r['path']) / 'requests.jsonl').read_text().splitlines()]
                         for r in manifest['reports']}
             return status, manifest, requests
+
+    def test_missing_prices_fail_unless_ignored(self):
+        models = {'last': 'future-model'}
+        status, manifest, requests = self.run_report('both', models=models)
+        self.assertEqual((status, requests), (1, {'current': ['current']}))
+        self.assertEqual(len(manifest['errors']), 1)
+        self.assertIn('codex last: ', manifest['errors'][0])
+        self.assertIn('no price for future-model (1 requests)', manifest['errors'][0])
+        status, manifest, requests = self.run_report('both', models=models, options=['--ignore-missing-prices'])
+        self.assertEqual((status, manifest['errors'], requests), (0, [], {'last': ['last'], 'current': ['current']}))
 
     def test_both_windows_have_separate_requests_and_manifest_entries(self):
         status, manifest, requests = self.run_report('both')
