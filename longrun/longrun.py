@@ -33,6 +33,24 @@ WIDTH = 300  # Longer lines are cut in summaries.
 FAILURE = re.compile(r"^(--- )?FAIL(ED)?\b|^error(\[\w+\])?: |: error: |"
                      r"^Test Case '.*' failed|^\*\* (BUILD|TEST) FAILED \*\*")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b\n]*(\x07|\x1b\\)")
+ANSI_BYTES = re.compile(ANSI.pattern.encode())
+# Lines in which a test runner says that a test is still running, and the
+# stack dumps printed with them: the warnings of deno test, cargo test,
+# cargo-nextest and loom's stuck-test plugin, and the output of Python's
+# faulthandler. Each alternative matches from where the warning starts,
+# since the text before it in the line is the command's real output. deno
+# test's starts the line, or follows the `NAME ...` that it writes when
+# the test starts.
+HANG = (r"(^|(?<=\.\.\.))'.*' has been running for over \((\d+m)?\d+s\)$"
+        r"|^test .+ has been running for over \d+ seconds$"
+        r"|^ *(SETUP |TRY \d+ )?SLOW \[> *[\d.]+s\] "
+        r"|stuck-test: "
+        r"|Timeout \(\d+:\d\d:\d\d(\.\d+)?\)!$"
+        r"|^((Current thread|Thread) 0x[0-9a-f]+( \[.*\])?|Stack)"
+        r" \(most recent call first\):$"
+        r'|  File ".*", line (\d+|\?\?\?) in '
+        r"|^  <no Python frame>$|^(  )?\.\.\.$")
+LINE = 4096  # Bytes at the start of a line that are searched for a warning.
 
 
 # Files and directories ------------------------------------------------------
@@ -312,6 +330,46 @@ def duration(seconds: float) -> str:
             else f"{rest // 60}m{rest % 60:02}s")
 
 
+# Hang warnings -------------------------------------------------------------------
+
+def hang_patterns() -> list[re.Pattern]:
+    """HANG, and the regular expression in $LONGRUN_HANG."""
+    return [re.compile(pattern)
+            for pattern in (HANG, os.environ.get("LONGRUN_HANG")) if pattern]
+
+
+def judge(pieces: list[tuple[float, bytes]], hang: list[re.Pattern],
+          ended: bool = True) -> tuple[float | None, bool]:
+    """When the latest real output in a line arrived, or None if it has
+    none, and whether the line holds a hang warning, given the pieces in
+    which the line was read with their arrival times, and whether the
+    line has ended. Without its colour codes, a line holds a warning from
+    the first match of a hang pattern in its first LINE bytes to its end;
+    a pattern can match the end of the line only once the line has ended.
+    Real output is what comes before that, other than white space and
+    colour codes."""
+    line = b"".join(piece for _, piece in pieces)
+    text = ANSI_BYTES.sub(b"", line)
+    head = text[:LINE].rstrip().decode(errors="surrogateescape")
+    if not ended:
+        head += "\0"
+    matches = [next((m.start() for m in p.finditer(head)
+                     if m.end() > m.start()), None) for p in hang]
+    matches = [len(head[:start].encode(errors="surrogateescape"))
+               for start in matches if start is not None]
+    last = len(text[:min(matches, default=len(text))].rstrip()) - 1
+    for code in ANSI_BYTES.finditer(line):
+        if code.start() > last:
+            break
+        last += code.end() - code.start()
+    seen = 0
+    for at, piece in pieces:
+        seen += len(piece)
+        if last >= 0 and seen > last:
+            return at, bool(matches)
+    return None, bool(matches)
+
+
 # Stall reports -------------------------------------------------------------------
 
 def top_of_stack(text: str) -> list[str]:
@@ -369,10 +427,14 @@ def continuing(rundir: str, again: float) -> str:
 
 
 def diagnose(rundir: str, number: int, child: int, quiet: float,
-             again: float, extent: tuple[int, int]) -> str:
-    """Describes a run that has printed nothing for a while: its
-    processes, what each is doing, and how to continue. Processes that
-    run the same command and are doing the same thing are listed once."""
+             again: float, extent: tuple[int, int], heard: int,
+             end: tuple[int, int], warned: bool) -> str:
+    """Describes a run that has stalled: its processes, what each is
+    doing, and how to continue. Processes that run the same command and
+    are doing the same thing are listed once. The run's last output was
+    in line heard, which ends at end (line breaks and bytes in the log
+    up to there), and warned says whether it has printed hang warnings
+    since."""
     table = processes()
     pids = members(table, child, child)
     stacks = os.path.join(rundir, f"stall-{number}")
@@ -405,9 +467,12 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
         alike.setdefault((table[pid].command[:160], tuple(detail)),
                          []).append(pid)
     cpu = sum(table[p].cpu for p in pids)
-    lines = [f"longrun: STALLED, no output for {duration(quiet)}. The command "
-             f"is still running ({count(len(pids), 'process', 'processes')}, {cpu:.0f}% CPU "
-             f"between them)."]
+    first, log, total = log_tail(rundir, extent, 1 << 16)
+    since = f" after its output in line {heard}" * (heard > 0)
+    lines = [f"longrun: STALLED, no output for {duration(quiet)}"
+             f"{f' other than hang warnings{since}' * warned}. The command "
+             f"is still running ({count(len(pids), 'process', 'processes')}, "
+             f"{cpu:.0f}% CPU between them)."]
     for (command, detail), group in alike.items():
         share = sum(table[p].cpu for p in group)
         who = (f"pid {group[0]}" if len(group) == 1 else
@@ -415,12 +480,25 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
                f"{', ...' * (len(group) > 4)})")
         lines.append(f"{who}, {share:.0f}% CPU: {command}")
         lines.extend("    " + line for line in detail)
-    first, log, total = log_tail(rundir, extent, 1 << 16)
     lines.append(f"run: {rundir} (samples in stall-{number}/; the log "
-                 f"has {count(total, 'line')}, ending:)")
-    if log:
-        lines.append(section(log, list(range(max(0, len(log) - 10),
-                                             len(log))), first))
+                 f"has {count(total, 'line')}, ending"
+                 f"{', after its last output' * (warned and heard > 0)}:)")
+    chosen = set(range(max(0, len(log) - 10), len(log)))
+    if warned and heard > first:
+        chosen.update(range(max(0, heard - first - 5),
+                            min(heard - first, len(log))))
+    elif warned:
+        # The last output, from further back than the end of the log that
+        # was read.
+        start, before, _ = log_tail(rundir, end, 1 << 16)
+        if before:
+            lines.append(section(before, list(range(max(0, len(before) - 5),
+                                                    len(before))), start))
+        left = first + min(chosen, default=len(log)) - heard
+        if left > 0:
+            lines.append(f"[{count(left, 'line')} left out]")
+    if chosen:
+        lines.append(section(log, sorted(chosen), first))
     return "\n".join(lines) + "\n" + continuing(rundir, again)
 
 
@@ -453,6 +531,17 @@ class Supervisor:
         self.kill_at: float | None = None  # When to send them SIGKILL.
         self.killed = False
         self.extent = (0, 0)  # Line breaks and bytes in the log.
+        self.hang = hang_patterns()
+        # The pieces of the line the command is writing, with when each
+        # arrived, which are judged when the line ends or a stall report
+        # falls due.
+        self.line: list[tuple[float, bytes]] = []
+        # When the command's latest real output arrived, the line that
+        # holds it, and the line breaks and bytes in the log up to the end
+        # of that line.
+        self.last, self.last_line, self.last_end = 0.0, 0, (0, 0)
+        self.last_warned = False
+        self.judged = 0.0  # When the last piece of self.line judged came.
 
     def watch(self, ident: int, kind: int, flags: int = select.KQ_EV_ADD,
               fflags: int = 0) -> None:
@@ -473,6 +562,9 @@ class Supervisor:
             self.watch(sig, select.KQ_FILTER_SIGNAL)
         output = open(os.path.join(self.rundir, "log"), "ab", buffering=0)
         self.log = open(os.path.join(self.rundir, "log"), "rb")
+        self.watch(self.log.fileno(), select.KQ_FILTER_VNODE,
+                   select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                   select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)
         try:
             self.child = subprocess.Popen(
                 self.spec["argv"], cwd=self.spec["cwd"], env=env,
@@ -487,9 +579,6 @@ class Supervisor:
             output.close()
         self.state.update(child=self.child.pid, owner=self.spec["owner"])
         self.save()
-        self.watch(self.log.fileno(), select.KQ_FILTER_VNODE,
-                   select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                   select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)
         self.watch(self.listener.fileno(), select.KQ_FILTER_READ)
         self.watch(self.reports[0], select.KQ_FILTER_READ)
         try:
@@ -502,7 +591,7 @@ class Supervisor:
                        fflags=select.KQ_NOTE_EXIT)
         except ProcessLookupError:
             self.end("its owner had already exited")
-        self.heard()
+        self.heard(time.monotonic(), 0, (0, 0), False)
         while self.child.returncode is None or (self.ending and
                                                 not self.killed):
             deadlines = [t for t in (self.kill_at, self.stall_at())
@@ -515,25 +604,46 @@ class Supervisor:
             if self.kill_at is not None and now >= self.kill_at:
                 self.kill()
             elif self.stall_at() is not None and now >= self.stall_at():
-                self.stall(now - self.last)
+                newlines, size = self.listen()
+                at, warned = judge(self.line, self.hang, False)
+                self.judged = self.line[-1][0] if self.line else 0.0
+                if at is not None:
+                    self.heard(at, newlines + 1, (newlines, size), warned)
+                else:
+                    self.last_warned |= warned
+                if now >= self.stall_at():
+                    self.stall(now - self.last)
         self.finish(self.child.returncode)
         self.log.close()
 
     def stall_at(self) -> float | None:
+        """When to report a stall, or to judge the line the command is
+        writing, if it would be due by then were it real output."""
         if (self.due is None or "reason" in self.state
                 or self.child.returncode is not None):
             return None
+        if self.line and self.line[-1][0] > self.judged:
+            return min(self.due, self.line[-1][0] + self.spec["quiet"])
         return self.due
 
-    def heard(self) -> None:
-        """Counts the command's silence from now, starting the intervals
-        between stall reports again."""
-        self.last, self.interval = time.monotonic(), self.spec["quiet"]
-        self.due = self.last + self.interval
+    def heard(self, at: float, line: int, end: tuple[int, int],
+              warned: bool) -> None:
+        """Counts the command's silence from its real output at time at,
+        and starts the intervals between stall reports again. The output
+        is in the given line of the log, which ends at end (line breaks
+        and bytes in the log up to there), and which holds a hang warning
+        after the output if warned. For output counted already, this only
+        records where its line ends now and whether it holds a warning."""
+        if (line, at) > (self.last_line, self.last):
+            self.last, self.last_line = at, line
+            self.interval = self.spec["quiet"]
+            self.due = self.last + self.interval
+        if line == self.last_line:
+            self.last_end, self.last_warned = end, warned
 
     def handle(self, event: select.kevent) -> None:
         if event.filter == select.KQ_FILTER_VNODE:
-            self.heard()
+            self.listen()
         elif event.filter == select.KQ_FILTER_READ:
             if event.ident == self.listener.fileno():
                 self.accept()
@@ -566,17 +676,56 @@ class Supervisor:
             if not self.spec["keep"]:
                 self.terminate(left)
 
-    def measure(self) -> tuple[int, int]:
-        """Counts what the command has added to the log since the last
-        count, up to the log's size now, and returns the line breaks and
-        bytes in the log up to there."""
+    def listen(self) -> tuple[int, int]:
+        """Reads what the command has added to the log, up to the log's
+        size now, counts the silence from the latest real output in the
+        lines that it ends, and returns the line breaks and bytes in the
+        log up to there. The line the command is still writing is judged
+        when it ends or when a stall report falls due."""
+        now = time.monotonic()
         newlines, size = self.extent
         end = os.fstat(self.log.fileno()).st_size
         while size < end and (data := self.log.read(min(1 << 20,
                                                          end - size))):
-            newlines, size = newlines + data.count(b"\n"), size + len(data)
+            ended = data.rfind(b"\n")
+            if ended >= 0:
+                self.ended(now, data[:ended], newlines, size)
+                self.line = []
+                newlines += data.count(b"\n")
+            rest = data[ended + 1:]
+            size += len(data)
+            if rest and len(ANSI_BYTES.sub(b"", b"".join(
+                    piece for _, piece in self.line))) < LINE:
+                self.line.append((now, rest))
+            elif rest:
+                # Past where a warning can start, only the start is kept.
+                at, warned = judge(self.line + [(now, rest)], self.hang,
+                                   False)
+                if at == now:
+                    self.heard(now, newlines + 1, (newlines, size), warned)
         self.extent = (newlines, size)
         return self.extent
+
+    def ended(self, now: float, data: bytes, newlines: int,
+              size: int) -> None:
+        """Counts the silence from the latest real output in data, whose
+        lines arrived now and follow the first newlines line breaks and
+        size bytes in the log, the first of them continuing self.line, by
+        looking at the lines from the last, and notes the hang warnings
+        after that output."""
+        line, end, after = newlines + data.count(b"\n") + 1, len(data), False
+        while True:
+            start = data.rfind(b"\n", 0, end) + 1
+            piece, at, warned = data[start:end], None, False
+            if start == 0 or piece.strip():
+                at, warned = judge((self.line if start == 0 else [])
+                                   + [(now, piece)], self.hang)
+            if at is not None:
+                self.heard(at, line, (line, size + end + 1), warned)
+            if at is not None or start == 0:
+                self.last_warned |= after or (at is None and warned)
+                return
+            line, end, after = line - 1, start - 1, after or warned
 
     def save(self) -> None:
         save(self.rundir, "state.json", self.state)
@@ -638,14 +787,16 @@ class Supervisor:
         self.due, again = None, self.interval * 2
         self.interval = again
         self.state["stalls"] += 1
-        number, extent = self.state["stalls"], self.measure()
+        number, extent = self.state["stalls"], self.extent
+        heard, end, warned = self.last_line, self.last_end, self.last_warned
 
         def report() -> None:
             try:
                 text = diagnose(self.rundir, number, self.child.pid, quiet,
-                                again, extent)
+                                again, extent, heard, end, warned)
             except Exception as error:
-                text = (f"longrun: STALLED, no output for {duration(quiet)}. "
+                text = (f"longrun: STALLED, no output for {duration(quiet)}"
+                        f"{' other than hang warnings' * warned}. "
                         f"The command is still running. Describing its "
                         f"processes failed: {error!r}\n"
                         + continuing(self.rundir, again))
@@ -712,7 +863,7 @@ class Supervisor:
                 os.remove(name)
         with open(os.path.join(self.rundir, "result.txt"), "w") as f:
             f.write(summary(self.rundir, self.spec, self.state,
-                            self.measure()))
+                            self.listen()))
         self.save()
         self.tell("done")
 
@@ -775,6 +926,11 @@ def start(argv: list[str], quiet: float, owner: int | None,
         argv = argv[1:]
     if not argv:
         sys.exit("longrun: no command given")
+    try:
+        hang_patterns()
+    except re.error as error:
+        sys.exit(f"longrun: $LONGRUN_HANG is not a regular expression: "
+                 f"{error}")
     display = argv[0] if len(argv) == 1 else shlex.join(argv)
     if len(argv) == 1:
         argv = ["/bin/sh", "-c", argv[0]]

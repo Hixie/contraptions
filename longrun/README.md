@@ -8,7 +8,8 @@ longrun says so again less and less often. The command ends
 when whoever started it is gone.
 
 It works for any command. It knows nothing about any one test suite,
-apart from recognising the summaries that some test runners print.
+apart from recognising the summaries that some test runners print, and
+the lines in which some say that a test has been running for a while.
 
 ## Running it
 
@@ -96,12 +97,12 @@ for the final header only, not for the headers of a run's stages.
 ## Stalls
 
 A run has stalled when it has printed nothing for `--quiet` minutes (10
-by default, and more than 0). longrun then writes a report, and `run` prints it and exits
-with status 75 while the command keeps running. A command that itself
-exits with status 75 is told apart by the first line of the output,
-which says either `STALLED` or how the command ended. The report lists the
-command's processes with their CPU use, and for each one what it is
-doing:
+by default, and more than 0), other than hang warnings. longrun then
+writes a report, and `run` prints it and exits with status 75 while the
+command keeps running. A command that itself exits with status 75 is
+told apart by the first line of the output, which says either `STALLED`
+or how the command ended. The report lists the command's processes with
+their CPU use, and for each one what it is doing:
 
 - For a Python process, the innermost two frames of each thread and the
   innermost frame outside the standard library and installed packages,
@@ -132,18 +133,18 @@ To end it:       longrun stop 0412-093015-pytest-k3v8a2qd
 ```
 
 `wait` blocks again, until the command ends or stalls again. If the
-command prints something, the next stall is reported after `--quiet`
-minutes of silence, as the first was. If it prints nothing, the next
-report comes after twice as long as the time before, counted from when
-`wait` starts: with the default of 10 minutes, `wait` reports the stall
-again after another 20 minutes, then 40, then 80, and so on. Each
-report says how long that is for the next `wait`, if the command stays
-silent. If a new stall happened while nothing was waiting, `wait`
-reports it at once. `stop` ends the command and prints the same result
-as `run` would. A run that was ended this way, or in any of the ways
-listed below, exits with the command's status, or 143
-(128 plus SIGTERM) if the command exited with 0, since it did not
-finish.
+command prints something other than hang warnings, the next stall is
+reported after `--quiet` minutes of silence, as the first was. If it
+prints nothing else, the next report comes after twice as long as the
+time before, counted from when `wait` starts: with the default of 10
+minutes, `wait` reports the stall again after another 20 minutes, then
+40, then 80, and so on. Each report says how long that is for the next
+`wait`, if the command stays silent. If a new stall happened while
+nothing was waiting, `wait` reports it at once. `stop` ends the command
+and prints the same result as `run` would. A run that was ended this
+way, or in any of the ways listed below, exits with the command's
+status, or 143 (128 plus SIGTERM) if the command exited with 0, since it
+did not finish.
 
 Python stacks come from `pystacks/sitecustomize.py`, which longrun puts
 first on the command's `PYTHONPATH`. In each Python process it starts,
@@ -163,6 +164,67 @@ a process whose stacks have not arrived by then is described by its
 root on macOS, which is why longrun asks the process instead. The
 handler is registered without chaining to an earlier one, so that a
 system call it interrupts is restarted rather than failing.
+
+### Hang warnings
+
+Some test runners print a warning when a test has been running for a
+while, and some print every thread's stack with it. Such a warning says
+that the run is not moving, so it does not count as output: the stall
+is reported `--quiet` minutes after the last line that was not one,
+however many warnings followed it. The warnings longrun recognises are:
+
+- deno test's `'NAME' has been running for over (1m0s)`, which it
+  prints 1, 2, 4, 9, 21 and more minutes into a test, at the start of a
+  line or after the `NAME ...` it printed when the test started;
+- cargo test's `test NAME has been running for over 60 seconds`;
+- cargo-nextest's `SLOW [> 60.000s] TEST`;
+- `stuck-test: ` and what follows it in its line, which is how a plugin
+  in one of the projects that use longrun reports a stuck test;
+- Python's faulthandler: `Timeout (0:05:00)!`, which
+  `faulthandler.dump_traceback_later()` and pytest's
+  `faulthandler_timeout` print, and the stack dumps it prints, which
+  are its thread headers, such as
+  `Thread 0x000000016c573000 (most recent call first):`, its frames,
+  such as `  File "a.py", line 3 in f` (a traceback has a comma before
+  `in`), its `  <no Python frame>` lines, and the `...` lines with
+  which it cuts a stack or a list of threads short.
+
+longrun also takes as a warning any line that matches the regular
+expression in `$LONGRUN_HANG`, which `run` checks before it starts the
+command. Blank lines count as neither output nor warnings, and colour
+codes are ignored.
+
+A warning can follow output on the same line, as when deno test has
+printed `NAME ...` as the test started, or pytest has printed its
+progress dots without a line break. The text from the start of the
+warning to the end of the line is the warning. What comes before it is
+output, counted from when it was written, not from when the warning
+was. For this reason each recognised warning is matched from its first
+character, and a pattern in `$LONGRUN_HANG` should be too.
+
+Lines that report a test failed, killed or timed out are output, since
+the run moves on after them: pytest-timeout's, Go's, XCTest's and
+those of the JavaScript test runners.
+
+longrun reads the log as the command writes it. A line is judged when
+it ends. A line that has not ended yet is judged when a report falls
+due, or `--quiet` minutes after its latest part was written, whichever
+comes first. Only the first 4096 bytes of a line, without its colour
+codes, are searched for a warning. A report that follows warnings says
+so, and its excerpt of the log starts with the last 5 lines up to the
+last output, however far back that is:
+
+```
+longrun: STALLED, no output for 10m00s other than hang warnings after its output in line 40. The command is still running (2 processes, 0% CPU between them).
+…
+run: … (samples in stall-1/; the log has 152 lines, ending, after its last output:)
+36| ..............                                       [ 98%]
+…
+40| ....
+[102 lines left out]
+143|   File ".../execnet/gateway_base.py", line 1806 in serve
+…
+```
 
 ## How a run ends
 
@@ -379,10 +441,10 @@ The call blocks until the command ends. A hook gives it the longest
 timeout Claude Code allows, so do not set `timeout` yourself, and do not
 poll, sleep or read the log while it runs.
 
-If the command prints nothing for 10 minutes, the call returns with exit
-status 75 and a report that starts with `STALLED`. The command is still
-running. The report says what each of its processes is doing. Decide at
-once what to do:
+If the command prints nothing but hang warnings for 10 minutes, the
+call returns with exit status 75 and a report that starts with
+`STALLED`. The command is still running. The report says what each of
+its processes is doing. Decide at once what to do:
 
 - If a process is waiting for something that will come, such as a free
   slot in a queue, or is busy in a long silent step, run

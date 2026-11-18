@@ -16,6 +16,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+import unittest.mock
 import zipfile
 
 import longrun
@@ -294,6 +295,188 @@ class Runs(unittest.TestCase):
         self.assertEqual(code, longrun.STALLED)
         self.assertIn("1| middle", report)
         self.assertIn(again(2), report)
+        self.longrun("stop", rundir)
+
+    def test_hang_warnings_are_not_output(self):
+        # A warning every half second keeps the command from being silent
+        # for the quiet time, but it is not output.
+        quiet = 0.04 * 60
+        proc, rundir = self.start(
+            "--quiet", "0.04",
+            "printf \"before\\n't' has been running for over (1m0s)\\n\"; "
+            "while :; do sleep 0.5; printf '\\033[0m\\033[1m"
+            "\\033[33m'\\''t'\\'' has been running for over \\033[0m"
+            "\\033[38;5;245m(1m0s)\\033[0m\\033[0m\\n'; done")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertRegex(report, r"^longrun: STALLED, no output for \d+s "
+                                 r"other than hang warnings after its output "
+                                 r"in line 1\. ")
+        self.assertIn("lines, ending, after its last output:)",
+                      report)
+        self.assertIn("1| before", report)
+        # Nor do the warnings start the intervals between reports again.
+        report, code = self.finish(self.client("wait", rundir))
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn(f"after another {longrun.duration(4 * quiet)}.", report)
+        self.longrun("stop", rundir)
+
+    def test_a_warning_after_output_in_its_line_is_not_output(self):
+        proc, rundir = self.start(
+            "--quiet", "0.04", "echo a; printf 'slow ...'; sleep 0.3; "
+            "echo \"'slow' has been running for over (1m0s)\"; sleep 300")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("other than hang warnings after its output in line 2.",
+                      report)
+        self.assertIn("2| slow ...'slow' has been running", report)
+        self.longrun("stop", rundir)
+
+    def test_long_output_before_warnings_is_shown(self):
+        proc, rundir = self.start(
+            "--quiet", "0.04", "echo first; printf '%5000s\\n' '' | tr ' ' x; "
+            "for i in $(seq 30); do echo 'stuck-test: x'; done; sleep 300")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertRegex(report, r"\n 1\| first\n 2\| x+ …\n"
+                                 r"\[20 lines left out\]\n23\| stuck-test: x")
+        self.longrun("stop", rundir)
+
+    def test_reports_at_the_edges_of_what_they_read(self):
+        for command, expected, unexpected in (
+                # The line of output ends just inside the end of the log
+                # that the report reads, and is left out of it.
+                ("echo before; for i in $(seq 4681); do "
+                 "echo 'stuck-test: x'; done; sleep 300",
+                 "\n1| before\n[4671 lines left out]\n4673| stuck", None),
+                # Blank lines are not warnings.
+                ("echo x; head -c 70000 /dev/zero | tr '\\0' '\\n'; sleep 300",
+                 "STALLED, no output for 2s. ", "warnings"),
+                # A warning longer than the end of the log that is read.
+                ("echo before; printf 'stuck-test: '; "
+                 "head -c 70000 /dev/zero | tr '\\0' x; echo; sleep 300",
+                 "\n1| before\n", "failed"),
+                # Output that a terminal would show as blank.
+                ("printf 'x stuck-test: y\\r   \\n'; sleep 300",
+                 "other than hang warnings after its output in line 1.",
+                 "failed"),
+                # pytest's dots, while their line has not ended.
+                ("echo a; sleep 1; printf ...; sleep 300",
+                 "no output for 2s. ", "warnings"),
+                # Many colour codes before a warning, which are not
+                # output.
+                ("for i in $(seq 500); do printf '\\033[32m.\\033[0m'; done; "
+                 "printf .; echo 'stuck-test: x'; sleep 300",
+                 "other than hang warnings after its output in line 1.",
+                 None)):
+            proc, rundir = self.start("--quiet", "0.04", command)
+            report, code = self.finish(proc)
+            self.assertEqual(code, longrun.STALLED, report)
+            self.assertIn(expected, report)
+            if unexpected:
+                self.assertNotIn(unexpected, report)
+            self.longrun("stop", rundir)
+
+    def test_a_warning_that_grows_past_where_warnings_are_looked_for(self):
+        proc, rundir = self.start(
+            "--quiet", "0.04", "printf 'stuck-test: x'; while :; do "
+            "head -c 1000 /dev/zero | tr '\\0' x; sleep 0.5; done")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("no output for 2s other than hang warnings.", report)
+        self.longrun("stop", rundir)
+
+    def test_a_warning_that_ends_a_line_judged_before(self):
+        # The report that falls due for `a` judges the unfinished line of
+        # dots, and the warning that ends that line comes after it.
+        proc, rundir = self.start(
+            "--quiet", "0.1", "echo a; sleep 2; printf ....; sleep 5; "
+            "echo 'stuck-test: x has run for 600 seconds'; sleep 300")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("other than hang warnings after its output in line 2.",
+                      report)
+        self.assertIn("2| ....stuck-test: x has run for 600 seconds", report)
+        self.longrun("stop", rundir)
+
+    def test_output_in_an_unfinished_line_after_a_stall(self):
+        # After a report, the next one comes the quiet time after output,
+        # even if the output does not end its line.
+        gate = self.fifo("gate")
+        proc, rundir = self.start("--quiet", "0.04",
+                                  f"read x < {gate}; printf .; sleep 300")
+        self.assertEqual(self.finish(proc)[1], longrun.STALLED)
+        waiting = self.client("wait", rundir)
+        self.release(gate)
+        report, code = self.finish(waiting)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("STALLED, no output for 2s.", report)
+        self.longrun("stop", rundir)
+
+    def test_python_stack_dumps_are_not_output(self):
+        proc, rundir = self.start(
+            "--quiet", "0.04", "--", sys.executable, "-c",
+            "import faulthandler, time; "
+            "faulthandler.dump_traceback_later(0.5, repeat=True); "
+            "time.sleep(300)")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("no output for 2s other than hang warnings. ", report)
+        self.assertRegex(report, r"\| Timeout \(0:00:00\.500000\)!")
+        self.longrun("stop", rundir)
+
+    def test_output_beside_hang_warnings_is_output(self):
+        for start, command in (
+                # Output and then a warning, in one write.
+                ("", r"""printf "real\n'w' has been running for over """
+                     r"""(1m0s)\n" """),
+                # A line that has not ended yet.
+                ("", "printf ."),
+                # A line that has not ended yet, and is longer than
+                # longrun looks in for a warning.
+                (f"printf '%{longrun.LINE}s' '' | tr ' ' .; ", "printf ."),
+                # Output before a warning in the same line.
+                ("", r"printf '.stuck-test: x has run for 600 seconds\n'")):
+            result = self.longrun(
+                "run", "--quiet", "0.04",
+                f"{start}for i in $(seq 10); do {command}; sleep 0.5; done; "
+                f"echo")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertNotIn("STALLED", result.stdout)
+
+    def test_hang_warnings_from_the_environment(self):
+        command = "for i in $(seq 10); do echo tick; sleep 0.5; done"
+        result = self.longrun("run", "--quiet", "0.04", command)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("STALLED", result.stdout)
+        self.env["LONGRUN_HANG"] = "^tick$"
+        result = self.longrun("run", "--quiet", "0.04",
+                              "while :; do echo tick; sleep 0.5; done")
+        self.assertEqual(result.returncode, longrun.STALLED, result.stdout)
+        self.assertIn("other than hang warnings. ", result.stdout)
+        self.longrun("stop", re.search(r"longrun stop (\S+)",
+                                       result.stdout)[1])
+        runs = os.listdir(self.base)
+        self.env["LONGRUN_HANG"] = "("
+        result = self.longrun("run", "echo hi")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("$LONGRUN_HANG is not a regular expression",
+                      result.stderr)
+        self.assertEqual(os.listdir(self.base), runs)
+
+    def test_output_before_many_warnings_is_shown(self):
+        # More warnings than the report reads from the end of the log.
+        proc, rundir = self.start(
+            "--quiet", "0.04", "echo before; echo during; "
+            "for i in $(seq 2000); do "
+            "echo 'stuck-test: tests/a.py::test_x has run for 300 seconds'; "
+            "done; sleep 300")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("other than hang warnings after its output in line 2.",
+                      report)
+        self.assertRegex(report, r"\n1\| before\n2\| during\n"
+                                 r"\[1990 lines left out\]\n1993\| stuck")
         self.longrun("stop", rundir)
 
     def test_stall_while_detached_is_reported_on_wait(self):
@@ -1129,6 +1312,150 @@ class Summaries(unittest.TestCase):
             f.write(b"later\n")
         self.assertEqual(longrun.log_tail(rundir, extent, 100)[1][-1],
                          "line 200000")
+
+
+class HangWarnings(unittest.TestCase):
+    def real(self, *pieces):
+        """When the real output in a line made of pieces arrived, piece n
+        arriving at time n, or None."""
+        return self.judge(*pieces)[0]
+
+    def judge(self, *pieces):
+        return longrun.judge(
+            [(n, piece.encode()) for n, piece in enumerate(pieces, 1)],
+            longrun.hang_patterns())
+
+    def test_warnings_and_stack_dumps(self):
+        for line in (
+                "'slow test' has been running for over (1m0s)",
+                "\x1b[0m\x1b[1m\x1b[33m'slow' has been running for over "
+                "\x1b[0m\x1b[38;5;245m(1m0s)\x1b[0m\x1b[0m",
+                "'it's slow' has been running for over (64m0s)",
+                "'a' has been running for over (1s)",
+                "test tests::slow_one has been running for over 60 seconds",
+                "        SLOW [> 60.000s] my-crate tests::slow_one",
+                "  TRY 2 SLOW [>120.000s] my-crate tests::slow_one",
+                "stuck-test: tests/a.py::test_x has run for 300 seconds; "
+                "every thread's stack follows, and the test carries on.",
+                "stuck-test: end of the stacks for tests/a.py::test_x.",
+                "stuck-test: tests/a.py::test_x has run for 600 seconds; it "
+                "started no process that is still running, so nothing is "
+                "killed.",
+                "Timeout (0:05:00)!",
+                "Timeout (0:00:00.300000)!",
+                "Timeout (0:05:00)!\r",
+                "Thread 0x000000016c573000 (most recent call first):",
+                "Thread 0x000000016de17000 [worker] (most recent call first):",
+                "Current thread 0x00000001f1fae180 (most recent call first):",
+                "Stack (most recent call first):",
+                '  File "/x/lib/python3.12/threading.py", line 1012 in run',
+                '  File "<string>", line 5 in f',
+                "  <no Python frame>",
+                "  ...",
+                "",
+                "   "):
+            self.assertIsNone(self.real(line), line)
+
+    def test_output(self):
+        for line in (
+                "....F...........                 [ 43%]",
+                "adds ... ok (1m5s)",
+                " ok (4s)",
+                '  File "x.py", line 3, in f',
+                "1 passed in 2.3s",
+                "     TIMEOUT [ 60.001s] my-crate tests::slow_one",
+                " TERMINATING [>120.000s] my-crate tests::slow_one",
+                "panic: test timed out after 10m0s",
+                "+" * 35 + " Timeout " + "+" * 35,
+                "Test Case '-[A b]' exceeded execution time allowance of 10 "
+                "minutes.",
+                "the build has been running for a while"):
+            self.assertEqual(self.judge(line), (1, False), line)
+        # pytest's dot before faulthandler's frame, from another process.
+        self.assertEqual(self.judge('.  File "x.py", line 3 in f'),
+                         (1, True))
+
+    def test_output_before_a_warning_counts_from_when_it_arrived(self):
+        # Deno writes a test's name when it starts, and its warning on the
+        # same line a minute later.
+        self.assertEqual(
+            self.real("slow ...", "'slow' has been running for over (1m0s)"),
+            1)
+        # pytest writes its dots without a line break.
+        self.assertEqual(self.real(
+            "..", "..", "stuck-test: x has run for 600 seconds; it started "
+            "no process that is still running, so nothing is killed."), 2)
+        # Text that arrives with the warning is part of it.
+        self.assertIsNone(self.real(
+            "test x has been running ", "for over 60 seconds"))
+        self.assertEqual(self.real(
+            "a ...", "'a' has been running", " for over (1m0s)"), 1)
+        # A quote in the output before deno's warning starts nothing.
+        self.assertEqual(self.real(
+            "it's", " a ...", "'it's a' has been running for over (1m0s)"),
+            2)
+        # Nor does a colour code split between two reads.
+        self.assertIsNone(self.real(
+            "\x1b[3", "3m'slow' has been running for over (1m0s)\x1b[0m"))
+        self.assertEqual(self.real(
+            "a ...", "\x1b[0m\x1b[1m\x1b[33m'a' has been running for over "
+            "\x1b[0m\x1b[38;5;245m(1m0s)\x1b[0m\x1b[0m"), 1)
+
+    def test_lines_that_hold_warnings(self):
+        self.assertEqual(self.judge("slow ...", "'slow' has been running "
+                                    "for over (1m0s)"), (1, True))
+        self.assertEqual(self.judge("stuck-test: x"), (None, True))
+        self.assertEqual(self.judge("ok"), (1, False))
+        self.assertEqual(self.judge(""), (None, False))
+        # Colour codes are neither output nor warnings.
+        self.assertEqual(self.judge("\x1b[2K\x1b[1G"), (None, False))
+        self.assertEqual(self.judge("abc", "\x1b[0m"), (1, False))
+        # faulthandler's line for more threads than it shows, which
+        # pytest's dots are until their line ends.
+        self.assertEqual(self.judge("..."), (None, True))
+        self.assertEqual(self.judge("...."), (1, False))
+        self.assertEqual(longrun.judge([(1, b"...")], longrun.hang_patterns(),
+                                       False), (1, False))
+        self.assertEqual(longrun.judge([(1, b"stuck-test: x")],
+                                       longrun.hang_patterns(), False),
+                         (None, True))
+        # faulthandler starts its dump in the line pytest is writing.
+        self.assertEqual(self.judge("tests/a.py::test_x ",
+                                    "Timeout (0:00:01.500000)!"), (1, True))
+
+    def test_long_lines(self):
+        # A warning starts in the first LINE bytes of a line, and runs to
+        # the end of it.
+        self.assertEqual(self.real("." * longrun.LINE, "stuck-test: x"), 2)
+        self.assertEqual(self.judge("stuck-test: x", "x" * longrun.LINE),
+                         (None, True))
+        self.assertEqual(self.judge("..", "stuck-test: " + "x" * longrun.LINE),
+                         (1, True))
+        self.assertIsNone(self.real(" " * longrun.LINE, "  \n"))
+        # Only the start of a line is searched for a warning.
+        self.assertEqual(self.judge("'" + "a" * longrun.LINE + "' has been "
+                                    "running for over (1m0s)"), (1, False))
+        # A long line full of places where deno's warning could start
+        # takes as long to judge as any other.
+        self.assertEqual(self.real("...'" * 250000), 1)
+
+    def test_hang_warnings_from_the_environment(self):
+        self.assertEqual(self.real("tick"), 1)
+        with unittest.mock.patch.dict(os.environ, {"LONGRUN_HANG": "^tick$"}):
+            self.assertIsNone(self.real("tick"))
+            self.assertEqual(self.real("ticks"), 1)
+            self.assertIsNone(self.real("Timeout (0:05:00)!"))
+        with unittest.mock.patch.dict(os.environ, {"LONGRUN_HANG": "(?i)^t"}):
+            self.assertIsNone(self.real("Tick"))
+        # A pattern that matches nothing in a line does not make it a
+        # warning, though it matches the empty string there.
+        with unittest.mock.patch.dict(os.environ,
+                                      {"LONGRUN_HANG": r"^\w+ hängt$"}):
+            self.assertEqual(self.judge("Prüfung hängt"), (None, True))
+            self.assertEqual(self.judge("Prüfung läuft"), (1, False))
+        with unittest.mock.patch.dict(os.environ, {"LONGRUN_HANG": "stuck|"}):
+            self.assertEqual(self.judge("hello"), (1, False))
+            self.assertEqual(self.judge("a stuck"), (1, True))
 
 
 if __name__ == "__main__":
