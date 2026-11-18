@@ -6,21 +6,25 @@ See README.md."""
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import select
 import shlex
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from typing import NamedTuple
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -101,6 +105,176 @@ def save(rundir: str, name: str, value: dict) -> None:
 def read(path: str) -> str:
     with open(path, errors="replace") as f:
         return f.read()
+
+
+RUN_README = """\
+This directory holds one run of longrun, which runs a long command for
+an agent. longrun's README says what each file here holds, and how to
+read `times`, the record of when the command's output arrived:
+
+https://github.com/Hixie/contraptions/blob/main/longrun/README.md#the-timing-file
+{readme} (section "The timing file")
+"""
+
+
+# The timing file -------------------------------------------------------------
+
+HEADER = struct.Struct("<HH")  # The header's length and each record's.
+RECORD = struct.Struct("<QQqqqQqqQ")
+
+
+class Silence(NamedTuple):
+    """A time without output, in seconds of the monotonic clock, and the
+    line that holds the output before it, or 0 if there was none."""
+    start: float
+    end: float
+    line: int
+
+
+class Record(NamedTuple):
+    """What the supervisor knew of the log at one moment. Times are in
+    seconds of the monotonic clock, except wall."""
+    size: int  # Bytes in the log.
+    lines: int  # Line breaks in the log.
+    at: float  # When the record was written.
+    wall: float  # The same moment, in seconds since the Unix epoch.
+    output: float  # When the last output before then arrived.
+    line: int  # The line that output is in, or 0 before any output.
+    longest: Silence  # The longest silence that had ended by then.
+
+
+def records(rundir: str, limit: int | None = None) -> list[Record]:
+    """The records in the run's timing file, or the first limit of them,
+    without a last record that was cut short. A missing file, one without
+    a whole header, and one whose header gives lengths too short for this
+    version's fields have none."""
+    try:
+        with open(os.path.join(rundir, "times"), "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return []
+    if len(data) < HEADER.size:
+        return []
+    start, step = HEADER.unpack_from(data)
+    if start < HEADER.size or step < RECORD.size:
+        return []
+    found = []
+    for offset in range(start, len(data) - step + 1, step)[:limit]:
+        (size, lines, at, wall, output, line, quiet, heard,
+         before) = RECORD.unpack_from(data, offset)
+        found.append(Record(size, lines, at / 1e9, wall / 1e9, output / 1e9,
+                            line, Silence(quiet / 1e9, heard / 1e9, before)))
+    return found
+
+
+def output_times(pieces: Sequence[tuple[float, bytes]]) -> list[float]:
+    """When each piece of a line that holds output arrived: a byte that
+    is neither white space nor part of a colour code."""
+    line = b"".join(piece for _, piece in pieces)
+    hidden = {i for code in ANSI_BYTES.finditer(line)
+              for i in range(*code.span())}
+    times, offset = [], 0
+    for arrived, piece in pieces:
+        if any(i not in hidden and not line[i:i + 1].isspace()
+               for i in range(offset, offset + len(piece))):
+            times.append(arrived)
+        offset += len(piece)
+    return times
+
+
+def length(silence: Silence) -> float:
+    return silence.end - silence.start
+
+
+def current(record: Record) -> Silence:
+    """The silence that was going on when the record was written."""
+    return Silence(record.output, record.at, record.line)
+
+
+def describe_silence(silence: Silence, start: float) -> str:
+    where = (f"after its output in line {silence.line}" if silence.line
+             else "before any output")
+    began, ended = int(silence.start - start), int(silence.end - start)
+    return (f"{duration(ended - began)} {where} (from {duration(began)} to "
+            f"{duration(ended)} after the start)")
+
+
+MINUTE = 60.0  # Shorter silences are not worth naming.
+SLICES = (10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600,
+          43200, 86400)
+
+
+def rhythm(found: list[Record], now: float) -> str:
+    """How much the command printed in each of at most 12 equal parts of
+    the run so far."""
+    start = found[0].at
+    elapsed = now - start
+    # A last part shorter than a second is counted in the one before.
+    width = next((s for s in SLICES if 12 * s >= elapsed - 1),
+                 SLICES[-1] * math.ceil((elapsed - 1) / (12 * SLICES[-1])))
+    times = [record.at for record in found]
+
+    def printed(moment: float) -> int:
+        index = bisect.bisect_right(times, moment) - 1
+        return found[index].size if index >= 0 else 0
+
+    parts = max(1, math.ceil((elapsed - 1) / width))
+    edges = [start + i * width for i in range(parts)] + [now]
+    amounts = [amount(printed(b) - printed(a))
+               for a, b in zip(edges, edges[1:])]
+    text = (f"Bytes written to it in each {duration(width)} since the run "
+            f"started: "
+            f"{', '.join(amounts)}")
+    if now - edges[-2] < width:
+        text += f" (the last part covers only {duration(now - edges[-2])})"
+    return text + "."
+
+
+def amount(n: float) -> str:
+    """A number of bytes, shortened with K, M or G."""
+    for unit in ("", "K", "M", "G"):
+        text = f"{n:.{int(n < 9.95 and unit != '')}f}"
+        if float(text) < 1000 or unit == "G":
+            break
+        n /= 1000
+    return text + unit
+
+
+def analysis(found: list[Record], lines: int) -> str:
+    """For a stall report written at the time of the last record, about a
+    log of the given number of lines: how much the command printed and
+    when, and how the silence now compares with the earlier ones."""
+    start, last = found[0].at, found[-1]
+    text = [f"The log so far: {amount(last.size)}B in {count(lines, 'line')} "
+            f"over {duration(last.at - start)}. " + rhythm(found, last.at)]
+    if not last.line:
+        text.append("This silence started when the run did.")
+    elif length(last.longest) < MINUTE:
+        text.append("Before this silence, the command never went a minute "
+                    "without output.")
+    else:
+        text.append("Before this silence, the longest silence was "
+                    + describe_silence(last.longest, start) + ".")
+    text.append("Each line of the log below starts with how long after the "
+                "start it was complete.")
+    return "\n".join(text)
+
+
+def stamps(found: list[Record], first: int, lines: list[str],
+           extent: tuple[int, int]) -> list[str]:
+    """For each line, how long after the start its last byte was read:
+    the time of the first record whose size includes it. The records
+    reach as far as extent. Without records, nothing."""
+    if not found:
+        return []
+    breaks, sizes = [r.lines for r in found], [r.size for r in found]
+    out = []
+    for i in range(len(lines)):
+        number = first + i + 1
+        index = (bisect.bisect_left(breaks, number) if number <= extent[0]
+                 else bisect.bisect_left(sizes, extent[1]))
+        out.append(duration(found[index].at - found[0].at))
+    return out
 
 
 # Processes -------------------------------------------------------------------
@@ -192,19 +366,21 @@ def clean(raw: str) -> list[str]:
 
 
 def section(lines: list[str], chosen: list[int], first: int = 0,
-            limit: int = 60) -> str:
+            limit: int = 60, times: list[str] | None = None) -> str:
     """The chosen lines, numbered as in the log, where lines[0] is the
     line after the first ones, saying how many lines are left out between
-    them. When more than limit are chosen, the middle ones are left out
-    too."""
+    them, and each after its entry in times if given. When more than
+    limit are chosen, the middle ones are left out too."""
     if len(chosen) > limit:
         chosen = chosen[:limit // 2] + chosen[-(limit // 2):]
     width = len(str(first + len(lines)))
+    wide = max((len(times[i]) for i in chosen), default=0) if times else 0
     out, previous = [], -1
     for i in chosen:
         if previous >= 0 and i > previous + 1:
             out.append(f"[{count(i - previous - 1, 'line')} left out]")
-        out.append(f"{first + i + 1:>{width}}| {lines[i]}")
+        when = f"{times[i]:>{wide}} " if times else ""
+        out.append(f"{when}{first + i + 1:>{width}}| {lines[i]}")
         previous = i
     return "\n".join(out)
 
@@ -292,6 +468,12 @@ def summary(rundir: str, spec: dict, state: dict,
              f"{spec['display']}",
              f"log: {os.path.join(rundir, 'log')} "
              f"({count(total, 'line')})"]
+    found = records(rundir)
+    if found:
+        longest = max(found[-1].longest, current(found[-1]), key=length)
+        if length(longest) >= MINUTE:
+            parts.append("longest silence: "
+                         + describe_silence(longest, found[0].at))
     left = state.get("leftovers", [])
     if left:
         number = count(len(left), "process", "processes")
@@ -428,12 +610,14 @@ def continuing(rundir: str, again: float) -> str:
 
 def diagnose(rundir: str, number: int, child: int, quiet: float,
              again: float, extent: tuple[int, int], heard: int,
-             end: tuple[int, int], warned: bool) -> str:
-    """Describes a run that has stalled: its processes, what each is
-    doing, and how to continue. Processes that run the same command and
-    are doing the same thing are listed once. The run's last output was
-    in line heard, which ends at end (line breaks and bytes in the log
-    up to there), and warned says whether it has printed hang warnings
+             end: tuple[int, int], warned: bool, recorded: int) -> str:
+    """Describes a run that has stalled: when it printed what, from the
+    first `recorded` records of its timing file, the last of which was
+    written for the stall; its processes and what each is doing; and how
+    to continue. Processes that run the same command and are
+    doing the same thing are listed once. The run's last output was in
+    line heard, which ends at end (line breaks and bytes in the log up to
+    there), and warned says whether it has printed hang warnings
     since."""
     table = processes()
     pids = members(table, child, child)
@@ -473,6 +657,9 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
              f"{f' other than hang warnings{since}' * warned}. The command "
              f"is still running ({count(len(pids), 'process', 'processes')}, "
              f"{cpu:.0f}% CPU between them)."]
+    found = records(rundir, recorded)
+    lines.append(analysis(found, total) if found else
+                 "longrun could not record when the output arrived.")
     for (command, detail), group in alike.items():
         share = sum(table[p].cpu for p in group)
         who = (f"pid {group[0]}" if len(group) == 1 else
@@ -492,13 +679,15 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
         # was read.
         start, before, _ = log_tail(rundir, end, 1 << 16)
         if before:
-            lines.append(section(before, list(range(max(0, len(before) - 5),
-                                                    len(before))), start))
+            lines.append(section(
+                before, list(range(max(0, len(before) - 5), len(before))),
+                start, times=stamps(found, start, before, end)))
         left = first + min(chosen, default=len(log)) - heard
         if left > 0:
             lines.append(f"[{count(left, 'line')} left out]")
     if chosen:
-        lines.append(section(log, sorted(chosen), first))
+        lines.append(section(log, sorted(chosen), first,
+                             times=stamps(found, first, log, extent)))
     return "\n".join(lines) + "\n" + continuing(rundir, again)
 
 
@@ -539,9 +728,20 @@ class Supervisor:
         # When the command's latest real output arrived, the line that
         # holds it, and the line breaks and bytes in the log up to the end
         # of that line.
-        self.last, self.last_line, self.last_end = 0.0, 0, (0, 0)
+        self.last, self.last_line, self.last_end = time.monotonic(), 0, (0, 0)
         self.last_warned = False
         self.judged = 0.0  # When the last piece of self.line judged came.
+        # The longest time between two pieces of real output, or between
+        # the start and the first, which is none until the run starts.
+        self.longest = Silence(self.last, self.last, 0)
+        # The timing file, what its last record says, when that was
+        # written, when the next is due, which is None unless something
+        # has changed since, and how many records it holds.
+        self.timing_fd: int | None = None
+        self.recorded: tuple[int, int, float, int, Silence] | None = None
+        self.recorded_at = -1.0
+        self.record_at: float | None = None
+        self.records_written = 0
 
     def watch(self, ident: int, kind: int, flags: int = select.KQ_EV_ADD,
               fflags: int = 0) -> None:
@@ -565,6 +765,14 @@ class Supervisor:
         self.watch(self.log.fileno(), select.KQ_FILTER_VNODE,
                    select.KQ_EV_ADD | select.KQ_EV_CLEAR,
                    select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)
+        with contextlib.suppress(OSError):
+            self.timing_fd = os.open(os.path.join(self.rundir, "times"),
+                                     os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                                     0o644)
+        self.append(HEADER.pack(HEADER.size, RECORD.size))
+        self.heard(time.monotonic(), 0, (0, 0), False)
+        self.longest = Silence(self.last, self.last, 0)
+        self.write_record()
         try:
             self.child = subprocess.Popen(
                 self.spec["argv"], cwd=self.spec["cwd"], env=env,
@@ -591,11 +799,10 @@ class Supervisor:
                        fflags=select.KQ_NOTE_EXIT)
         except ProcessLookupError:
             self.end("its owner had already exited")
-        self.heard(time.monotonic(), 0, (0, 0), False)
         while self.child.returncode is None or (self.ending and
                                                 not self.killed):
-            deadlines = [t for t in (self.kill_at, self.stall_at())
-                         if t is not None]
+            deadlines = [t for t in (self.kill_at, self.stall_at(),
+                                     self.record_at) if t is not None]
             wait = (max(0.0, min(deadlines) - time.monotonic())
                     if deadlines else None)
             for event in self.kq.control(None, 64, wait):
@@ -604,15 +811,11 @@ class Supervisor:
             if self.kill_at is not None and now >= self.kill_at:
                 self.kill()
             elif self.stall_at() is not None and now >= self.stall_at():
-                newlines, size = self.listen()
-                at, warned = judge(self.line, self.hang, False)
-                self.judged = self.line[-1][0] if self.line else 0.0
-                if at is not None:
-                    self.heard(at, newlines + 1, (newlines, size), warned)
-                else:
-                    self.last_warned |= warned
+                self.listen()
+                self.judge_line(False)
                 if now >= self.stall_at():
                     self.stall(now - self.last)
+            self.record()
         self.finish(self.child.returncode)
         self.log.close()
 
@@ -627,17 +830,26 @@ class Supervisor:
         return self.due
 
     def heard(self, at: float, line: int, end: tuple[int, int],
-              warned: bool) -> None:
+              warned: bool,
+              pieces: Sequence[tuple[float, bytes]] = ()) -> None:
         """Counts the command's silence from its real output at time at,
         and starts the intervals between stall reports again. The output
         is in the given line of the log, which ends at end (line breaks
         and bytes in the log up to there), and which holds a hang warning
-        after the output if warned. For output counted already, this only
-        records where its line ends now and whether it holds a warning."""
-        if (line, at) > (self.last_line, self.last):
-            self.last, self.last_line = at, line
-            self.interval = self.spec["quiet"]
-            self.due = self.last + self.interval
+        after the output if warned. The pieces of the line that hold
+        output and arrived before at count too, so that the silences
+        between them are counted. For output counted already, this only records
+        where its line ends now and whether it holds a warning."""
+        for moment in [arrived for arrived in output_times(pieces)
+                       if arrived < at] + [at]:
+            if (line, moment) > (self.last_line, self.last):
+                if line:
+                    self.longest = max(
+                        self.longest, Silence(self.last, moment,
+                                              self.last_line), key=length)
+                self.last, self.last_line = moment, line
+                self.interval = self.spec["quiet"]
+                self.due = self.last + self.interval
         if line == self.last_line:
             self.last_end, self.last_warned = end, warned
 
@@ -666,6 +878,9 @@ class Supervisor:
         leaves."""
         self.child.wait()
         self.ending.discard(self.child.pid)
+        self.listen()
+        self.judge_line(True)
+        self.write_record()
         table = processes()
         left = [pid for pid, v in table.items() if v.pgid == self.child.pid]
         if "reason" in self.state:
@@ -699,10 +914,11 @@ class Supervisor:
                 self.line.append((now, rest))
             elif rest:
                 # Past where a warning can start, only the start is kept.
-                at, warned = judge(self.line + [(now, rest)], self.hang,
-                                   False)
+                pieces = self.line + [(now, rest)]
+                at, warned = judge(pieces, self.hang, False)
                 if at == now:
-                    self.heard(now, newlines + 1, (newlines, size), warned)
+                    self.heard(now, newlines + 1, (newlines, size), warned,
+                               pieces)
         self.extent = (newlines, size)
         return self.extent
 
@@ -712,20 +928,86 @@ class Supervisor:
         lines arrived now and follow the first newlines line breaks and
         size bytes in the log, the first of them continuing self.line, by
         looking at the lines from the last, and notes the hang warnings
-        after that output."""
+        after that output. The first line is counted whatever follows it,
+        so that the silences between its pieces are counted."""
+        pieces = self.line + [(now, data.split(b"\n", 1)[0])]
+        judged = judge(pieces, self.hang)
+        if judged[0] is not None:
+            self.heard(judged[0], newlines + 1,
+                       (newlines + 1, size + len(pieces[-1][1]) + 1),
+                       judged[1], pieces)
         line, end, after = newlines + data.count(b"\n") + 1, len(data), False
         while True:
             start = data.rfind(b"\n", 0, end) + 1
             piece, at, warned = data[start:end], None, False
-            if start == 0 or piece.strip():
-                at, warned = judge((self.line if start == 0 else [])
-                                   + [(now, piece)], self.hang)
-            if at is not None:
-                self.heard(at, line, (line, size + end + 1), warned)
+            if start == 0:
+                at, warned = judged
+            elif piece.strip():
+                at, warned = judge([(now, piece)], self.hang)
+                if at is not None:
+                    self.heard(at, line, (line, size + end + 1), warned)
             if at is not None or start == 0:
                 self.last_warned |= after or (at is None and warned)
                 return
             line, end, after = line - 1, start - 1, after or warned
+
+    def judge_line(self, ended: bool) -> None:
+        """Judges the line the command is writing, as far as it has been
+        read, as a line that has ended if ended."""
+        newlines, size = self.extent
+        at, warned = judge(self.line, self.hang, ended)
+        self.judged = self.line[-1][0] if self.line else 0.0
+        if at is not None:
+            self.heard(at, newlines + 1, (newlines, size), warned, self.line)
+        else:
+            self.last_warned |= warned
+
+    def record(self) -> None:
+        """Adds a record to the timing file if the log or its last output
+        has changed since the last record, at once if that was a second
+        ago or more, and otherwise when it will be."""
+        if self.timing_fd is None or self.timing() == self.recorded:
+            return
+        if time.monotonic() >= self.recorded_at + 1:
+            self.write_record()
+        else:
+            self.record_at = self.recorded_at + 1
+
+    def timing(self) -> tuple[int, int, float, int, Silence]:
+        """The bytes and line breaks in the log, the time and line of the
+        last output, and the longest silence."""
+        newlines, size = self.extent
+        return size, newlines, self.last, self.last_line, self.longest
+
+    def write_record(self) -> None:
+        """Adds a record of the log and its last output, as they are now,
+        to the timing file."""
+        self.recorded = self.timing()
+        self.recorded_at, self.record_at = time.monotonic(), None
+        size, newlines, last, line, longest = self.recorded
+        if self.append(RECORD.pack(
+                size, newlines, round(self.recorded_at * 1e9),
+                time.time_ns(), round(last * 1e9), line,
+                round(longest.start * 1e9), round(longest.end * 1e9),
+                longest.line)):
+            self.records_written += 1
+
+    def append(self, data: bytes) -> bool:
+        """Adds data to the timing file, and returns whether it did. If
+        it cannot, it deletes the file, which then says nothing rather
+        than something false, and stops recording."""
+        if self.timing_fd is None:
+            return False
+        try:
+            if os.write(self.timing_fd, data) == len(data):
+                return True
+        except OSError:
+            pass
+        os.close(self.timing_fd)
+        self.timing_fd = None
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.rundir, "times"))
+        return False
 
     def save(self) -> None:
         save(self.rundir, "state.json", self.state)
@@ -789,11 +1071,13 @@ class Supervisor:
         self.state["stalls"] += 1
         number, extent = self.state["stalls"], self.extent
         heard, end, warned = self.last_line, self.last_end, self.last_warned
+        self.write_record()
+        recorded = self.records_written
 
         def report() -> None:
             try:
                 text = diagnose(self.rundir, number, self.child.pid, quiet,
-                                again, extent, heard, end, warned)
+                                again, extent, heard, end, warned, recorded)
             except Exception as error:
                 text = (f"longrun: STALLED, no output for {duration(quiet)}"
                         f"{' other than hang warnings' * warned}. "
@@ -861,9 +1145,15 @@ class Supervisor:
         for name in glob.glob(os.path.join(self.rundir, "py", "*.txt")):
             if not os.path.getsize(name):
                 os.remove(name)
+        extent = self.listen()
+        self.judge_line(True)
+        if self.timing() != self.recorded:
+            self.write_record()
+        if self.timing_fd is not None:
+            os.close(self.timing_fd)
+            self.timing_fd = None
         with open(os.path.join(self.rundir, "result.txt"), "w") as f:
-            f.write(summary(self.rundir, self.spec, self.state,
-                            self.listen()))
+            f.write(summary(self.rundir, self.spec, self.state, extent))
         self.save()
         self.tell("done")
 
@@ -945,6 +1235,8 @@ def start(argv: list[str], quiet: float, owner: int | None,
                                "agent": os.environ.get("LONGRUN_AGENT"),
                                "session": os.environ.get(
                                    "CLAUDE_CODE_SESSION_ID")})
+    with open(os.path.join(rundir, "README.md"), "w") as f:
+        f.write(RUN_README.format(readme=os.path.join(HERE, "README.md")))
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     here = os.getcwd()
     os.chdir(rundir)

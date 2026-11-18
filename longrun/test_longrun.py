@@ -338,8 +338,9 @@ class Runs(unittest.TestCase):
             "for i in $(seq 30); do echo 'stuck-test: x'; done; sleep 300")
         report, code = self.finish(proc)
         self.assertEqual(code, longrun.STALLED)
-        self.assertRegex(report, r"\n 1\| first\n 2\| x+ …\n"
-                                 r"\[20 lines left out\]\n23\| stuck-test: x")
+        self.assertRegex(report, r"\n\d+s  1\| first\n\d+s  2\| x+ …\n"
+                                 r"\[20 lines left out\]\n\d+s 23\| "
+                                 r"stuck-test: x")
         self.longrun("stop", rundir)
 
     def test_reports_at_the_edges_of_what_they_read(self):
@@ -348,31 +349,32 @@ class Runs(unittest.TestCase):
                 # that the report reads, and is left out of it.
                 ("echo before; for i in $(seq 4681); do "
                  "echo 'stuck-test: x'; done; sleep 300",
-                 "\n1| before\n[4671 lines left out]\n4673| stuck", None),
+                 r"\n\d+s 1\| before\n\[4671 lines left out\]\n\d+s 4673\| "
+                 r"stuck", None),
                 # Blank lines are not warnings.
                 ("echo x; head -c 70000 /dev/zero | tr '\\0' '\\n'; sleep 300",
-                 "STALLED, no output for 2s. ", "warnings"),
+                 r"STALLED, no output for 2s\. ", "warnings"),
                 # A warning longer than the end of the log that is read.
                 ("echo before; printf 'stuck-test: '; "
                  "head -c 70000 /dev/zero | tr '\\0' x; echo; sleep 300",
-                 "\n1| before\n", "failed"),
+                 r"\n\d+s 1\| before\n", "failed"),
                 # Output that a terminal would show as blank.
                 ("printf 'x stuck-test: y\\r   \\n'; sleep 300",
-                 "other than hang warnings after its output in line 1.",
+                 r"other than hang warnings after its output in line 1\.",
                  "failed"),
                 # pytest's dots, while their line has not ended.
                 ("echo a; sleep 1; printf ...; sleep 300",
-                 "no output for 2s. ", "warnings"),
+                 r"no output for 2s\. ", "warnings"),
                 # Many colour codes before a warning, which are not
                 # output.
                 ("for i in $(seq 500); do printf '\\033[32m.\\033[0m'; done; "
                  "printf .; echo 'stuck-test: x'; sleep 300",
-                 "other than hang warnings after its output in line 1.",
+                 r"other than hang warnings after its output in line 1\.",
                  None)):
             proc, rundir = self.start("--quiet", "0.04", command)
             report, code = self.finish(proc)
             self.assertEqual(code, longrun.STALLED, report)
-            self.assertIn(expected, report)
+            self.assertRegex(report, expected)
             if unexpected:
                 self.assertNotIn(unexpected, report)
             self.longrun("stop", rundir)
@@ -475,9 +477,125 @@ class Runs(unittest.TestCase):
         self.assertEqual(code, longrun.STALLED)
         self.assertIn("other than hang warnings after its output in line 2.",
                       report)
-        self.assertRegex(report, r"\n1\| before\n2\| during\n"
-                                 r"\[1990 lines left out\]\n1993\| stuck")
+        self.assertRegex(report, r"\n\d+s 1\| before\n\d+s 2\| during\n"
+                                 r"\[1990 lines left out\]\n\d+s 1993\| "
+                                 r"stuck")
         self.longrun("stop", rundir)
+
+    def test_times_say_when_output_arrived(self):
+        gate = self.fifo("gate")
+        before = time.time()
+        proc, rundir = self.start(f"echo a; read x < {gate}; echo b")
+        released = time.monotonic()
+        self.release(gate)
+        output, code = self.finish(proc)
+        self.assertEqual(code, 0)
+        with open(os.path.join(rundir, "times"), "rb") as f:
+            self.assertEqual(f.read(4), b"\x04\x00\x48\x00")
+        found = longrun.records(rundir)
+        self.assertEqual((found[0].size, found[0].lines, found[0].line),
+                         (0, 0, 0))
+        self.assertEqual(longrun.length(found[0].longest), 0)
+        self.assertEqual(found[-1].size,
+                         os.path.getsize(os.path.join(rundir, "log")))
+        self.assertEqual((found[-1].lines, found[-1].line), (2, 2))
+        self.assertEqual([r.at for r in found], sorted(r.at for r in found))
+        self.assertTrue(before <= found[0].wall <= found[-1].wall
+                        <= time.time())
+        # The second line was printed after the gate opened.
+        self.assertLessEqual(released, found[-1].output)
+        self.assertNotIn("longest silence", output)
+        with open(os.path.join(rundir, "README.md")) as f:
+            readme = f.read()
+        self.assertIn("README.md#the-timing-file", readme)
+        self.assertIn(os.path.join(HERE, "README.md"), readme)
+
+    def test_times_are_recorded_at_most_once_a_second(self):
+        result = self.longrun(
+            "run", "for i in $(seq 150); do echo $i; sleep 0.01; done")
+        found = longrun.records(os.path.dirname(log_path(result)))
+        # The last record is written when the command ends; the others
+        # when the run starts and when output arrives, a second apart or
+        # more.
+        gaps = [b.at - a.at for a, b in zip(found[:-1], found[1:-1])]
+        self.assertGreater(len(gaps), 0)
+        self.assertGreaterEqual(min(gaps), 0.99)
+        self.assertEqual((found[-1].lines, found[-1].line), (150, 150))
+
+    def test_a_line_that_never_ends_is_counted_when_the_command_does(self):
+        result = self.longrun("run", "printf a; sleep 1.5; printf b")
+        found = longrun.records(os.path.dirname(log_path(result)))
+        self.assertEqual((found[-1].lines, found[-1].line), (0, 1))
+        self.assertGreaterEqual(found[-1].output - found[0].at, 1.5)
+        # The silence was measured within the line.
+        self.assertEqual(found[-1].longest.line, 1)
+
+    def test_a_stall_report_without_a_timing_file_says_so(self):
+        gate = self.fifo("gate")
+        proc, rundir = self.start("--quiet", "0.04",
+                                  f"echo a; read x < {gate}")
+        os.remove(os.path.join(rundir, "times"))
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("\nlongrun could not record when the output arrived.\n",
+                      report)
+        self.assertIn("\n1| a\n", report)
+        self.release(gate)
+        self.assertEqual(self.finish(self.client("wait", rundir))[1], 0)
+
+    def test_silences_within_a_line_are_counted(self):
+        # The end of the line comes in the same write as the next line.
+        result = self.longrun("run", "printf a; sleep 2; printf b; sleep 2; "
+                                     "printf 'c\\nnext\\n'")
+        found = longrun.records(os.path.dirname(log_path(result)))
+        # The silences in the first line are counted, not the whole line
+        # as one.
+        whole = found[-1].output - found[0].at
+        self.assertLess(longrun.length(found[-1].longest), whole - 1.5)
+        self.assertEqual((found[-1].line, found[-1].lines), (2, 2))
+
+    def test_silences_within_a_long_line_are_counted(self):
+        result = self.longrun(
+            "run", "printf a; sleep 2; printf '%5000s' '' | tr ' ' .; "
+                   "sleep 0.5; printf b; sleep 2; echo")
+        found = longrun.records(os.path.dirname(log_path(result)))
+        self.assertEqual(found[-1].longest.line, 1)
+
+    def test_the_silence_before_the_command_exits_is_recorded(self):
+        result = self.longrun("run", "echo a; sleep 1.5")
+        found = longrun.records(os.path.dirname(log_path(result)))
+        # The last record was written when the command exited, although
+        # nothing had changed.
+        self.assertEqual(found[-1][:2] + found[-1][4:],
+                         found[-2][:2] + found[-2][4:])
+        self.assertGreater(found[-1].at, found[-2].at)
+
+    def test_the_last_record_covers_what_leftovers_print(self):
+        result = self.longrun(
+            "run", "sh -c 'trap \"echo bye; exit\" TERM; "
+                   "while :; do sleep 0.1; done' & echo hi; sleep 0.3")
+        self.assertIn("bye", result.stdout)
+        found = longrun.records(os.path.dirname(log_path(result)))
+        self.assertEqual(found[-1].size, os.path.getsize(log_path(result)))
+
+    def test_stall_report_says_when_lines_were_printed(self):
+        gate = self.fifo("gate")
+        proc, rundir = self.start(
+            "--quiet", "0.04",
+            f"echo before; sleep 1.2; echo middle; read x < {gate}")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertIn("\nThe log so far: 14B in 2 lines over ", report)
+        self.assertIn("the log has 2 lines", report)
+        self.assertRegex(report, r"Bytes written to it in each \S+ since "
+                                 r"the run started: 14[ ,]")
+        self.assertIn("Before this silence, the command never went a minute "
+                      "without output.", report)
+        self.assertIn("\nEach line of the log below starts with how long "
+                      "after the start it was complete.\n", report)
+        self.assertRegex(report, r"\n *\d+s 1\| before\n *\d+s 2\| middle\n")
+        self.release(gate)
+        self.assertEqual(self.finish(self.client("wait", rundir))[1], 0)
 
     def test_stall_while_detached_is_reported_on_wait(self):
         gate = self.fifo("gate")
@@ -1077,6 +1195,24 @@ class Reports(unittest.TestCase):
         supervisor.reported()
         self.assertEqual((told, supervisor.written), (["stall 3"], 3))
 
+    def test_a_timing_file_that_cannot_be_written_is_removed(self):
+        rundir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, rundir)
+        longrun.save(rundir, "spec.json", {"quiet": 60})
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        supervisor = longrun.Supervisor(rundir, listener)
+        path = os.path.join(rundir, "times")
+        with open(path, "wb") as f:
+            f.write(longrun.HEADER.pack(4, 48))
+        supervisor.timing_fd = os.open(path, os.O_RDONLY)
+        supervisor.write_record()
+        self.assertEqual((supervisor.timing_fd, supervisor.records_written),
+                         (None, 0))
+        self.assertFalse(os.path.exists(path))
+        supervisor.write_record()
+        self.assertEqual(longrun.records(rundir), [])
+
     def test_a_stall_is_reported_when_the_supervisor_is_gone_after_it(self):
         rundir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, rundir)
@@ -1089,6 +1225,238 @@ class Reports(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(longrun.attach(rundir, conn), longrun.STALLED)
         self.assertEqual(output.getvalue(), "the report\n")
+
+
+class Timing(unittest.TestCase):
+    """The timing file, and what reports say from it, from files written
+    here."""
+
+    def rundir(self, rows, header=(4, 72), pad=b"", log=b""):
+        """A run directory whose timing file holds a record for each row
+        of (size, lines, at, output, line) or (size, lines, at, output,
+        line, longest start, longest end, longest line), times in seconds,
+        each followed by pad."""
+        rundir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, rundir)
+        with open(os.path.join(rundir, "times"), "wb") as f:
+            f.write(longrun.HEADER.pack(*header)
+                    + b"\xff" * (header[0] - 4))
+            for size, lines, at, output, line, *longest in rows:
+                quiet, heard, before = longest or (0, 0, 0)
+                f.write(longrun.RECORD.pack(
+                    size, lines, round(at * 1e9), round(at * 1e9) + 10**18,
+                    round(output * 1e9), line, round(quiet * 1e9),
+                    round(heard * 1e9), before) + pad)
+        with open(os.path.join(rundir, "log"), "wb") as f:
+            f.write(log)
+        return rundir
+
+    def test_records(self):
+        rows = [(0, 0, 100, 100, 0), (6, 1, 101.5, 101.2, 1, 100, 101.2, 0),
+                (12, 2, 130, 101.2, 1, 100, 101.2, 0)]
+        found = longrun.records(self.rundir(rows))
+        self.assertEqual(found[1], longrun.Record(
+            6, 1, 101.5, 1e9 + 101.5, 101.2, 1,
+            longrun.Silence(100, 101.2, 0)))
+        self.assertEqual(len(found), 3)
+        # Readers skip what later versions add to the header and to each
+        # record.
+        self.assertEqual(longrun.records(
+            self.rundir(rows, (12, 80), b"\xee" * 8)), found)
+        self.assertEqual(longrun.records(self.rundir(rows), 2), found[:2])
+
+    def test_damaged_or_missing_times(self):
+        rows = [(0, 0, 1, 1, 0), (2, 1, 2, 2, 1)]
+        rundir = self.rundir(rows)
+        path = os.path.join(rundir, "times")
+        with open(path, "ab") as f:
+            f.write(b"\x01" * 71)
+        self.assertEqual(len(longrun.records(rundir)), 2)
+        for data in (b"", b"\x04\x00\x48", b"\x04\x00\x48\x00",
+                     b"\x02\x00\x48\x00" + b"\x00" * 72,
+                     b"\x04\x00\x30\x00" + b"\x00" * 72):
+            with open(path, "wb") as f:
+                f.write(data)
+            self.assertEqual(longrun.records(rundir), [], data)
+        os.remove(path)
+        self.assertEqual(longrun.records(rundir), [])
+
+    def supervisor(self):
+        """A supervisor that has not started a command, and the time from
+        which it counts silence."""
+        rundir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, rundir)
+        longrun.save(rundir, "spec.json", {"quiet": 600})
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        supervisor = longrun.Supervisor(rundir, listener)
+        return supervisor, supervisor.last
+
+    def test_the_longest_silence_is_counted_between_pieces(self):
+        supervisor, t = self.supervisor()
+        supervisor.heard(t + 3, 1, (1, 2), False)
+        # A line of dots, judged when it ends: the silences between the
+        # dots count, not the time since the line before.
+        dots = [(t + 10, b"."), (t + 50, b"."), (t + 60, b".")]
+        supervisor.heard(t + 70, 2, (2, 7), False, dots + [(t + 70, b"]")])
+        self.assertEqual(supervisor.longest,
+                         longrun.Silence(t + 10, t + 50, 2))
+        self.assertEqual((supervisor.last, supervisor.last_line), (t + 70, 2))
+        # Pieces counted already, and earlier output, change nothing.
+        supervisor.heard(t + 70, 2, (2, 7), True, dots)
+        supervisor.heard(t + 60, 1, (1, 2), False)
+        self.assertEqual(supervisor.longest,
+                         longrun.Silence(t + 10, t + 50, 2))
+        self.assertEqual((supervisor.last, supervisor.last_line,
+                          supervisor.last_warned), (t + 70, 2, True))
+        # Pieces that hold only white space or colour codes are not
+        # output.
+        supervisor.heard(t + 200, 3, (3, 20), False,
+                         [(t + 80, b"\x1b[32m"), (t + 90, b"  "),
+                          (t + 100, b"x\x1b[0m"), (t + 200, b"y")])
+        self.assertEqual(supervisor.longest,
+                         longrun.Silence(t + 100, t + 200, 3))
+        # Nor is a colour code split between what was read before and
+        # what has just been read.
+        supervisor.line = [(t + 210, b"a"), (t + 260, b"\x1b[3")]
+        supervisor.ended(t + 400, b"2mb", 3, 20)
+        self.assertEqual(supervisor.longest,
+                         longrun.Silence(t + 210, t + 400, 4))
+        # A colour code split across pieces is not output either.
+        self.assertEqual(longrun.output_times(
+            [(1, b"a\x1b[3"), (2, b"2m"), (3, b" \x1b[0m"), (4, b"z")]),
+            [1, 4])
+        # The first output ends the silence that the run started with.
+        quiet, t = self.supervisor()
+        quiet.heard(t + 200, 1, (1, 2), False)
+        self.assertEqual(quiet.longest, longrun.Silence(t, t + 200, 0))
+
+    def test_a_record_waits_a_second_after_the_last(self):
+        supervisor, t = self.supervisor()
+        path = os.path.join(supervisor.rundir, "times")
+        supervisor.timing_fd = os.open(path, os.O_WRONLY | os.O_CREAT)
+        self.addCleanup(lambda: supervisor.timing_fd is None or
+                        os.close(supervisor.timing_fd))
+        supervisor.write_record()
+        supervisor.extent = (1, 2)
+        supervisor.record()
+        self.assertEqual(supervisor.record_at, supervisor.recorded_at + 1)
+        self.assertEqual(os.path.getsize(path), longrun.RECORD.size)
+        supervisor.recorded_at -= 1
+        supervisor.record()
+        self.assertIsNone(supervisor.record_at)
+        self.assertEqual(os.path.getsize(path), 2 * longrun.RECORD.size)
+        # Nothing has changed since, so no record is due.
+        supervisor.recorded_at -= 1
+        supervisor.record()
+        self.assertEqual(os.path.getsize(path), 2 * longrun.RECORD.size)
+
+    def test_stall_analysis_of_steady_output_that_stopped(self):
+        rows = [(0, 0, 0, 0, 0)] + [(100 * i, 10 * i, 60 * i, 60 * i - 1,
+                                     10 * i, 0, 59, 0) for i in range(1, 6)]
+        found = longrun.records(self.rundir(
+            rows + [(500, 50, 600, 299, 50, 59, 119, 10)]))
+        text = longrun.analysis(found, 51)
+        self.assertEqual(text, (
+            "The log so far: 500B in 51 lines over 10m00s. Bytes written to "
+            "it in each 1m00s since the run started: 100, 100, 100, 100, "
+            "100, 0, 0, 0, 0, 0.\n"
+            "Before this silence, the longest silence was 1m00s after its "
+            "output in line 10 (from 59s to 1m59s after the start).\n"
+            "Each line of the log below starts with how long after the start "
+            "it was complete."))
+
+    def test_stall_analysis_of_output_that_was_always_slow(self):
+        rows = [(0, 0, 0, 0, 0), (10, 1, 480, 480, 1, 0, 480, 0),
+                (20, 2, 1080, 1080, 2, 480, 1080, 1),
+                (20, 2, 1500, 1080, 2, 480, 1080, 1)]
+        found = longrun.records(self.rundir(rows))
+        text = longrun.analysis(found, 2)
+        self.assertIn("each 5m00s since the run started: 0, 10, 0, 10, 0.\n",
+                      text)
+        self.assertIn("the longest silence was 10m00s after its output in "
+                      "line 1 (from 8m00s to 18m00s after the start).", text)
+        quiet = longrun.records(self.rundir([(0, 0, 0, 0, 0),
+                                             (0, 0, 700, 0, 0)]))
+        self.assertIn("This silence started when the run did.",
+                      longrun.analysis(quiet, 0))
+        steady = longrun.records(self.rundir([(0, 0, 0, 0, 0),
+                                              (5, 1, 1, 0.5, 1, 0, 0.5, 0),
+                                              (9, 2, 50, 50, 2, 0.5, 50, 1),
+                                              (9, 2, 700, 50, 2, 0.5, 50, 1)]))
+        self.assertIn("\nBefore this silence, the command never went a "
+                      "minute without output.",
+                      longrun.analysis(steady, 2))
+
+    def test_rhythm_parts(self):
+        def text(now):
+            found = longrun.records(self.rundir([(0, 0, 0, 0, 0),
+                                                 (50, 1, 30, 30, 1)]))
+            return longrun.rhythm(found, now)
+        # A part shorter than a second is counted in the one before.
+        self.assertEqual(text(600.4), "Bytes written to it in each 1m00s since "
+                         "the run started: 50, 0, 0, 0, 0, 0, 0, 0, 0, 0.")
+        self.assertEqual(text(605), "Bytes written to it in each 1m00s since the "
+                         "run started: 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 (the "
+                         "last part covers only 5s).")
+        self.assertEqual(text(5), "Bytes written to it in each 10s since the run "
+                         "started: 0 (the last part covers only 5s).")
+        # Runs longer than 12 days are shown in parts of whole days.
+        self.assertTrue(text(12 * 86400 + 0.5).startswith(
+            "Bytes written to it in each 24h00m since the run started: 50, 0, "))
+        self.assertTrue(text(30 * 86400).startswith(
+            "Bytes written to it in each 72h00m since the run started: 50, 0, "))
+
+    def test_amounts(self):
+        self.assertEqual([longrun.amount(n) for n in
+                          (0, 999, 1000, 1500, 9_999, 12_345, 999_499,
+                           999_500, 2_500_000, 2.5e9, 3e12)],
+                         ["0", "999", "1.0K", "1.5K", "10K", "12K", "999K",
+                          "1.0M", "2.5M", "2.5G", "3000G"])
+
+    def test_line_stamps(self):
+        found = longrun.records(self.rundir([
+            (0, 0, 0, 0, 0), (4, 2, 1, 0.5, 2), (6, 2, 65, 65, 3),
+            (8, 3, 70, 70, 3), (10, 3, 200, 200, 4)]))
+        lines = ["a", "b", "cc", "d"]
+        self.assertEqual(longrun.stamps(found, 0, lines, (3, 10)),
+                         ["1s", "1s", "1m10s", "3m20s"])
+        self.assertEqual(longrun.stamps(found, 2, lines[2:], (3, 10)),
+                         ["1m10s", "3m20s"])
+        # A line that had not ended at a size the records reach.
+        self.assertEqual(longrun.stamps(found, 1, lines[1:3], (2, 6)),
+                         ["1s", "1m05s"])
+        shown = longrun.section(lines, [0, 3], 0,
+                                times=["1s", "1s", "1m10s", "3m20s"])
+        self.assertEqual(shown, "   1s 1| a\n[2 lines left out]\n"
+                                "3m20s 4| d")
+
+    def test_longest_silence_in_the_result(self):
+        log = b"a\nb\nc\n"
+        rows = [(0, 0, 0, 0, 0), (2, 1, 1, 0.5, 1, 0, 0.5, 0),
+                (4, 2, 75, 75, 2, 0.5, 75, 1), (6, 3, 80, 79, 3, 0.5, 75, 1),
+                (6, 3, 90, 79, 3, 0.5, 75, 1)]
+        result = longrun.summary(self.rundir(rows, log=log),
+                                 {"display": "x", "keep": False},
+                                 {"exit": 0, "started": 0, "ended": 90},
+                                 (3, 6))
+        self.assertIn("\nlongest silence: 1m15s after its output in line 1 "
+                      "(from 0s to 1m15s after the start)\n", result)
+        # The silence that lasted until the end counts too.
+        rows[-1] = (6, 3, 200, 79, 3, 0.5, 75, 1)
+        result = longrun.summary(self.rundir(rows, log=log),
+                                 {"display": "x", "keep": False},
+                                 {"exit": 0, "started": 0, "ended": 200},
+                                 (3, 6))
+        self.assertIn("\nlongest silence: 2m01s after its output in line 3 "
+                      "(from 1m19s to 3m20s after the start)\n", result)
+        short = longrun.summary(self.rundir(rows[:2] + [(6, 3, 30, 29, 3,
+                                                          0, 0.5, 0)],
+                                            log=log),
+                                {"display": "x", "keep": False},
+                                {"exit": 0, "started": 0, "ended": 30},
+                                (3, 6))
+        self.assertNotIn("longest silence", short)
 
 
 class Summaries(unittest.TestCase):
@@ -1260,6 +1628,7 @@ class Summaries(unittest.TestCase):
         self.assertNotIn("PASS check 7\n", failed)
         self.assertNotIn("FAIL", self.shown(text.replace("1 FAIL", "0 FAIL"),
                                             0).split("100|")[0])
+        self.assertNotIn("longest silence", failed)
 
     def test_every_failed_build_is_shown(self):
         lines = longrun.clean("one\n** BUILD FAILED **\nx\nx\nx\n"

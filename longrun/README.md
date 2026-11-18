@@ -46,10 +46,18 @@ status, or 128 plus the signal number if a signal ended it. For example:
 ```
 longrun: exit 1 after 4m12s: deno task test
 log: /…/scratchpad/longrun/1026-102900-test-z8ubjjle/log (71601 lines)
+longest silence: 2m40s after its output in line 5 (from 1m02s to 3m42s after the start)
  6|  ERRORS
  …
 27| FAILED | 1 passed | 1 failed (11ms)
 ```
+
+The `longest silence` line is there when the command once went a minute
+or more without output other than hang warnings (see "Hang warnings"
+below). It names the line that holds the last output before that
+silence, or says that the silence came before any output, and says when
+the silence started and ended. A command whose longest silence comes
+close to the `--quiet` time is one that should print more progress.
 
 The part of the log shown is the test runner's own summary when longrun
 recognises it, and otherwise the last 5 lines of a run that succeeded or
@@ -101,8 +109,24 @@ by default, and more than 0), other than hang warnings. longrun then
 writes a report, and `run` prints it and exits with status 75 while the
 command keeps running. A command that itself exits with status 75 is
 told apart by the first line of the output, which says either `STALLED`
-or how the command ended. The report lists the command's processes with
-their CPU use, and for each one what it is doing:
+or how the command ended. The report says how much the command printed
+and when, so that a command that was always slow can be told apart from
+one that has stopped:
+
+- how much the log holds, in bytes and lines, and how many bytes were
+  written to it in each of at most 12 equal parts of the run so far, each
+  part a round length of time. These count everything the command
+  printed, hang warnings included;
+- the longest earlier silence, with the line that holds the last output
+  before it, or that it came before any output; or that the command
+  never went a minute without output before; or that it has printed no
+  output other than hang warnings since the run started;
+- for each of the last lines of the log, how long after the start it
+  was complete, to within about a second: when longrun first recorded
+  its line break, or for a last line that has not ended, its last byte.
+
+It then lists the command's processes with their CPU use, and for each
+one what it is doing:
 
 - For a Python process, the innermost two frames of each thread and the
   innermost frame outside the standard library and installed packages,
@@ -117,6 +141,9 @@ commands to continue:
 
 ```
 longrun: STALLED, no output for 10m00s. The command is still running (6 processes, 0% CPU between them).
+The log so far: 48KB in 1204 lines over 25m10s. Bytes written to it in each 5m00s since the run started: 12K, 1.2K, 30K, 5.0K, 0, 0 (the last part covers only 10s).
+Before this silence, the longest silence was 6m02s after its output in line 40 (from 1m08s to 7m10s after the start).
+Each line of the log below starts with how long after the start it was complete.
 4 processes (51202, 51203, 51204, 51205), 0% CPU: …/.venv/bin/python -u -c import sys;exec(eval(sys.stdin.readline()))
     1 thread:
       File ".../site-packages/execnet/gateway_base.py", line 534 in read
@@ -126,7 +153,10 @@ pid 51206, 0% CPU: …/.venv/bin/python -u -c import sys;exec(eval(sys.stdin.rea
       File ".../lib/python3.12/selectors.py", line 416 in select
       File ".../lib/python3.12/subprocess.py", line 2115 in _communicate
       File "tests/test_cleanup.py", line 88 in test_interrupted_run_removes_its_files
+run: /…/scratchpad/longrun/0412-093015-pytest-k3v8a2qd (samples in stall-1/; the log has 1204 lines, ending:)
+15m09s 1195| tests/test_cleanup.py::test_partial_files PASSED
 …
+15m10s 1204| tests/test_cleanup.py::test_interrupted_run_removes_its_files
 If it stays silent, waiting reports it again after another 20m00s.
 To keep waiting: longrun wait 0412-093015-pytest-k3v8a2qd
 To end it:       longrun stop 0412-093015-pytest-k3v8a2qd
@@ -218,11 +248,11 @@ last output, however far back that is:
 longrun: STALLED, no output for 10m00s other than hang warnings after its output in line 40. The command is still running (2 processes, 0% CPU between them).
 …
 run: … (samples in stall-1/; the log has 152 lines, ending, after its last output:)
-36| ..............                                       [ 98%]
+ 9m40s  36| ..............                                       [ 98%]
 …
-40| ....
+10m02s  40| ....
 [102 lines left out]
-143|   File ".../execnet/gateway_base.py", line 1806 in serve
+15m02s 143|   File ".../execnet/gateway_base.py", line 1806 in serve
 …
 ```
 
@@ -415,9 +445,9 @@ again.
 ## Instructions for agents
 
 The hooks make a call that runs longrun block, but agents still have to
-choose to run their long commands through it. This text, added to
-`~/.claude/CLAUDE.md` or to a project's `CLAUDE.md` or `AGENTS.md`, tells
-them to:
+choose to run their long commands through it, and they need to know how
+to read what it says. This text, added to `~/.claude/CLAUDE.md` or to a
+project's `CLAUDE.md` or `AGENTS.md`, tells them:
 
 ````markdown
 ## Long commands
@@ -428,49 +458,81 @@ longrun, in one call:
 
     longrun run 'COMMAND'
 
-Give it the bare command. Do not pipe it through `tail` or `grep`, and do
-not redirect its output: longrun keeps the whole output in a log in your
-scratchpad, and a command whose output goes to `tail` prints nothing
-until it ends, so it looks stalled. When the command ends, longrun
-prints its exit status, how long it took, the log's path, and the part
-of the log that matters, numbered as in the log: the test runner's
-summary when longrun recognises it, and otherwise the last lines. Read
-the log only for what that part leaves out, by line number.
-
 The call blocks until the command ends. A hook gives it the longest
 timeout Claude Code allows, so do not set `timeout` yourself, and do not
 poll, sleep or read the log while it runs.
 
+When the command ends, longrun prints its exit status, how long it took,
+the log's path, and the part of the log that matters, numbered as in the
+log: the test runner's summary when longrun recognises it, and otherwise
+the last lines. Read the log only for what that part leaves out, by line
+number.
+
 If the command prints nothing but hang warnings for 10 minutes, the
 call returns with exit status 75 and a report that starts with
-`STALLED`. The command is still running. The report says what each of
-its processes is doing. Decide at once what to do:
+`STALLED`. The command is still running. The report says when the
+command printed what, and what each of its processes is doing. Decide
+at once what to do:
 
 - If a process is waiting for something that will come, such as a free
   slot in a queue, or is busy in a long silent step, run
-  `longrun wait RUN`. It blocks until the command ends or stalls
-  again. If the command stays silent, that is after twice as long as
-  the last time, as the report says.
+  `longrun wait RUN`. It blocks until the command ends or stalls again.
+  If the command prints something, it stalls again after another 10
+  minutes of silence. If it prints nothing, the next report comes after
+  twice as long as the last, counted from when `wait` starts: 20
+  minutes, then 40, then 80. Each report says how long the next `wait`
+  will be if the command stays silent.
 - If a process is waiting for something that will never happen, run
   `longrun stop RUN`, then fix the cause.
 
-For a command that is known to stay silent for longer, give
-`--quiet MINUTES`.
+A report that follows a `wait` with no output in between means the step
+you expected to finish has not finished. Wait again only if you can
+name what the command is waiting for and why it has not arrived yet.
+Otherwise, stop it. Each report is kept as `stall-N.txt` in the run
+directory, so you can compare it with the earlier ones. If a run is
+still stalled an hour after its first report, tell whoever you are
+working for exactly what is happening.
+
+A script you write for yourself should print a line as each step starts
+or finishes, even when its results go to files. Print only real
+progress, never on a timer. The result names the run's longest silence
+when it lasted a minute or more; a script whose longest silence comes
+close to 10 minutes needs more progress output. Give `--quiet MINUTES`
+only for a command that cannot print progress and is known to stay
+silent for more than 10 minutes, set to about how long it stays silent.
+The intervals then start at that many minutes instead of 10, and double
+in the same way.
 
 When the command's job is to start a process that outlives it, such as
 a development server, a local service or a copy of an app that later
 commands drive, give `--keep`. Without it, longrun ends whatever the
 command leaves running when it exits, and the result lists what it
-ended.
+ended. Do not give `--keep` to a test suite or a build to make that list
+go away: a test or build that leaves processes running has a bug to fix.
 
-In a main session, `run_in_background: true` on a `longrun run` call
-lets you work while it runs. You are notified when it ends or stalls,
-and its output is the same short report. In a subagent, block instead.
+Give longrun the bare command, and run each longrun call, `run` and
+`wait` alike, bare too. Do not pipe either through `tail` or `grep`, do
+not redirect their output, and do not wrap a longrun call in `$(...)`.
+longrun keeps the command's whole output in a log in your scratchpad,
+and a command whose output goes to `tail` prints nothing until it ends,
+so it looks stalled. longrun's exit status is the result: the command's
+own status, or 75 for a stall. A pipeline reports `tail`'s status
+instead.
+
+In a main session, use `run_in_background: true` on a `longrun run` call
+only when you have other work to do while the command runs. If you would
+end your turn right after starting it, block instead. If you do run it
+in the background, you are notified when it ends or stalls, and its
+output is the same short report. In a subagent, always block, and do not
+end your turn, read the log or sleep while a run is going.
 ````
 
 Without the hooks, the text should also tell agents to give each
 `longrun` call `timeout: 2147483647`, since otherwise Claude Code moves a
-call that outlives its timeout to the background.
+call that outlives its timeout to the background. In a subagent, the
+call should then also start with `sleep 0;`, for the reason given under
+"Calls from subagents". That `sleep` returns at once, so it is not the
+kind of waiting that the text tells agents not to do.
 
 ## Where runs live
 
@@ -486,6 +548,9 @@ within that directory. A run directory holds:
 - `state.json`: the supervisor's view of the run, rewritten as it
   changes;
 - `log`: everything the command printed, as bytes;
+- `times`: when the command's output arrived, described below;
+- `README.md`: a note that points to this file, for anyone who finds the
+  directory;
 - `result.txt`: what `run` prints when the command ends;
 - `stall-N.txt` and `stall-N/`: the Nth stall report and its `sample`
   output;
@@ -495,6 +560,156 @@ within that directory. A run directory holds:
   and the hooks tell whether it is still running;
 - `sock`: the socket that `run`, `wait` and `stop` talk to the
   supervisor through.
+
+## The timing file
+
+`times`, in each run directory, records when the command's output
+arrived. The stall reports and the result use it, and it is there for
+anyone who wants to measure how commands behave. The log stays exactly
+what the command printed. The supervisor creates `times` when the run
+starts, adds records to its end, and never changes what it has written.
+If it cannot write a whole record, it deletes the file and records no
+more, so that the file never says something false. Runs made by versions
+of longrun from before it was added have no such file.
+
+### Layout
+
+All numbers are little-endian, with no padding between them. "u16" and
+"u64" are unsigned integers of 16 and 64 bits, and "i64" is a signed
+integer of 64 bits in two's complement.
+
+The file starts with a header:
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | u16 | H, the length of the header in bytes, these two included (4) |
+| 2 | u16 | R, the length of each record in bytes (72) |
+| 4 | H − 4 bytes | fields that later versions may add |
+
+Records follow the header, from offset H, one after another, each R
+bytes long:
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | u64 | the size of the log, in bytes |
+| 8 | u64 | how many line breaks (bytes 0x0A) the log holds, up to that size |
+| 16 | i64 | when the record was written, in nanoseconds on the monotonic clock |
+| 24 | i64 | the same moment, in nanoseconds since 1970-01-01 00:00:00 UTC |
+| 32 | i64 | when the last output before then arrived, in nanoseconds on the monotonic clock |
+| 40 | u64 | the number of the line that output is in, counting from 1, or 0 if there was no output yet |
+| 48 | i64 | when the longest silence that had ended by then started, in nanoseconds on the monotonic clock |
+| 56 | i64 | when that silence ended, in nanoseconds on the monotonic clock |
+| 64 | u64 | the number of the line that holds the last output before that silence, or 0 if it came before any output |
+| 72 | R − 72 bytes | fields that later versions may add |
+
+The numbers in parentheses are the values that this version writes. A
+later version adds fields only at the end of the header or of a record,
+and makes H or R larger to match, so that what each field means never
+changes. A reader takes the lengths from the header, uses the fields it
+knows, and skips the rest.
+
+The monotonic clock is the one that macOS calls `mach_absolute_time`,
+in nanoseconds, which is what Python's `time.monotonic_ns()` returns;
+longrun's values are correct to within a microsecond.
+It is the clock that longrun measures silence with. It counts from when
+the machine started, and it stops while the machine sleeps, so the
+difference between two records' monotonic times is how long the command
+ran in between. The difference between their wall-clock times also
+counts any time the machine slept, and any change to the system clock.
+Monotonic times can be compared only with others from the same machine
+since it last started.
+
+### When records are written
+
+The supervisor writes a record:
+
+- when the run starts, before the command prints anything: the size, the
+  line breaks and the lines are 0, and the last output and both ends of
+  the longest silence are the start, which they stay until there is
+  output;
+- when the log grows or the last output changes, but at most one record
+  each second: at once if the last record is a second old or more, and
+  otherwise one second after the last record, covering everything that
+  arrived in between;
+- just before each stall report;
+- when the command has ended, or could not be started, and again when
+  the run ends if anything has changed since, as when processes that
+  the command left running print more.
+
+The sizes, the line breaks, the times of the records and the times of
+the last output never decrease from one record to the next. A byte of
+the log that lies at or after the size in one record and before the
+size in the next was read by the supervisor after the first record was
+written, and before the second was. The
+supervisor reads what the command writes as soon as the system tells it
+there is more, and writes a record at most a second after that, so each
+byte's time is known to within about a second.
+
+### Reading it
+
+To find when line N of the log was printed, counting from 1, take the
+first record whose line break count is N or more: the line's line break
+had arrived by that record's time. The log's last line may have no line
+break yet; it was printed by the time of the first record whose size is
+the size of the log. To find the line that holds the byte at offset B,
+count the line breaks in the log before offset B and add 1. A record's
+line break count is the number of lines that were complete when it was
+written.
+
+The fields from offset 32 are about output: what the command wrote other
+than hang warnings, blank lines and colour codes, as described under
+"Hang warnings". A silence is a time without such output, between two
+pieces of output, or between the start and the first.
+
+longrun judges a line when it ends, when the command ends, and earlier
+in the cases that "Hang warnings" describes, so the last output's time
+and line can change some time after the output arrived. When it judges a
+line that arrived in pieces, such as pytest's dots, each piece of output
+in it counts, so the silences between the pieces are counted as well.
+That is why the longest silence is a field of its own: it cannot always
+be worked out from the last output's times in the records.
+
+The silence that is going on when a record is written runs from the
+last output's time to the record's time, and is not counted in the
+record's longest silence until it ends. In a run's last record, the
+run's longest silence is the longer of the two.
+
+A reader must expect:
+
+- no file at all, for a run from an older version of longrun, or one
+  whose timing file could not be written. Its output's timing is
+  unknown, which is not the same as no output.
+- a file that is shorter than 4 bytes, or than H bytes. It has no
+  records yet.
+- fewer than R bytes after the last whole record. That is a record that
+  is being written, or whose writing was cut short, and the reader
+  ignores those bytes.
+- H less than 4, or R less than 72. Such a file is not one that this
+  section describes, and the reader ignores it.
+
+In Python:
+
+```python
+import struct
+
+def records(path):
+    """(size, line_breaks, monotonic_ns, wall_ns, last_output_ns,
+    last_output_line, longest_start_ns, longest_end_ns, longest_line)
+    for each record in a timing file."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 4:
+        return []
+    header, length = struct.unpack_from("<HH", data)
+    if header < 4 or length < 72:
+        return []
+    return [struct.unpack_from("<QQqqqQqqQ", data, offset)
+            for offset in range(header, len(data) - length + 1, length)]
+```
+
+Each run directory also holds a `README.md` that links to this section,
+so that someone who finds a timing file can find out how to read it.
+longrun writes it when it creates the directory.
 
 ## Requirements and tests
 
