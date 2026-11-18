@@ -35,6 +35,11 @@ class Failure(Exception):
     pass
 
 
+def progress(message):
+    """Print a line about the work at once."""
+    print(message, flush=True)
+
+
 _libc = ctypes.CDLL(None, use_errno=True)
 _random = random.SystemRandom()
 
@@ -213,6 +218,7 @@ def build_masters(source, base, head, copied, scratch):
     trees = {v: os.path.join(scratch, v) for v in (base, head)}
     dirs = {v: os.path.join(scratch, v + ".git") for v in (base, head)}
 
+    progress("Copying the objects of both versions")
     objects = os.path.join(scratch, "objects.git")
     git("init", "-q", "--bare", "--initial-branch=before", objects)
     git("-C", objects, "config", "core.bare", "false")
@@ -244,6 +250,7 @@ def build_masters(source, base, head, copied, scratch):
         git("-C", dirs[version], "update-ref", "refs/heads/before", commit,
             env=IDENTITY)
 
+    progress("Writing the files both versions share")
     common = os.path.join(scratch, "shared")
     os.mkdir(common)
     for rel in copied:
@@ -260,6 +267,7 @@ def build_masters(source, base, head, copied, scratch):
     index = {v: os.path.join(scratch, v + ".index") for v in (base, head)}
     names = {v: [line.split(b"\t", 1)[1] for line in own[v]]
              for v in (base, head)}
+    progress("Writing the files the versions do not share")
     writes = []
     for version in order:
         clone(common, trees[version])
@@ -277,11 +285,13 @@ def build_masters(source, base, head, copied, scratch):
     for files, tree, rel in writes:
         copy_new(os.path.join(files, rel), os.path.join(tree, rel))
 
+    progress("Checking the two versions' trees")
     for version in order:
         stamp(trees[version], [os.fsdecode(p) for v in (base, head)
                                for p in names[v]], when)
         check(trees[version], at(source.git_dir, trees[version],
                                  index[version]), entries[version], copied)
+    progress("Setting the times of every file")
     for git_dir in dirs.values():
         stamp(git_dir, [os.path.relpath(os.path.join(top, name), git_dir)
                         for top, subdirs, files in os.walk(git_dir)
@@ -540,8 +550,11 @@ def stage(args):
         open(os.path.join(out, MARKER), "x").close()
         scratch = os.path.join(out, ".staging")
         os.mkdir(scratch)
-        head = source.resolve(args.head) if args.head else \
-            source.worktree_tree(scratch)
+        if args.head:
+            head = source.resolve(args.head)
+        else:
+            progress("Reading the working tree")
+            head = source.worktree_tree(scratch)
         if base == head:
             raise Failure("the base and the head are the same, so there is"
                           " nothing to review")
@@ -557,6 +570,7 @@ def stage(args):
         _random.shuffle(made)
         assignment = {n: kept[n] if n in kept else made.pop()
                       for n in args.names}
+        progress("Comparing the two versions")
         patches = {True: source.diff(base, head),
                    False: source.diff(head, base)}
         if previous:
@@ -566,6 +580,7 @@ def stage(args):
         for name, forward in assignment.items():
             before, after = (base, head) if forward else (head, base)
             place = os.path.join(out, name)
+            progress(f"Making {name}'s directory")
             os.mkdir(place)
             build_tree(trees[before], dirs[before],
                        os.path.join(place, "before"), [])
@@ -580,7 +595,8 @@ def stage(args):
                             else "Nothing in the patch has changed.\n")
             with open(os.path.join(place, "README.md"), "w") as f:
                 f.write(readme(previous is not None))
-        shutil.rmtree(scratch)
+        empty(scratch)
+        os.rmdir(scratch)
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)
         raise
@@ -605,6 +621,18 @@ def stage(args):
               f" patch's {len(hunks(patches[True]))} hunks")
     print(f"Patch of the change as made: {backup}")
     return assignment
+
+
+def empty(directory, keep=()):
+    """Delete everything in directory but the names in keep, reporting each
+    directory as its deletion starts."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                progress(f"Removing {entry.name}")
+                shutil.rmtree(entry.path)
+            elif entry.name not in keep:
+                os.remove(entry.path)
 
 
 def spellings(path):
@@ -644,7 +672,7 @@ def remove(out):
             mirror = cache + name
             if os.path.lexists(mirror):
                 shutil.rmtree(mirror)
-                print(f"Removed {mirror}")
+                progress(f"Removed {mirror}")
         # Some tools, such as Go's module cache, make their directories
         # read only.
         def unlock(path):
@@ -656,12 +684,7 @@ def remove(out):
                 unlock(os.path.join(top, name))
         # The marker goes last, so that a removal that fails can be run
         # again.
-        with os.scandir(out) as entries:
-            for entry in entries:
-                if entry.is_dir(follow_symlinks=False):
-                    shutil.rmtree(entry.path)
-                elif entry.name != MARKER:
-                    os.remove(entry.path)
+        empty(out, keep={MARKER})
         os.remove(os.path.join(out, MARKER))
         os.rmdir(out)
     except OSError as e:

@@ -21,8 +21,12 @@ From the worktree holding the change:
 `OUT` is a directory to create. It must not already exist, it must be
 outside the worktree, and it must be on an APFS volume (the same one as
 the worktree, if `--copy-ignored` is used). Each name after it gets a
-directory of its own inside `OUT`. The command prints
-which reviewers see the change as made and which see it reversed. Give
+directory of its own inside `OUT`. The command prints a line as it
+starts each step, such as writing the files that both versions share,
+making each reviewer's directory, or deleting each directory of
+intermediate files. In a project with many files, some steps take
+minutes. When it has finished, the command prints which reviewers see
+the change as made and which see it reversed. Give
 each reviewer the path of its own directory and nothing about its
 orientation. Once the reviewers are done, delete `OUT` with `--remove`,
 as described [below](#removing-a-staging).
@@ -182,9 +186,10 @@ Once a round's reviewers are done, remove what was staged for them:
 ```
 
 This deletes `OUT`, and first deletes the compiled code that Deno
-cached for the files in it. When Deno runs a local module that it has
-to compile, such as a TypeScript one, it saves the compiled JavaScript
-in its cache directory, at `gen/file` followed by
+cached for the files in it. It prints a line as it starts deleting each
+directory in `OUT`. When Deno runs a local module that it has to
+compile, such as a TypeScript one, it saves the compiled JavaScript in
+its cache directory, at `gen/file` followed by
 the module's absolute path, with `.js` added to the file name. The
 cache directory is `$DENO_DIR`, else `$XDG_CACHE_HOME/deno`, else
 `~/Library/Caches/deno`. Deno deletes these files only when told to

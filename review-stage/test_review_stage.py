@@ -328,6 +328,32 @@ class Staging(unittest.TestCase):
                 "\n  .*/old "):
             self.stage("missing", "--since", "one")
 
+    def test_each_step_is_reported_as_it_starts(self):
+        def steps(out, first, *args):
+            printed = io.StringIO()
+            self.stage(out, *args, printed=printed)
+            lines = printed.getvalue().splitlines()
+            self.assertTrue(lines[-4].startswith("Staged "))
+            self.assertEqual(lines[:-12], first + [
+                "Copying the objects of both versions",
+                "Writing the files both versions share",
+                "Writing the files the versions do not share",
+                "Checking the two versions' trees",
+                "Setting the times of every file",
+                "Comparing the two versions",
+                "Making 🦜's directory", "Making 🦆's directory"])
+            self.assertCountEqual([re.sub("[0-9a-f]{40}", "V", line)
+                                   for line in lines[-12:-4]], [
+                f"Removing {name}" for name in (
+                    "objects.git", "shared", "V", "V", "V.git", "V.git",
+                    "V.files", "V.files")])
+
+        self.change_worktree()
+        steps("worktree", ["Reading the working tree"], "--base", "HEAD")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "change")
+        steps("commit", [], "--base", "HEAD~1", "--head", "HEAD")
+
     def test_the_base_is_where_the_head_branched_from_it(self):
         git(self.repo, "checkout", "-q", "-b", "topic")
         write(self.repo, "a.txt", LINES.replace("line 3\n", "line three\n"))
@@ -523,7 +549,9 @@ class Staging(unittest.TestCase):
         os.chflags(stuck, stat.UF_IMMUTABLE)
         os.chmod(out, 0o555)
         rc, printed, errors = self.remove(out, deno)
+        first = printed.splitlines()
         self.assertEqual(rc, 1)
+        self.assertEqual(first[-1], "Removing 🦜")
         self.assertRegex(errors, r"^review-stage: \[Errno 1\] Operation not"
                          r" permitted: .*\nRun --remove again once that is"
                          r" fixed\.\n$")
@@ -539,8 +567,14 @@ class Staging(unittest.TestCase):
             write("/", path, "compiled\n")
         rc, printed, errors = self.remove(out, deno)
         self.assertEqual((rc, errors), (0, ""))
-        self.assertEqual(printed, f"Removed {cache + real}\n"
-                         f"Removed {cache + out}\nRemoved {real}\n")
+        lines = printed.splitlines()
+        self.assertEqual(lines[:2] + lines[-1:], [
+            f"Removed {cache + real}", f"Removed {cache + out}",
+            f"Removed {real}"])
+        # Each reviewer's directory is reported once as its deletion
+        # starts, and the one that could not be deleted again.
+        self.assertCountEqual(first[:-1] + lines[2:-1], [
+            "Removing 🦜", "Removing 🦆"])
         for path in [out, cache + out, cache + real]:
             self.assertFalse(os.path.lexists(path), path)
         for path in kept:
