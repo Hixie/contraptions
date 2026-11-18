@@ -6,15 +6,70 @@ struct Problem: Error, CustomStringConvertible {
     let description: String
 }
 
-/// The settings the configuration file holds, each named by its section and
-/// key, with how the settings window shows it.
-let settings: [(name: String, label: String, placeholder: String)] = [
-    ("relay.address", "Relay:", "host:port"),
-    ("github.authors", "Authors:", "everyone"),
-    ("github.orgs", "Repository owners:", "anyone"),
-    ("github.actions", "Actions:", "opened"),
-    ("command.run", "Command:", "open"),
+/// A setting the configuration file holds, named by its section and key,
+/// with how the settings window shows it.
+struct Setting {
+    let name: String
+    let label: String
+    let placeholder: String
+    let help: String
+}
+
+/// The settings, in the groups the settings window shows them in.
+let settingGroups: [(title: String, help: String, settings: [Setting])] = [
+    ("Webhook relay", "github-hookbar stays connected to a relay that passes on GitHub's "
+        + "webhook deliveries.", [
+        Setting(name: "relay.address", label: "Address:", placeholder: "host:port",
+                help: "Where the relay accepts connections."),
+    ]),
+    ("Pull requests", "When a chosen author opens a pull request, github-hookbar runs a "
+        + "command, and lists the pull request in ~/.cache/github-prs.tsv until it is "
+        + "closed.", [
+        Setting(name: "github.authors", label: "Authors:", placeholder: "everyone",
+                help: "GitHub logins, separated by commas."),
+        Setting(name: "github.orgs", label: "Repository owners:", placeholder: "anyone",
+                help: "Users or organizations whose repositories count, separated by commas."),
+        Setting(name: "github.actions", label: "Actions:", placeholder: "opened",
+                help: "Which pull request actions run the command, separated by commas, "
+                    + "such as opened, reopened, or ready_for_review."),
+        Setting(name: "command.run", label: "Command:", placeholder: "open",
+                help: "A command line for your login shell, which gets the pull request's URL "
+                    + "as its last argument."),
+    ]),
+    ("Event stream", "Optionally, github-hookbar can follow a stream of server-sent events, "
+        + "and keep a value from the JSON data of its events in a file.", [
+        Setting(name: "stream.url", label: "URL:", placeholder: "none",
+                help: "The http or https URL of the stream. Leave it empty to follow none."),
+        Setting(name: "stream.path", label: "Value:", placeholder: "for example, message.text",
+                help: "Where the value is in each event's data: keys separated by dots, with "
+                    + "numbers counting from 0 for the elements of an array."),
+        Setting(name: "stream.file", label: "Save to:", placeholder: "for example, ~/.cache/value.txt",
+                help: "The file that holds the latest value. A leading ~ stands for your "
+                    + "home directory."),
+    ]),
 ]
+
+let settings = settingGroups.flatMap(\.settings)
+
+/// A server-sent event stream to follow, the path to a string in the JSON
+/// data of its events, and the file to keep that string in.
+struct StreamSettings: Equatable {
+    let url: URL
+    let path: [String]
+    let file: String
+
+    /// The URL without its query or user name and password, which can hold
+    /// secrets that do not belong in the log or the menu.
+    var publicURL: String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        return components.string ?? url.absoluteString
+    }
+}
 
 /// What one line of INI text is: a "[section]" header, a "key = value"
 /// setting, nothing (a blank line, or a comment starting with "#" or ";"),
@@ -113,6 +168,7 @@ struct Configuration {
     let orgs: [String]
     let actions: [String]
     let command: String
+    let stream: StreamSettings?
 
     var relay: String { "\(host):\(port)" }
 
@@ -169,5 +225,30 @@ struct Configuration {
         let actions = list("github.actions")
         self.actions = actions.isEmpty ? ["opened"] : actions
         command = try required("command.run")
+
+        let url = values["stream.url"] ?? ""
+        guard !url.isEmpty else {
+            for key in ["stream.path", "stream.file"] where !(values[key] ?? "").isEmpty {
+                throw Problem(description: "\(key) is set, but stream.url is not")
+            }
+            stream = nil
+            return
+        }
+        guard let streamURL = URL(string: url),
+              ["http", "https"].contains(streamURL.scheme?.lowercased()),
+              streamURL.host != nil else {
+            // The URL can hold a secret, so the message leaves it out.
+            throw Problem(description: "stream.url is not an http or https URL")
+        }
+        let path = try required("stream.path")
+        let keys = path.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        guard !keys.contains("") else {
+            throw Problem(description: "the path \(path) has an empty key")
+        }
+        let file = NSString(string: try required("stream.file")).expandingTildeInPath
+        guard file.hasPrefix("/") else {
+            throw Problem(description: "the value file \(file) is not an absolute path")
+        }
+        stream = StreamSettings(url: streamURL, path: keys, file: file)
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 // Tests for the parts of github-hookbar that do not need the menu bar. Run
 // them with `make test`.
@@ -361,6 +362,7 @@ let minimal = "[relay]\naddress = [::1]:8081\n[command]\nrun = open\n"
 if case .success(let parsed) = configuration(minimal) {
     expect(parsed.host == "::1" && parsed.relay == "::1:8081", "an IPv6 relay: \(parsed.host)")
     expect(parsed.authors.isEmpty && parsed.orgs.isEmpty, "no authors or owners accepts anyone")
+    expect(parsed.stream == nil, "no event stream")
 } else {
     expect(false, "a minimal configuration is read: \(String(describing: problem(minimal)))")
 }
@@ -374,8 +376,33 @@ for (text, expected) in [
     (minimal + "[github]\nauthor = octocat\n", "github.author is not a setting github-hookbar knows"),
     (minimal + "[command]\nrun = open\n", "command.run is set more than once"),
     (minimal + "authors\n", "a line is not \"key = value\": authors"),
+    (minimal + "[stream]\npath = a.b\n", "stream.path is set, but stream.url is not"),
+    (minimal + "[stream]\nfile = /tmp/x\n", "stream.file is set, but stream.url is not"),
+    (minimal + "[stream]\nurl = ftp://example.com/\npath = a\nfile = /x\n",
+     "stream.url is not an http or https URL"),
+    (minimal + "[stream]\nurl = https:events\npath = a\nfile = /x\n",
+     "stream.url is not an http or https URL"),
+    (minimal + "[stream]\nurl = https://example.com/\nfile = /x\n", "stream.path is not set"),
+    (minimal + "[stream]\nurl = https://example.com/\npath = a..b\nfile = /x\n",
+     "the path a..b has an empty key"),
+    (minimal + "[stream]\nurl = https://example.com/\npath = a\n", "stream.file is not set"),
+    (minimal + "[stream]\nurl = https://example.com/\npath = a\nfile = x.txt\n",
+     "the value file x.txt is not an absolute path"),
 ] {
     expect(problem(text) == expected, "\(expected): \(String(describing: problem(text)))")
+}
+let withStream = minimal
+    + "[stream]\nurl = HTTPS://example.com/events\npath = message.text\nfile = ~/a/b.txt\n"
+expect(StreamSettings(url: URL(string: "https://me:secret@example.com:8/events?token=t#top")!,
+                      path: [], file: "/").publicURL == "https://example.com:8/events#top",
+       "the URL shown leaves out the user name, password and query")
+if case .success(let parsed) = configuration(withStream) {
+    expect(parsed.stream == StreamSettings(url: URL(string: "HTTPS://example.com/events")!,
+                                           path: ["message", "text"],
+                                           file: NSHomeDirectory() + "/a/b.txt"),
+           "an event stream: \(String(describing: parsed.stream))")
+} else {
+    expect(false, "a stream is read: \(String(describing: problem(withStream)))")
 }
 
 /// What setting a setting does to INI text.
@@ -445,6 +472,527 @@ expect(event("closed", author: "hubot", state: "closed")
        "closing another author's pull request does not change the list")
 expect((try? PullRequestEvent(Data(#"{"action": "opened"}"#.utf8))) == nil,
        "a delivery without a pull request is not read")
+
+// MARK: - Event streams
+
+/// The data of the events in a stream that arrives in the given pieces.
+func events(_ pieces: [Data]) -> [String] {
+    var parser = EventStreamParser()
+    return pieces.flatMap { (try? parser.read($0)) ?? ["failed"] }
+}
+
+func events(_ pieces: String...) -> [String] {
+    events(pieces.map { Data($0.utf8) })
+}
+
+let streamText = ": a comment\n\nevent: update\nid: 7\nretry: 10\ndata: {\"a\": \"✓\"}\n\n"
+    + "data: first\ndata:second\ndata:  third\ndata\n\n"
+expect(events(streamText) == [#"{"a": "✓"}"#, "first\nsecond\n third\n"],
+       "each event's data lines, joined: \(events(streamText))")
+expect(events(Data(streamText.utf8).map { Data([$0]) }) == events(streamText),
+       "a stream split between every byte, even within a character, reads the same")
+expect(events("data: a\r\n\r\ndata: b\r\rdata: c\n\n") == ["a", "b", "c"],
+       "lines can end with CRLF, CR, or LF")
+expect(events("data: a\r", "\ndata: b\r", "\n\r", "\n") == ["a\nb"],
+       "a CRLF split between pieces is one line ending")
+expect(events("\u{feff}data: a\n\n\u{feff}data: b\n\n") == ["a"],
+       "a byte order mark is dropped only at the start of the stream")
+expect(events("event: ping\n\n\n: comment\n\n") == [], "events without data are not dispatched")
+expect(events("data:\u{301}x\n\n") == ["\u{301}x"],
+       "the field name ends at a colon that a combining mark follows")
+expect(events("data: done\n\ndata: cut short\n") == ["done"],
+       "an event that the stream does not finish is not dispatched")
+var limited = EventStreamParser(limit: 8)
+expect((try? limited.read(Data("data: 12\n\ndata: 1\ndata".utf8))) == ["12"],
+       "events up to the limit are read")
+expect((try? limited.read(Data("xxx".utf8))) == [],
+       "an event that reaches the limit is still read")
+expect((try? limited.read(Data("x".utf8))) == nil,
+       "an event that grows past the limit fails the stream")
+
+expect(string(at: ["message", "text"], inJSON: #"{"message": {"text": "hi", "n": 1}}"#) == "hi",
+       "a path through objects")
+let listJSON = #"{"a": [{"b": "x"}, "y"]}"#
+expect(string(at: ["a", "0", "b"], inJSON: listJSON) == "x", "a path through an array")
+expect(string(at: ["a", "1"], inJSON: listJSON) == "y", "a path to an element of an array")
+expect(string(at: [], inJSON: #""top""#) == "top", "an empty path is the whole text")
+expect(string(at: ["a", "+1"], inJSON: listJSON) == nil && string(at: ["a", "01"], inJSON: listJSON)
+       == nil, "an index must be written plainly")
+for (path, json) in [(["a", "2"], listJSON), (["a", "-1"], listJSON), (["a", "first"], listJSON),
+                     (["a", "1", "z"], listJSON), (["missing"], listJSON),
+                     (["n"], #"{"n": 1}"#), (["n"], #"{"n": null}"#), (["n"], #"{"n": {}}"#),
+                     (["message"], "1"), (["message"], "not JSON")] {
+    expect(string(at: path, inJSON: json) == nil, "\(path) leads to no string in \(json)")
+}
+
+let valuePath = temporaryDirectory() + "/new/value.txt"
+let valueFile = StreamValueFile(StreamSettings(url: URL(fileURLWithPath: "/"),
+                                               path: ["message", "text"], file: valuePath))
+
+/// Gives the value file an event's data, and returns what it says changed,
+/// as the log would say it.
+func take(_ data: String, at time: Date = Date()) -> String? {
+    var change: ValueFileChange?
+    waitForMain { done in
+        valueFile.take(data, at: time) {
+            change = $0
+            done()
+        }
+    }
+    return change?.description
+}
+
+/// The file's identity, which stays the same while it is changed in place.
+func inode(_ path: String) -> ino_t? {
+    var status = stat()
+    return stat(path, &status) == 0 ? status.st_ino : nil
+}
+
+let firstWrite = Date(timeIntervalSince1970: 1000)
+expect(valueFile.latest == nil, "a new value file has seen no value")
+var firstChange: ValueFileChange?
+waitForMain { done in
+    valueFile.take(#"{"message": {"text": "first"}}"#) {
+        firstChange = $0
+        done()
+    }
+}
+if case .wrote(let file, let value)? = firstChange {
+    expect(file == valuePath && value == "first", "a write says what it wrote: \(value)")
+} else {
+    expect(false, "the first value is written: \(String(describing: firstChange))")
+}
+expect(take(#"{"message": {"text": "hello\n"}}"#, at: firstWrite) == "wrote \(valuePath)"
+       && valueFile.latest == "hello\n"
+       && contents(valuePath) == "hello\n" && valueFile.writtenAt == firstWrite,
+       "the value is written, and its directory made: \(String(describing: contents(valuePath)))")
+expect(take(#"{"message": {"text": "hello\n"}}"#) == nil
+       && valueFile.writtenAt == firstWrite,
+       "a value the file already holds is not written again")
+expect(take("1") == nil && contents(valuePath) == "hello\n",
+       "an event without a value leaves the file alone")
+try? "changed by hand".write(toFile: valuePath, atomically: false, encoding: .utf8)
+expect(take(#"{"message": {"text": "hello\n"}}"#) == "wrote \(valuePath)"
+       && contents(valuePath) == "hello\n",
+       "a file changed by something else gets the value again")
+let firstInode = inode(valuePath)
+expect(take(#"{"message": {"text": ""}}"#) == "wrote \(valuePath)" && inode(valuePath) == firstInode
+       && contents(valuePath) == "",
+       "an empty value empties the file")
+try? FileManager.default.removeItem(atPath: valuePath)
+try? FileManager.default.createDirectory(atPath: valuePath + "/in-the-way",
+                                         withIntermediateDirectories: true)
+let writeProblem = take(#"{"message": {"text": "x"}}"#)
+expect(writeProblem?.hasPrefix("could not write the value file: cannot open \(valuePath): ") == true
+       && valueFile.problem != nil,
+       "a file that cannot be written is a problem: \(String(describing: writeProblem))")
+expect(take(#"{"message": {"text": "x"}}"#) == nil && valueFile.problem != nil,
+       "the same problem again is no change")
+try? FileManager.default.removeItem(atPath: valuePath)
+expect(take(#"{"message": {"text": "x"}}"#) == "wrote \(valuePath)"
+       && valueFile.problem == nil && contents(valuePath) == "x", "writing the file once it can be written clears the problem")
+try? FileManager.default.removeItem(atPath: valuePath)
+try? FileManager.default.createDirectory(atPath: valuePath + "/in-the-way",
+                                         withIntermediateDirectories: true)
+_ = take(#"{"message": {"text": "y"}}"#)
+try? FileManager.default.removeItem(atPath: valuePath)
+try? "x".write(toFile: valuePath, atomically: false, encoding: .utf8)
+let heldWrittenAt = valueFile.writtenAt
+expect(valueFile.problem != nil && take(#"{"message": {"text": "x"}}"#)
+       == "\(valuePath) already holds the latest value" && valueFile.problem == nil
+       && valueFile.writtenAt == heldWrittenAt,
+       "a file that already holds the value clears the problem, without saying it was written")
+
+// MARK: - Event stream connections
+
+/// Listens on a port of its own on the loopback interface, and answers each
+/// connection's first piece of request with `response`, closing the
+/// connection afterwards when `closes` is true. Returns the listener, which
+/// keeps listening until it is cancelled, and its port.
+func startServer(_ response: String, closes: Bool = true) -> (NWListener, UInt16) {
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    guard let listener = try? NWListener(using: parameters) else {
+        fatalError("could not make a listener")
+    }
+    listener.newConnectionHandler = { connection in
+        connection.start(queue: .main)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { _, _, _, _ in
+            connection.send(content: Data(response.utf8),
+                            contentContext: closes ? .finalMessage : .defaultMessage,
+                            isComplete: closes, completion: .idempotent)
+        }
+    }
+    waitForMain { done in
+        listener.stateUpdateHandler = { state in
+            if case .ready = state {
+                done()
+            }
+        }
+        listener.start(queue: .main)
+    }
+    guard let port = listener.port?.rawValue else {
+        fatalError("the listener has no port")
+    }
+    return (listener, port)
+}
+
+/// Follows the stream at a server that answers with `response` until the
+/// connection ends, and returns whether it was ready, the events, and why it
+/// ended.
+func follow(_ response: String, closes: Bool = true,
+            idleLimit: TimeInterval = 60) -> (Bool, [String], String?) {
+    let (server, port) = startServer(response, closes: closes)
+    defer { server.cancel() }
+    let connection = EventStreamConnection(url: URL(string: "http://127.0.0.1:\(port)/events")!,
+                                           idleLimit: idleLimit)
+    var ready = false
+    var events: [String] = []
+    var reason: String?
+    waitForMain { done in
+        connection.onReady = { ready = true }
+        connection.onEvent = { events.append($0) }
+        connection.onEnded = {
+            reason = $0
+            done()
+        }
+        connection.start()
+    }
+    return (ready, events, reason)
+}
+
+let streamHead = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
+    + "Connection: close\r\n\r\n"
+let (streamReady, streamed, streamEnd) = follow(streamHead + streamText)
+expect(streamReady && streamed == events(streamText), "the stream's events arrive: \(streamed)")
+expect(streamEnd == "the server ended the stream",
+       "the stream ends: \(String(describing: streamEnd))")
+
+let (missingReady, missingEvents, missingEnd) = follow(
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+expect(!missingReady && missingEvents.isEmpty
+       && missingEnd == "the server answered with status 404",
+       "a stream that is not there: \(String(describing: missingEnd))")
+let (pageReady, pageEvents, pageEnd) = follow(
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\ndata: a\n\nxyz")
+expect(!pageReady && pageEvents.isEmpty
+       && pageEnd == "the server answered with content type text/html, not text/event-stream",
+       "a response that is not an event stream: \(String(describing: pageEnd))")
+let (idleReady, idleEvents, idleEnd) = follow(streamHead + "data: a\n\n", closes: false,
+                                              idleLimit: 0.2)
+expect(idleReady && idleEvents == ["a"] && idleEnd != nil
+       && idleEnd != "the server ended the stream",
+       "a stream that goes quiet ends: \(String(describing: idleEnd))")
+
+// An event that cancels the connection is the last, and the connection does
+// not then say it ended.
+let (cancelServer, cancelPort) = startServer(streamHead + "data: a\n\ndata: b\n\n")
+let cancelled = EventStreamConnection(url: URL(string: "http://127.0.0.1:\(cancelPort)/")!)
+var cancelledEvents: [String] = []
+var cancelledEnded = false
+waitForMain { done in
+    cancelled.onEvent = {
+        cancelledEvents.append($0)
+        cancelled.cancel()
+        done()
+    }
+    cancelled.onEnded = { _ in cancelledEnded = true }
+    cancelled.start()
+}
+cancelServer.cancel()
+_ = follow(streamHead)
+expect(cancelledEvents == ["a"] && !cancelledEnded,
+       "nothing arrives after cancelling: \(cancelledEvents), \(cancelledEnded)")
+
+// MARK: - Persistent connections
+
+final class FakeConnection: Connection {
+    var onReady: (() -> Void)?
+    var onEnded: ((String) -> Void)?
+    var started = false
+    var cancelled = false
+
+    func start() {
+        started = true
+    }
+
+    func cancel() {
+        cancelled = true
+    }
+}
+
+var clock = Date(timeIntervalSince1970: 1000)
+var fakes: [FakeConnection] = []
+var stateChanges = 0
+let persistent = PersistentConnection(now: { clock })
+persistent.onChange = { stateChanges += 1 }
+
+func open() -> Connection {
+    let connection = FakeConnection()
+    fakes.append(connection)
+    return connection
+}
+
+/// The state's description, with times as seconds after the clock.
+func persistentState() -> String {
+    switch persistent.state {
+    case .connecting:
+        return "connecting"
+    case .connected(let since):
+        return "connected \(since.timeIntervalSince(clock))"
+    case .disconnected(let reason, let retryAt):
+        return "\(reason), again at \(retryAt.map { "\($0.timeIntervalSince(clock))" } ?? "never")"
+    }
+}
+
+expect(persistentState() == "not started, again at never", "a new connection has not started")
+persistent.start(open)
+expect(fakes.count == 1 && fakes[0].started && persistentState() == "connecting",
+       "starting connects: \(persistentState())")
+fakes[0].onReady?()
+expect(persistentState() == "connected 0.0", "the connection is ready: \(persistentState())")
+persistent.wake()
+expect(fakes.count == 1, "waking while connected does not reconnect")
+var expectedDelays: [TimeInterval] = []
+var delays: [String] = []
+clock += 0.5
+for delay in [1.0, 2, 4, 8, 16, 32, 64, 64] {
+    fakes[fakes.count - 1].onEnded?("gone")
+    expectedDelays.append(delay)
+    delays.append(persistentState())
+    persistent.wake()
+}
+expect(delays == expectedDelays.map { "gone, again at \($0)" },
+       "each failure doubles the wait, up to a maximum: \(delays)")
+expect(fakes.count == 9 && persistentState() == "connecting",
+       "waking connects straight away: \(fakes.count)")
+fakes[8].onReady?()
+clock += 64.5
+fakes[8].onEnded?("gone")
+expect(persistentState() == "gone, again at 1.0",
+       "a connection that lasted longer than the next wait starts the waits again: "
+       + persistentState())
+persistent.wake()
+fakes[0].onReady?()
+fakes[1].onEnded?("old")
+expect(persistentState() == "connecting", "old connections are not heard: \(persistentState())")
+persistent.start(open)
+expect(fakes[9].cancelled && fakes.count == 11, "starting again replaces the connection")
+let changesBeforeStop = stateChanges
+persistent.stop("stopped")
+expect(fakes[10].cancelled && persistentState() == "stopped, again at never"
+       && stateChanges == changesBeforeStop + 1,
+       "stopping ends the connection: \(persistentState())")
+persistent.wake()
+expect(fakes.count == 11, "waking does not connect once stopped")
+
+// A connection that ends as soon as it is ready still makes the next wait
+// longer.
+let brief = PersistentConnection(now: { clock })
+var briefFakes: [FakeConnection] = []
+brief.start {
+    let connection = FakeConnection()
+    briefFakes.append(connection)
+    return connection
+}
+var briefWaits: [TimeInterval] = []
+for _ in 0..<3 {
+    briefFakes[briefFakes.count - 1].onReady?()
+    briefFakes[briefFakes.count - 1].onEnded?("gone")
+    if case .disconnected(_, let retryAt?) = brief.state {
+        briefWaits.append(retryAt.timeIntervalSince(clock))
+    }
+    brief.wake()
+}
+expect(briefWaits == [1, 2, 4], "connections that end at once wait longer each time: \(briefWaits)")
+/// Makes the latest of the brief connections ready, ends it after `lasting`
+/// seconds, and returns the wait after it.
+func endBrief(lasting: TimeInterval) -> TimeInterval? {
+    brief.wake()
+    briefFakes[briefFakes.count - 1].onReady?()
+    clock += lasting
+    briefFakes[briefFakes.count - 1].onEnded?("gone")
+    if case .disconnected(_, let retryAt?) = brief.state {
+        return retryAt.timeIntervalSince(clock)
+    }
+    return nil
+}
+let afterShort = endBrief(lasting: 7.5)
+expect(afterShort == 8, "a connection no longer than the next wait makes the wait longer: "
+       + String(describing: afterShort))
+let afterLong = endBrief(lasting: 16.5)
+expect(afterLong == 1, "a connection longer than the next wait starts the waits again: "
+       + String(describing: afterLong))
+
+// The waits are real.
+let quick = PersistentConnection(firstRetryDelay: 0.01)
+var quickOpened = 0
+waitForMain { done in
+    quick.start {
+        quickOpened += 1
+        let connection = FakeConnection()
+        if quickOpened == 1 {
+            DispatchQueue.main.async { connection.onEnded?("gone") }
+        } else {
+            done()
+        }
+        return connection
+    }
+}
+expect(quickOpened == 2, "a connection that ends is opened again after the wait")
+
+// MARK: - The train
+
+/// Ten points for every character.
+func tenEach(_ text: String) -> CGFloat { CGFloat(text.count * 10) }
+
+for (text, width, expected, message) in [
+    ("the quick brown fox", 100, ["the quick", "brown fox"], "words share cars while they fit"),
+    ("exactly", 70, ["exactly"], "a word exactly as wide as a car fits"),
+    ("  a\n\nb\t c ", 100, ["a b c"], "runs of white space, line breaks included, separate words"),
+    ("abcdefghijkl xy", 50, ["abcde", "fghij", "kl xy"], "a word too wide for a car is split"),
+    (" \n ", 100, [], "white space alone gives no cars"),
+] as [(String, CGFloat, [String], String)] {
+    let loads = freightLoads(text, maximumWidth: width, width: tenEach)
+    expect(loads == expected, "\(message): \(loads)")
+}
+
+let long = String(repeating: "word ", count: 10_000)
+let longLoads = trainLoads(long)
+expect(longLoads.count == maximumCars && longLoads.last == "…"
+       && longLoads.dropLast().allSatisfy { $0.hasPrefix("word") },
+       "a long text is cut short, and its last car says so: \(longLoads.count)")
+let fullLoads = trainLoads(String(repeating: "word ", count: 40))
+expect(fullLoads.joined(separator: " ") == String(repeating: "word ", count: 40).dropLast(),
+       "a text that fits is carried whole: \(fullLoads.count)")
+// Each of these words is too wide to share a car.
+let wide = "WWWWWWWWWW"
+let exactlyFull = trainLoads(Array(repeating: wide, count: maximumCars).joined(separator: " "))
+expect(exactlyFull.count == maximumCars && !exactlyFull.contains("…"),
+       "a train can be exactly full: \(exactlyFull.count)")
+let overFull = trainLoads(Array(repeating: wide, count: maximumCars + 1).joined(separator: " "))
+expect(overFull.count == maximumCars && overFull.last == "…"
+       && overFull.dropLast().allSatisfy { $0 == wide },
+       "one car too many is cut short: \(overFull.count)")
+let invisible = trainLoads(String(repeating: "\u{200B}", count: 100_000))
+expect(invisible.count == maximumCars
+       && invisible.dropLast().allSatisfy { $0.count == maximumLoadCharacters },
+       "characters that take up no width are shared out by count: \(invisible.count)")
+let accented = "e" + String(repeating: "\u{301}", count: 3) + "x"
+expect(trainLoads(accented) == [accented], "combining marks stay with their letter")
+expect(trainLoads("e" + String(repeating: "\u{301}", count: 200)) == ["…"],
+       "a letter under too many marks to draw is carried as an ellipsis")
+expect(trainLoads(String(repeating: "\u{1100}", count: 20_000)) == ["…"],
+       "a character too long to draw is carried as an ellipsis")
+let joined = Array(repeating: "👍", count: 40).joined(separator: "\u{200D}")
+expect(trainLoads("go " + joined) == ["go …"],
+       "a long chain of joined emoji is one character, carried as an ellipsis")
+expect(freightLoads("a", maximumWidth: 5, width: tenEach) == ["…"],
+       "a character wider than a car is carried as an ellipsis")
+expect(freightLoads("ab cdefg", maximumWidth: 1000, maximumCharacters: 3, width: tenEach)
+       == ["ab cde", "fg"], "the start of a split word can share a car with the word before")
+expect(trainLoads(" \n").isEmpty, "white space sends no train")
+let padded = String(repeating: " ", count: 5000) + "b"
+expect(trainLoads(padded) == ["b"], "white space before the words is skipped: \(trainLoads(padded))")
+let gap = "a" + String(repeating: " ", count: 5000) + "b"
+expect(trainLoads(gap) == ["a b"], "a long gap between words loses no words: \(trainLoads(gap))")
+let huge = trainLoads(String(repeating: "x", count: 100_000))
+expect(huge.count == maximumCars && huge.last == "…",
+       "one huge word is cut short too: \(huge.count)")
+expect(freightLoads("a b c d", maximumWidth: 10, limit: 2, width: tenEach) == ["a", "b"],
+       "sharing out stops at the limit")
+expect(freightLoads("abcdefg", maximumWidth: 1000, maximumCharacters: 3, width: tenEach)
+       == ["abc", "def", "g"], "a word is split after the most characters a car carries")
+
+for width: CGFloat in [800, 1512, 3008] {
+    let lead = lineLead(width: width)
+    expect(abs(lineFront(at: 0, width: width) - width) < 1e-9
+           && abs(lineFront(at: lead.crossing, width: width) + lineEdge) < 1e-9,
+           "the front of the line crosses the whole window: \(width)")
+    expect(abs(lineFront(at: lead.delay, width: width) - width * 3 / 4) < 1e-6,
+           "the train comes in a quarter of the window behind the front of the line: \(width)")
+    // The front of the train, from when it comes in, against the line.
+    let behind = stride(from: lead.delay, through: lead.crossing, by: 0.01).allSatisfy {
+        width - trainSpeed * CGFloat($0 - lead.delay) - lineFront(at: $0, width: width)
+            >= width / 4 - 1e-6
+    }
+    expect(behind, "the train never catches up with the front of the line: \(width)")
+}
+expect(railTop + engineHeight + trainRock <= trainHeight, "the engine fits in the window")
+let knee = pantographKnee(foot: pantographFoot)
+expect(hypot(knee.x - pantographKneeAtRest.x, knee.y - pantographKneeAtRest.y) < 1e-9,
+       "at rest, the pantograph's knee is where it is drawn: \(knee)")
+for rise in trainRockSteps {
+    let foot = CGPoint(x: pantographFoot.x, y: pantographFoot.y + rise)
+    let bent = pantographKnee(foot: foot)
+    expect(abs(hypot(bent.x - foot.x, bent.y - foot.y)
+               - hypot(pantographKneeAtRest.x - pantographFoot.x,
+                       pantographKneeAtRest.y - pantographFoot.y)) < 1e-9
+           && abs(hypot(pantographHead.x - bent.x, pantographHead.y - bent.y)
+                  - hypot(pantographHead.x - pantographKneeAtRest.x,
+                          pantographHead.y - pantographKneeAtRest.y)) < 1e-9,
+           "as the engine rises \(rise), the pantograph's arms keep their length")
+    expect(bent.x > pantographHead.x, "the knee stays behind the head: \(bent)")
+}
+expect(railTop + mastHeight <= trainHeight, "the masts fit in the window")
+expect(contactWireHeight + 1 <= engineHeight, "the raised pantograph reaches the contact wire")
+expect(engineWheels.allSatisfy { $0 - engineWheelRadius >= 0 && $0 + engineWheelRadius <= engineLength },
+       "the engine's wheels are under it: \(engineWheels)")
+
+do {
+    var random = SystemRandomNumberGenerator()
+    let empty = trainLayer([], width: 1000, scale: 2, using: &random)
+    let loaded = trainLayer(["hi"], width: 1000, scale: 2, using: &random)
+    expect(abs(empty.duration - lineLead(width: 1000).delay
+               - Double((1000 + engineLength + lineTrail + lineEdge) / trainSpeed)) < 1e-9,
+           "an engine alone takes as long as it needs to cross: \(empty.duration)")
+    let car = max(minimumCarLength, letteringWidth("hi") + 2 * carPadding) + couplingLength
+    expect(abs(loaded.duration - empty.duration - Double(car / trainSpeed)) < 1e-9,
+           "each car adds the time it takes to pass: \(loaded.duration)")
+}
+
+/// A random number generator that gives the same numbers every time.
+struct SeededRandom: RandomNumberGenerator {
+    var state: UInt64
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+var seeded = SeededRandom(state: 1)
+let sparks = sparkTimes(from: 10, to: 100_010, using: &seeded)
+expect(sparks.first.map { $0 >= 10 + sparkLife } == true && sparks.last.map { $0 + sparkLife <= 100_010 } == true,
+       "sparks come within the run")
+expect(zip(sparks, sparks.dropFirst()).allSatisfy { $0 < $1 }, "sparks come in order")
+let perBurst = Double(sparks.count) * (sparkInterval + sparkLife) / 100_000
+expect(abs(perBurst - 4) < 0.2,
+       "bursts begin about once every \(sparkInterval) seconds, four sparks each: \(perBurst)")
+
+var bursts: [[CFTimeInterval]] = []
+for _ in 0..<20_000 {
+    bursts.append(sparkBurst(at: 5, using: &seeded))
+}
+let meanBurst = Double(bursts.map(\.count).reduce(0, +)) / Double(bursts.count)
+expect(abs(meanBurst - 4) < 0.15, "a burst has four sparks on average: \(meanBurst)")
+expect(bursts.allSatisfy { $0.first == 5 && zip($0, $0.dropFirst()).allSatisfy { $0 <= $1 } },
+       "a burst starts with its first spark and comes in order")
+expect(bursts.allSatisfy { burst in
+    burst.indices.dropFirst().allSatisfy { index in
+        burst[..<index].contains { (0.03...1.5).contains(burst[index] - $0) }
+    }
+}, "every later spark in a burst follows an earlier one by 30 to 1,500 milliseconds")
+let lone = Double(bursts.filter { $0.count == 1 }.count) / Double(bursts.count)
+expect(abs(lone - 0.375) < 0.02,
+       "a spark with no followers, half the time and three quarters of the time: \(lone)")
+let quickly = Double(bursts.filter { $0.count > 1 && $0[1] - $0[0] <= 0.15 }.count)
+    / Double(bursts.count)
+expect(quickly >= 0.5, "half of all first sparks are followed within 150 milliseconds: \(quickly)")
+expect(sparkTimes(from: 0, to: sparkLife, using: &seeded).isEmpty, "a run too short for a spark has none")
 
 if failures > 0 {
     fputs("\(failures) failed\n", stderr)

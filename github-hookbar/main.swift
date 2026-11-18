@@ -5,17 +5,13 @@ import os
 // github-hookbar: a menu bar indicator that keeps a connection open to a relay of
 // GitHub webhook deliveries, runs a command for each pull request that a
 // chosen author opens, and keeps a list of those pull requests until they
-// are closed.
+// are closed. It can also follow a stream of server-sent events and keep a
+// value from them in a file.
 
 // MARK: - Constants
 
 let defaultConfigurationPath = "~/.config/github-hookbar/config.ini"
 let pullRequestListPath = NSHomeDirectory() + "/.cache/github-prs.tsv"
-
-/// After the connection fails, the first attempt to connect again waits this
-/// long, and each failure after that doubles the wait, up to the maximum.
-let firstRetryDelay: TimeInterval = 1
-let maximumRetryDelay: TimeInterval = 64
 
 /// How many handled pull requests the menu lists.
 let recentLength = 10
@@ -51,7 +47,7 @@ func log(_ message: String) {
 /// the connection has ended; a frame that the end of the connection cuts
 /// short is not a delivery. All methods and callbacks run on the main
 /// thread.
-final class RelayConnection {
+final class RelayConnection: Connection {
     var onReady: (() -> Void)?
     var onDelivery: ((Delivery) -> Void)?
     var onEnded: ((String) -> Void)?
@@ -77,7 +73,9 @@ final class RelayConnection {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                self?.onReady?()
+                if self?.ended == false {
+                    self?.onReady?()
+                }
             case .waiting(let error), .failed(let error):
                 self?.end(describe(error))
             default:
@@ -283,127 +281,6 @@ func lookUpPullRequests(_ search: String,
     }
 }
 
-// MARK: - Settings window
-
-/// A window with a field for each setting, which edits the configuration
-/// file in place: saving rewrites only the lines of the settings that the
-/// window shows, so the file's comments and layout stay as they were.
-final class SettingsWindow: NSObject {
-    var onSave: (() -> Void)?
-    private let url: URL
-    private let window: NSWindow
-    private let fields: [NSTextField]
-    private let message = NSTextField(wrappingLabelWithString: "")
-    /// What the fields held when the window opened. Saving writes only the
-    /// fields that have changed since, so it keeps whatever else changed in
-    /// the file meanwhile.
-    private var shown: [String] = []
-
-    init(url: URL) {
-        self.url = url
-        fields = settings.map { setting in
-            let field = NSTextField()
-            field.placeholderString = setting.placeholder
-            field.widthAnchor.constraint(equalToConstant: 360).isActive = true
-            return field
-        }
-        window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable],
-                          backing: .buffered, defer: true)
-        super.init()
-        window.title = "github-hookbar Settings"
-        window.isReleasedWhenClosed = false
-        let grid = NSGridView(views: zip(settings, fields).map { setting, field in
-            [NSTextField(labelWithString: setting.label), field]
-        })
-        grid.column(at: 0).xPlacement = .trailing
-        grid.rowAlignment = .firstBaseline
-        message.textColor = .systemRed
-        message.preferredMaxLayoutWidth = 480
-        let editFile = NSButton(title: "Edit File…", target: self, action: #selector(openFile))
-        let cancel = NSButton(title: "Cancel", target: window,
-                              action: #selector(NSWindow.performClose(_:)))
-        cancel.keyEquivalent = "\u{1b}"
-        let save = NSButton(title: "Save", target: self, action: #selector(save))
-        save.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [editFile, NSView(), cancel, save])
-        let stack = NSStackView(views: [grid, message, buttons])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        buttons.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
-        let content = NSView()
-        content.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-        ])
-        window.contentView = content
-        window.initialFirstResponder = fields[0]
-        window.center()
-    }
-
-    /// Brings the window to the front, filling the fields from the file as
-    /// it is now unless the window is already open.
-    func show() {
-        if !window.isVisible {
-            var values: [String: String] = [:]
-            message.stringValue = ""
-            do {
-                if let text = try contents() {
-                    let file = try INIFile(text)
-                    values = file.values
-                    _ = try Configuration(file)
-                }
-            } catch {
-                message.stringValue = "\(error)"
-            }
-            message.isHidden = message.stringValue.isEmpty
-            for (setting, field) in zip(settings, fields) {
-                field.stringValue = values[setting.name] ?? ""
-            }
-            shown = fields.map(\.stringValue)
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-    }
-
-    /// The file's text, or nothing when there is no file yet.
-    private func contents() throws -> String? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try String(contentsOf: url, encoding: .utf8)
-    }
-
-    @objc private func save() {
-        do {
-            var file = try INIFile(try contents() ?? "")
-            for (index, setting) in settings.enumerated()
-            where fields[index].stringValue != shown[index] {
-                try file.set(setting.name, to: fields[index].stringValue
-                    .components(separatedBy: .newlines).joined(separator: " ")
-                    .trimmingCharacters(in: .whitespaces))
-            }
-            _ = try Configuration(file)
-            // Writing through a symbolic link keeps the link.
-            let target = url.resolvingSymlinksInPath()
-            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            try file.text.write(to: target, atomically: true, encoding: .utf8)
-        } catch {
-            message.stringValue = "\(error)"
-            message.isHidden = false
-            return
-        }
-        window.close()
-        onSave?()
-    }
-
-    @objc private func openFile() {
-        NSWorkspace.shared.open(url)
-    }
-}
-
 /// The application's main menu, which an app that lives in the menu bar
 /// still needs for the standard editing commands to reach text fields.
 func makeMainMenu() -> NSMenu {
@@ -431,19 +308,12 @@ func makeMainMenu() -> NSMenu {
 
 // MARK: - Menu bar app
 
-enum ConnectionState {
-    case connecting
-    case connected(since: Date)
-    case disconnected(reason: String, retryAt: Date?)
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let configurationURL: URL
     private var configuration: Configuration?
-    private var connection: RelayConnection?
-    private var state = ConnectionState.disconnected(reason: "not started", retryAt: nil)
-    private var retryDelay = firstRetryDelay
-    private var retry: DispatchWorkItem?
+    private let relay = PersistentConnection()
+    private var stream: (connection: PersistentConnection, file: StreamValueFile)?
+    private let train = TrainController()
     private var recent: [Run] = []
     /// How long after GitHub made it the last delivery on this connection
     /// arrived, when its delivery ID says when that was.
@@ -467,6 +337,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.configurationURL = configurationURL
         settingsWindow = SettingsWindow(url: configurationURL)
         super.init()
+        relay.onChange = { [weak self] in
+            guard let self else { return }
+            changed(relayName, relay.state)
+        }
         settingsWindow.onSave = { [weak self] in
             self?.connect()
         }
@@ -488,59 +362,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Reads the configuration again and opens a new connection to the relay.
+    /// Reads the configuration again and opens new connections.
     @objc private func connect() {
-        retry?.cancel()
-        retry = nil
-        connection?.cancel()
-        connection = nil
         let configuration: Configuration
         do {
             configuration = try Configuration(contentsOf: configurationURL)
         } catch {
             self.configuration = nil
-            show(.disconnected(reason: "\(error)", retryAt: nil))
+            relay.stop("\(error)")
+            // The stream is kept, so that settings that come back unchanged
+            // keep its record of writing the file.
+            stream?.connection.stop("the settings cannot be read")
             return
         }
         self.configuration = configuration
-        lastDeliveryAge = nil
-        let connection = RelayConnection(configuration)
-        connection.onReady = { [weak self] in
-            self?.show(.connected(since: Date()))
+        relay.start { [weak self] in
+            self?.lastDeliveryAge = nil
+            let connection = RelayConnection(configuration)
+            connection.onDelivery = { delivery in
+                self?.received(delivery)
+            }
+            return connection
         }
-        connection.onDelivery = { [weak self] delivery in
-            self?.received(delivery)
+        guard let settings = configuration.stream else {
+            return stopStream("the settings no longer name it")
         }
-        connection.onEnded = { [weak self] reason in
-            self?.connectionEnded(reason)
+        // A stream whose settings have not changed is opened again, but
+        // keeps its record of writing the file, and the wait it has reached.
+        if stream?.file.settings != settings {
+            stopStream("the settings changed")
+            let connection = PersistentConnection()
+            connection.onChange = { [weak self, weak connection] in
+                guard let self, let connection else { return }
+                changed(streamName(settings), connection.state)
+            }
+            stream = (connection, StreamValueFile(settings))
         }
-        self.connection = connection
-        show(.connecting)
-        connection.start()
+        if let stream {
+            let file = stream.file
+            stream.connection.start { [weak self] in
+                let connection = EventStreamConnection(url: settings.url)
+                connection.onEvent = { data in
+                    self?.streamed(data, into: file)
+                }
+                return connection
+            }
+        }
     }
 
-    /// Schedules the next attempt to connect. A connection that lasted longer
-    /// than the wait before it counts as a success, and starts the waits
-    /// again from the first; one that ended sooner, as one does when a proxy
-    /// in front of the relay accepts it and then finds the relay down, makes
-    /// the next wait longer.
-    private func connectionEnded(_ reason: String) {
-        connection = nil
-        if case .connected(let since) = state, Date().timeIntervalSince(since) > retryDelay {
-            retryDelay = firstRetryDelay
-        }
-        let retry = DispatchWorkItem { [weak self] in
-            self?.connect()
-        }
-        self.retry = retry
-        DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay, execute: retry)
-        show(.disconnected(reason: reason, retryAt: Date() + retryDelay))
-        retryDelay = min(retryDelay * 2, maximumRetryDelay)
+    private func stopStream(_ reason: String) {
+        let stopped = stream
+        stream = nil
+        stopped?.connection.stop(reason)
     }
 
     @objc private func didWake() {
-        if case .disconnected = state {
+        if configuration == nil {
             connect()
+        } else {
+            relay.wake()
+            stream?.connection.wake()
+        }
+    }
+
+    /// Writes the value from an event's data to the file, and sends a
+    /// train carrying it when it is new.
+    private func streamed(_ data: String, into file: StreamValueFile) {
+        file.take(data) { [weak self] change in
+            guard let self, let change else { return }
+            log("\(change)")
+            updateMenu()
+            if case .wrote(_, let value) = change {
+                train.run(value)
+            }
+        }
+    }
+
+    /// Sends a train carrying the latest value from the event stream, or
+    /// saying that there is none.
+    @objc private func sendTrain() {
+        if !train.run(stream?.file.latest ?? "") {
+            train.run("No message just now")
         }
     }
 
@@ -634,15 +536,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenu()
     }
 
-    private func show(_ state: ConnectionState) {
-        self.state = state
+    private var relayName: String {
+        configuration.map { "the relay at \($0.relay)" } ?? "the relay"
+    }
+
+    private func streamName(_ settings: StreamSettings) -> String {
+        "the event stream at \(settings.publicURL)"
+    }
+
+    private func changed(_ name: String, _ state: ConnectionState) {
         switch state {
         case .connecting:
             break
         case .connected:
-            log("connected to \(configuration?.relay ?? "the relay")")
+            log("connected to \(name)")
         case .disconnected(let reason, _):
-            log("not connected: \(reason)")
+            log("not connected to \(name): \(reason)")
         }
         updateIndicator()
         updateMenu()
@@ -653,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateIndicator() {
         let symbol: String
         var tint: NSColor?
-        switch state {
+        switch relay.state {
         case .connecting:
             symbol = "ellipsis.circle"
         case .connected:
@@ -676,23 +585,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var statusLines: [String] {
+        var lines = describe(relay.state, of: relayName)
+        if case .connected = relay.state, let lastDeliveryAge {
+            lines.append(String(format: "The last delivery arrived %.1f seconds after "
+                                + "GitHub made it", lastDeliveryAge))
+        }
+        if let stream {
+            let file = stream.file.settings.file
+            lines += describe(stream.connection.state, of: streamName(stream.file.settings))
+            if let problem = stream.file.problem {
+                lines.append("Could not write the value file: \(problem)")
+            } else if let writtenAt = stream.file.writtenAt {
+                lines.append("Wrote \(file) at " + timeFormatter.string(from: writtenAt))
+            }
+        }
+        return lines
+    }
+
+    private func describe(_ state: ConnectionState, of name: String) -> [String] {
         switch state {
         case .connecting:
-            return ["Connecting to \(configuration?.relay ?? "the relay")…"]
+            return ["Connecting to \(name)…"]
         case .connected(let since):
-            var lines = ["Connected to \(configuration?.relay ?? "the relay") since "
-                         + timeFormatter.string(from: since)]
-            if let lastDeliveryAge {
-                lines.append(String(format: "The last delivery arrived %.1f seconds after "
-                                    + "GitHub made it", lastDeliveryAge))
-            }
-            return lines
+            return ["Connected to \(name) since " + timeFormatter.string(from: since)]
         case .disconnected(let reason, let retryAt):
-            var lines = ["Not connected: \(reason)"]
-            if let retryAt {
-                lines.append("Trying again at " + timeFormatter.string(from: retryAt))
-            }
-            return lines
+            return ["Not connected to \(name): \(reason)"]
+                + (retryAt.map { ["Trying again at " + timeFormatter.string(from: $0)] } ?? [])
         }
     }
 
@@ -743,6 +661,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    keyEquivalent: "r")
         reconnect.target = self
         menu.addItem(reconnect)
+        // The train is behind Option, since waiting for a new value is no way
+        // to see what it looks like. It is an alternate of the item above,
+        // which AppKit swaps in while Option is held. An alternate has to
+        // follow its twin and carry the same key equivalent, differing only in
+        // the modifiers, which gives it Command-Option-R.
+        let sendTrain = NSMenuItem(title: "Send the Train", action: #selector(sendTrain),
+                                   keyEquivalent: "r")
+        sendTrain.keyEquivalentModifierMask = [.command, .option]
+        sendTrain.isAlternate = true
+        sendTrain.target = self
+        sendTrain.toolTip = "Send a train carrying the latest value from the event stream now."
+        menu.addItem(sendTrain)
         // An item without an action is disabled.
         let refresh = NSMenuItem(
             title: pullRequestList.isRefreshing
@@ -797,10 +727,8 @@ signal(SIGHUP) { _ in }
 signal(SIGPIPE) { _ in }
 
 let app = NSApplication.shared
-if configurationPath.hasPrefix("~/") {
-    configurationPath = NSHomeDirectory() + configurationPath.dropFirst()
-}
-let delegate = AppDelegate(configurationURL: URL(fileURLWithPath: configurationPath))
+let delegate = AppDelegate(configurationURL: URL(
+    fileURLWithPath: NSString(string: configurationPath).expandingTildeInPath))
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()

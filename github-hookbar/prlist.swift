@@ -60,42 +60,25 @@ enum PullRequestListChange: Equatable, CustomStringConvertible {
 }
 
 /// Replaces the lines of the file at `path` with the lines `transform`
-/// returns, creating the file and its directory when they do not exist yet.
+/// returns, under an exclusive lock as `withExclusiveLock` describes.
 /// `transform` is given a function that reads the file's lines, which fails
 /// when the file is not UTF-8 text, so a transform that ignores them can
-/// replace a file whatever it holds. The file is rewritten in place while an
-/// exclusive flock(2) lock on it is held, so a reader that holds a shared lock
-/// on it, as `flock -s` does, never sees it half written.
+/// replace a file whatever it holds.
 func rewriteLines(ofFileAt path: String,
                   _ transform: (() throws -> [String]) throws -> [String]) throws {
-    try FileManager.default.createDirectory(
-        at: URL(fileURLWithPath: path).deletingLastPathComponent(),
-        withIntermediateDirectories: true)
-    let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
-    guard descriptor >= 0 else {
-        throw Problem(description: "cannot open \(path): \(String(cString: strerror(errno)))")
+    try withExclusiveLock(onFileAt: path) { file in
+        let data = Data(try transform {
+            guard let text = String(data: try file.readToEnd() ?? Data(), encoding: .utf8) else {
+                throw Problem(description: "\(path) is not UTF-8 text")
+            }
+            var lines = text.components(separatedBy: "\n")
+            if lines.last == "" {
+                lines.removeLast()
+            }
+            return lines
+        }.map { $0 + "\n" }.joined().utf8)
+        try replaceContents(of: file, with: data)
     }
-    let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-    // Closing the file releases the lock.
-    defer { try? file.close() }
-    guard flock(descriptor, LOCK_EX) == 0 else {
-        throw Problem(description: "cannot lock \(path): \(String(cString: strerror(errno)))")
-    }
-    let data = Data(try transform {
-        guard let text = String(data: try file.readToEnd() ?? Data(), encoding: .utf8) else {
-            throw Problem(description: "\(path) is not UTF-8 text")
-        }
-        var lines = text.components(separatedBy: "\n")
-        if lines.last == "" {
-            lines.removeLast()
-        }
-        return lines
-    }.map { $0 + "\n" }.joined().utf8)
-    // Writing over the old text before cutting it short keeps it whole
-    // unless the new text cannot be written.
-    try file.seek(toOffset: 0)
-    try file.write(contentsOf: data)
-    try file.truncate(atOffset: UInt64(data.count))
 }
 
 /// How long GitHub's search can take to include a pull request that was just

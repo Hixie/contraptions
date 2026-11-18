@@ -6,9 +6,14 @@ request. The command is given the pull request's URL, so it can open the pull
 request, announce it, or hand it to whatever should start work on it.
 github-hookbar also keeps a file listing those pull requests and their
 branches until they are closed, so that other programs can find the pull
-request for a branch.
+request for a branch. It can also follow a stream of server-sent events and
+keep a value from those events in a file, as described in the section on
+following an event stream.
 
 ## What the indicator means
+
+The indicator shows the state of the connection to the relay. The menu shows
+the state of the event stream.
 
 - **Pull request arrows**: connected to the relay. The arrows dim for a
   moment when a delivery arrives, and stay dim while deliveries keep
@@ -34,10 +39,16 @@ pull request on GitHub.
 When a change to the pull request list fails, the menu says so until the
 list is next refreshed, and hovering over that line shows the whole error.
 
-**Reconnect** reads the configuration file again and opens a new connection.
+When the settings name an event stream, the menu also says whether
+github-hookbar is connected to it, and when it last wrote the value file, or
+why it could not.
+
+**Reconnect** reads the configuration file again and opens new connections.
 **Refresh Pull Request List** rebuilds the pull request list from GitHub, as
 described in the section on the pull request list. **Settings…** opens the
-settings window.
+settings window. Holding Option turns **Reconnect** into **Send the Train**,
+which sends the freight train described below straight away, as
+Command-Option-R does while the menu is open.
 
 ## The relay
 
@@ -77,20 +88,30 @@ The relay sends nothing between deliveries. github-hookbar turns on TCP
 keepalive, so a connection that dies without closing, for example while the
 computer sleeps, is noticed within about a minute and a half of idling.
 
-When the connection ends, github-hookbar tries again after one second, then
+An event stream that sends nothing for a minute is taken to have died in the
+same way, so a stream that can be quiet for longer should send comments or
+other events to keep it open.
+
+When a connection ends, github-hookbar tries again after one second, then
 after two, four, and so on, up to a minute apart, and goes back to one second
-once it has stayed connected for longer than the wait before it. When the
-computer wakes while github-hookbar is not connected, it tries again straight
-away.
+once a connection has lasted longer than the next wait would be. The relay
+and the event stream each keep their own waits. When the computer wakes
+while github-hookbar is not connected, it tries again straight away.
 
 ## Configuration
 
 github-hookbar keeps its configuration in
 `~/.config/github-hookbar/config.ini`, or in the file given with
 `--config PATH`. The settings window, which opens by itself when the file does
-not exist yet, has a field for each setting:
+not exist yet, has a field for each setting, in three groups. Each group
+says what it is for, and each field says what it holds.
 
-- **Relay**: the host and port where the relay accepts connections.
+**Webhook relay**
+
+- **Address**: the host and port where the relay accepts connections.
+
+**Pull requests**
+
 - **Authors**: comma-separated GitHub logins whose pull requests run the
   command and go on the pull request list. Empty means every author.
 - **Repository owners**: comma-separated repository owners to accept, for
@@ -99,6 +120,16 @@ not exist yet, has a field for each setting:
   `opened`, covers new pull requests, including drafts, and is what an empty
   field means.
 - **Command**: the command line to run.
+
+**Event stream**
+
+- **URL**: the `http` or `https` URL of a stream of server-sent events to
+  follow. Empty means none, in which case the next two fields must be empty
+  too.
+- **Value**: where the value is in each event's data, as described in the
+  section on following an event stream.
+- **Save to**: the file to keep the value in. A leading `~` stands for your
+  home directory.
 
 **Save** edits the file in place. Only the lines of the fields you changed are
 rewritten, so comments, layout, and anything changed in the file while the
@@ -110,15 +141,16 @@ reconnects with them. **Edit File…** opens the file itself.
 
 The file is in INI format; see [config.example.ini](config.example.ini). The
 window's settings are, in order, `address` in `[relay]`, `authors`, `orgs` and
-`actions` in `[github]`, and `run` in `[command]`. github-hookbar refuses a
-file that sets any other key, or sets one twice, so a misspelled or repeated
-key cannot quietly widen what runs the command. The window says so when it
-opens.
+`actions` in `[github]`, `run` in `[command]`, and `url`, `path` and `file`
+in `[stream]`. github-hookbar refuses a file that sets any other key, or sets
+one twice, so a misspelled or repeated key cannot quietly widen what runs the
+command. The window says so when it opens.
 
-The configuration is read when github-hookbar starts, and again whenever it
-connects to the relay, including when **Reconnect** is chosen and after
-**Save**. When the file cannot be read, the menu says why, and github-hookbar
-tries again when **Reconnect** is chosen or the computer wakes.
+The configuration is read when github-hookbar starts, when **Reconnect** is
+chosen, and after **Save**. Attempts to connect again after a connection ends
+use the settings already read. When the file cannot be read, the menu says
+why, and github-hookbar reads it again when **Reconnect** is chosen or the
+computer wakes.
 
 ## The command
 
@@ -133,6 +165,93 @@ are kept for the menu, and nothing is written to its standard input.
 A delivery redelivered from the webhook's page on GitHub runs the command
 again, which is how to recover a pull request opened while github-hookbar was
 not connected.
+
+## Following an event stream
+
+github-hookbar can keep a connection open to a stream of server-sent events,
+the format that a web page's `EventSource` reads, and keep a value from those
+events in a file, so that other programs can show it. The settings name the
+stream's URL, a path to the value in each event's data, and the file.
+
+Each event's data is read as JSON, and the path picks a string out of it.
+The path is a list of keys separated by dots. Each key names a member of an
+object or, as a number counting from 0, an element of an array. For
+example, given an event whose data is
+
+```json
+{"message": {"text": "Back at 3pm", "tags": ["away", "lunch"]}}
+```
+
+the path `message.text` picks `Back at 3pm`, and `message.tags.1` picks
+`lunch`. A path cannot name a key that contains a dot.
+
+Events whose data is not JSON, or has no string at the path, are ignored,
+whatever their event type. So are fields other than `data`, such as `id` and
+`retry`, so github-hookbar does not ask the server to resume where a
+previous connection left off. An event bigger than 32 MB ends the
+connection. The file holds exactly the string, as UTF-8, with no line ending
+added, so an empty string leaves it empty. When an event's value differs
+from what the file holds, github-hookbar rewrites the file in place while it
+holds an exclusive lock on the file, taken with `flock(2)`, as it does for
+the pull request list described below. A program that holds a shared lock on
+the file while reading it, for example with `flock -s`, therefore never sees
+it half written. github-hookbar makes the file and its directory if there
+are none, and changes the file on a thread of its own, so a reader that holds
+its lock for a long time does not hold up the menu bar. The file keeps its
+last value while github-hookbar is not connected to the stream.
+
+The server must answer with status 200 and the content type
+`text/event-stream`. A stream that ends, or that the server answers any
+other way, is opened again as described in the section on reconnecting.
+The menu and the log show the stream's URL without its query, user name, or
+password, which can hold secrets.
+
+**Reconnect** and **Save** open the stream again. When its settings did not
+change, the menu goes on saying when the file was last written.
+
+## The freight train
+
+Whenever github-hookbar writes a new value to the value file, a freight
+train rolls along the bottom of the main display, the one with the menu bar,
+from beyond its right edge to beyond its left, with the value lettered along
+the sides of its cars. An SBB Re 620 electric locomotive in SBB Cargo's
+livery pulls the cars: red cab ends, a blue side lettered "cargo", and a
+grey roof with its pantograph raised. Its six wheels on each side turn as it
+goes, and the cars rock on their springs.
+Under and over the train runs a railway line: a track, and above it an
+overhead line on masts, a contact wire hung from a sagging catenary wire,
+which the raised pantograph runs along, its arms flexing at their joints as
+the engine rocks so that its head stays against the wire, now and then
+sparking against it.
+Sparks come in bursts that begin at random, about once every eight seconds.
+Each spark in a burst has a one in two chance of being followed by another
+30 to 150 milliseconds later, and separately a one in four chance of being
+followed by another 100 to 1,500 milliseconds later, so a burst has four
+sparks on average. A spark that comes while the one before it still shows
+cuts it short, which makes the arc flicker. The line is laid from the right edge
+of the screen, starting slowly and speeding up until it reaches the left
+edge. The train comes in once the line is a quarter of the screen ahead,
+when the line is going twice as fast as the train, so the line stays ahead
+of it. Behind the train, the line is taken up a little behind the last car.
+Both ends of the line have soft edges.
+
+The engine leads, so the value reads in order from the front of the train to
+the back. Each car carries as many whole words as fit in 150 points of
+lettering, and a word too long for one car is split across as many as it
+needs. A train pulls at most 40 cars; a longer value is cut short, and the
+last car says so with "…". Line breaks count as spaces. The train goes at
+170 points a second, slowly enough to read the cars, so it takes as long as
+it needs for its whole length to cross the screen. It passes over
+everything, the Dock included, and clicks go through it to whatever is
+underneath. A new value sends a new train in place of any train still on its
+way. A value that is empty or only white space sends none, and leaves a
+train already on its way alone.
+
+A value counts as new when it differs from what the value file held, so a
+value that arrives while the file already holds it, as it does each time
+github-hookbar connects to the stream, sends no train. **Send the Train**
+sends one carrying the last value the stream gave, or, when there is none or
+it is only white space, one saying that there is no message.
 
 ## The pull request list
 
@@ -200,9 +319,11 @@ bar.
 
 Requires the Xcode command line tools, for `swiftc`. The tests also need
 `/usr/bin/jq`, which macOS includes from macOS 15 on. There is no Xcode
-project; the app is four Swift files: `main.swift`, which holds the menu bar
-app, and `timing.swift`, `configuration.swift`, and `prlist.swift`, which hold
-what the tests cover.
+project; the app is nine Swift files: `main.swift` and
+`settingswindow.swift`, which hold the menu bar app and its settings window,
+and `timing.swift`, `configuration.swift`, `prlist.swift`, `lockedfile.swift`,
+`connection.swift`, `stream.swift`, and `train.swift`, which hold what the
+tests cover, apart from the train's window.
 
 ```sh
 make              # builds ./github-hookbar
@@ -210,9 +331,12 @@ make test         # builds and runs the tests in tests/main.swift
 ./github-hookbar  # runs the menu bar indicator in the foreground
 ```
 
-github-hookbar logs each time it connects, each time it loses the connection
-or fails to connect, each `pull_request` delivery with whether it runs the
-command or changes the pull request list, each time the command finishes,
+github-hookbar logs each time it connects to the relay or the event stream,
+each time it loses a connection or fails to connect, each time it writes the
+value file, each new reason it cannot write the value file, each time the
+value file turns out to hold the latest value already after such a failure,
+each `pull_request` delivery with whether it runs the command or changes the
+pull request list, each time the command finishes,
 with its exit status and output, one line of output per log line, each
 refresh of the pull request list, and each failure to change the list. The
 lines go to standard error and to the system log, which keeps them however
