@@ -95,3 +95,23 @@ func glyphImage(_ statuses: [Status?], now: Date, warning: Bool = false) -> NSIm
     image.isTemplate = true
     return image
 }
+
+/// `image` drawn at `scale` pixels per point.
+func bitmap(of image: NSImage, scale: CGFloat) -> NSBitmapImageRep {
+    let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(image.size.width * scale),
+                                  pixelsHigh: Int(image.size.height * scale), bitsPerSample: 8,
+                                  samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+    image.draw(in: NSRect(x: 0, y: 0, width: bitmap.pixelsWide, height: bitmap.pixelsHigh))
+    NSGraphicsContext.restoreGraphicsState()
+    return bitmap
+}
+
+/// The pixels of `image` on a Retina display. Two pictures with the same
+/// pixels look the same.
+func pixels(of image: NSImage) -> Data {
+    let drawn = bitmap(of: image, scale: 2)
+    return Data(bytes: drawn.bitmapData!, count: drawn.bytesPerRow * drawn.pixelsHigh)
+}

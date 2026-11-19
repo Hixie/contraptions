@@ -81,8 +81,17 @@ struct Service: Sendable {
     static let identity = ["User-Agent": "claude-cli/2.1.311 (external, cli) quotabar/1", "x-app": "cli"]
 
     /// Requests fail at once while the Mac is offline; the watcher holds
-    /// checks back until the network is there.
-    var session = URLSession.shared
+    /// checks back until the network is there. The session is ephemeral, so
+    /// that nothing is written to disk, since the answers hold account
+    /// details. It has no cache, so that every check asks the server, and no
+    /// cookies, so that what the server sets for one account is not sent
+    /// with another's requests.
+    var session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        return URLSession(configuration: configuration)
+    }()
     var now: @Sendable () -> Date = { Date() }
 
     /// The sign-in page, asking for the account with the email address

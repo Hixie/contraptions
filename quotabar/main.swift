@@ -15,41 +15,84 @@ final class Monitor: NSObject, NSApplicationDelegate, NSMenuDelegate {
         service: Service(), store: AccountStore(item: KeychainItem(service: "quotabar", account: "accounts")),
         open: { NSWorkspace.shared.open($0) }, changed: { [weak self] in self?.update() })
     private var timer: Timer?
+    private var lastTick = Date.distantPast
     private let paths = NWPathMonitor()
     /// The sign-in note the menu showed when it last opened.
     private var shownNote: String?
+    /// The pixels of the picture in the menu bar.
+    private var shownPixels: Data?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
         watcher.load()
-        watcher.checkAll()
         paths.pathUpdateHandler = { path in
             MainActor.assumeIsolated { _ = self.watcher.setOnline(path.status != .unsatisfied) }
         }
         paths.start(queue: .main)
-        // Each tick also redraws, so the rings advance even while a check
-        // waits for the network.
-        timer = Timer.scheduledTimer(withTimeInterval: checkInterval, repeats: true) { _ in
-            MainActor.assumeIsolated { self.tick() }
+        // Nobody can see the menu bar while the displays sleep, so there is
+        // no timer then.
+        if CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
+            resumeTicking()
         }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { _ in
-            MainActor.assumeIsolated { self.tick() }
+        let notifications = NSWorkspace.shared.notificationCenter
+        // A timer's time stands still while the Mac sleeps, so when the Mac
+        // wakes with the timer running, because the displays did not sleep
+        // first, the timer is rescheduled by the clock.
+        let wake: @MainActor () -> Void = { if self.timer != nil { self.resumeTicking() } }
+        for (name, action) in [(NSWorkspace.didWakeNotification, wake),
+                               (NSWorkspace.screensDidWakeNotification, resumeTicking),
+                               (NSWorkspace.screensDidSleepNotification, pauseTicking)] {
+            notifications.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { action() }
+            }
         }
     }
 
+    /// Ticks every `checkInterval`: now, if a tick is overdue, and otherwise
+    /// when the next is due, redrawing now.
+    private func resumeTicking() {
+        timer?.invalidate()
+        if lastTick + checkInterval <= Date() {
+            tick()
+        } else {
+            update()
+        }
+        // A clock set back since the last tick does not put the next one off.
+        let timer = Timer(fire: min(lastTick, Date()) + checkInterval, interval: checkInterval,
+                          repeats: true) { _ in
+            MainActor.assumeIsolated { self.tick() }
+        }
+        // Lets macOS fire this timer together with other programs' timers.
+        timer.tolerance = 2 * 60
+        RunLoop.main.add(timer, forMode: .default)
+        self.timer = timer
+    }
+
+    private func pauseTicking() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// Each tick also redraws, so the rings advance even while a check waits
+    /// for the network.
     private func tick() {
+        lastTick = Date()
         watcher.checkAll()
         update()
     }
 
+    /// Shows the picture, redrawing the menu bar only when it looks
+    /// different.
     private func update() {
         let picture = menuBarPicture(of: watcher.roster, loadProblem: watcher.loadProblem,
                                      saveProblem: watcher.saveProblem, now: Date(), in: .current)
-        statusItem.button?.image = picture.image
+        let drawn = pixels(of: picture.image)
+        if drawn != shownPixels {
+            statusItem.button?.image = picture.image
+            shownPixels = drawn
+        }
         statusItem.button?.toolTip = picture.toolTip
     }
 

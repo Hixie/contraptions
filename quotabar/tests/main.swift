@@ -593,7 +593,12 @@ final class Stub: URLProtocol {
     }
 }
 
-let configuration = URLSessionConfiguration.ephemeral
+let configuration = Service().session.configuration
+expect(configuration.urlCache == nil && configuration.httpCookieStorage == nil,
+       "requests keep no cache and no cookies")
+expect(configuration.urlCredentialStorage != nil
+       && configuration.urlCredentialStorage !== URLCredentialStorage.shared,
+       "requests keep their credentials in memory, not on disk")
 configuration.protocolClasses = [Stub.self]
 var service = Service()
 service.session = URLSession(configuration: configuration)
@@ -855,16 +860,8 @@ expect(saved.isEmpty && Stub.requests.count == 1, "a bad request does not refres
 /// The opacity of each point of a glyph drawn at one pixel per point, by
 /// point coordinates with the origin at the bottom left.
 func render(_ statuses: [Status?]) -> (CGFloat, CGFloat) -> CGFloat {
-    let image = glyphImage(statuses, now: now)
-    let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(image.size.width),
-                                  pixelsHigh: Int(image.size.height), bitsPerSample: 8,
-                                  samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                                  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
-    image.draw(in: NSRect(origin: .zero, size: image.size))
-    NSGraphicsContext.restoreGraphicsState()
-    return { x, y in bitmap.colorAt(x: Int(x), y: bitmap.pixelsHigh - 1 - Int(y))!.alphaComponent }
+    let drawn = bitmap(of: glyphImage(statuses, now: now), scale: 1)
+    return { x, y in drawn.colorAt(x: Int(x), y: drawn.pixelsHigh - 1 - Int(y))!.alphaComponent }
 }
 
 // Points on the ring (radius 7 around the centre at 8, 8) at three o'clock,
@@ -922,13 +919,7 @@ let partUsed = render([checked(30, weekLeft: 0.6, banked: [BankedReset(label: "r
 expect(midTones(partUsed) > midTones(render([checked(30, weekLeft: 0.6)])) + 3,
        "the digit is dark where it crosses the faint part of the disc")
 let warningImage = glyphImage([], now: now, warning: true)
-let warningBitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 16, pixelsHigh: 16, bitsPerSample: 8,
-                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                                     bytesPerRow: 0, bitsPerPixel: 0)!
-NSGraphicsContext.saveGraphicsState()
-NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: warningBitmap)
-warningImage.draw(in: NSRect(x: 0, y: 0, width: 16, height: 16))
-NSGraphicsContext.restoreGraphicsState()
+let warningBitmap = bitmap(of: warningImage, scale: 1)
 func warningAlpha(_ x: Int, _ y: Int) -> CGFloat { warningBitmap.colorAt(x: x, y: 15 - y)!.alphaComponent }
 expect(warningImage.size.width == glyphSize && warningAlpha(8, 10) > 0.9 && warningAlpha(8, 1) > 0.9
        && warningAlpha(8, 4) == 0 && warningAlpha(14, 8) == 0,
@@ -942,6 +933,17 @@ let pair = glyphImage([nil, nil], now: now)
 expect(pair.size == NSSize(width: 36, height: 16) && pair.isTemplate,
        "glyphs sit side by side, drawn as a template for the menu bar")
 expect(glyphImage([], now: now).size == NSSize(width: 16, height: 16), "no accounts still shows one glyph")
+let retina = bitmap(of: glyphImage([checked(30, weekLeft: 0.6)], now: now), scale: 2)
+expect(retina.pixelsWide == 32 && retina.pixelsHigh == 32, "a picture can be drawn at Retina size")
+func retinaPixels(_ statuses: [Status?], at time: Date = now) -> Data {
+    pixels(of: glyphImage(statuses, now: time))
+}
+let shown = retinaPixels([checked(30, weekLeft: 0.6)])
+expect(retinaPixels([checked(30, weekLeft: 0.6)], at: now.addingTimeInterval(1)) == shown,
+       "a second later the ring has not moved a pixel, so the picture is the same")
+expect(retinaPixels([checked(31, weekLeft: 0.6)]) != shown, "a picture with more of the quota used is different")
+expect(retinaPixels([checked(30, weekLeft: 0.5)]) != shown, "a picture later in the week is different")
+expect(retinaPixels([checked(30, weekLeft: 0.6), nil]) != shown, "a picture with another account is different")
 
 // MARK: - The watcher
 

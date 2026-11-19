@@ -88,12 +88,11 @@ quotabar keeps its own tokens, separate from Claude Code's. Each use of a
 refresh token replaces it with a new one and stops the old one working, so
 sharing Claude Code's tokens would make the two programs sign each other out.
 
-Every five minutes, and whenever the Mac wakes, quotabar asks
-`https://api.anthropic.com/api/oauth/usage` about each account, the endpoint
-behind Claude Code's `/usage` command, and reads the answer's weekly quota. It
-adds `?cedar_ember=1&skip_spend=1`, as Claude Code does to ask for banked
-resets. Claude Code treats banked resets as an experiment that is still
-rolling out, so accounts outside it report none.
+Every five minutes, quotabar asks `https://api.anthropic.com/api/oauth/usage`
+about each account, the endpoint behind Claude Code's `/usage` command, and
+reads the answer's weekly quota. It adds `?cedar_ember=1&skip_spend=1`, as
+Claude Code does to ask for banked resets. Claude Code treats banked resets as
+an experiment that is still rolling out, so accounts outside it report none.
 
 The server reports banked resets only to the products it offers them in, which
 it tells apart by the headers a request carries; to anything else it says the
@@ -103,10 +102,21 @@ quotabar sends carries Claude Code's headers, `User-Agent: claude-cli/2.1.311
 to the first. This presents quotabar to Anthropic as Claude Code, which
 Anthropic's terms may not allow.
 
+quotabar's requests write nothing to disk, since the answers hold account
+details. They use no cache, so that every check asks the server, and no
+cookies, so that what the server sets for one account is not sent with
+another's requests.
+
 The endpoint has no way to tell quotabar when usage changes, so quotabar has
-to ask. **Check Now** asks straight away. macOS tells quotabar when the Mac
-goes offline and comes back, and checks asked for while it is offline, as it
-often is just after waking, wait until it is online. A check that fails for
+to ask. While the displays sleep, nobody can see the menu bar, so quotabar
+stops asking every five minutes. When the displays wake, or the Mac wakes with
+its displays on, it asks as soon as five minutes have passed since its last
+scheduled check: at once, if they already have. It redraws the menu bar only
+when the picture changes.
+
+**Check Now** asks straight away. macOS tells quotabar when the Mac goes
+offline and comes back, and checks asked for while it is offline, as it often
+is just after waking, wait until it is online. A check that fails for
 want of a network (no connection, a lost connection, a timeout, or a host that
 cannot be found or reached), as it can before macOS has noticed the network
 go, runs again once macOS says the network is there: at once, if macOS said so
