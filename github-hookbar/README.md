@@ -78,9 +78,29 @@ UUID. GitHub gives a redelivered webhook the same ID as the original, so
 a redelivery counts as late. A delivery whose ID is not a time-based UUID
 returns the arrows to the menu bar's own color.
 
-The relay keeps no history, so a pull request opened while github-hookbar is
-not connected does not run the command. Redelivering the webhook from GitHub,
-or running the command by hand, covers it.
+The relay keeps no history, so github-hookbar misses the deliveries GitHub
+makes while it is not connected. When it connects again, it catches up. It
+refreshes the pull request list, as **Refresh Pull Request List** does. It
+also asks GitHub, with the `gh` command, for the open pull requests opened
+since ten minutes before it last heard from the relay, by connecting or by a
+delivery arriving, but not before it first connected. It runs the command
+for each of those that the settings choose, unless it has already run the
+command for that pull request.
+
+With authors in the settings, github-hookbar lists each author's open pull
+requests, which GitHub shows as soon as they are opened. An author that is
+not a GitHub user, such as a bot, has none. With only repository
+owners, it uses GitHub's search, which can take a while to include a pull
+request that was just opened. With neither, it does not look. Catching up
+runs the command only when the settings' actions include `opened`, since
+GitHub says when each pull request was opened but not when other actions
+happened. When a list holds 100 pull requests that were all opened since
+then, there may be more than GitHub returned, so the catch-up fails. When
+catching up fails, the menu says why until it next succeeds, and
+github-hookbar tries again the next time it connects.
+Choosing **Reconnect** or saving the settings while connected opens a new
+connection without catching up, so new settings do not run the command for
+pull requests opened before they were saved.
 
 ## Reconnecting
 
@@ -163,8 +183,7 @@ The last 2,000 characters of the command's standard output and standard error
 are kept for the menu, and nothing is written to its standard input.
 
 A delivery redelivered from the webhook's page on GitHub runs the command
-again, which is how to recover a pull request opened while github-hookbar was
-not connected.
+again, even for a pull request it has already run for.
 
 ## Following an event stream
 
@@ -185,20 +204,23 @@ example, given an event whose data is
 the path `message.text` picks `Back at 3pm`, and `message.tags.1` picks
 `lunch`. A path cannot name a key that contains a dot.
 
-Events whose data is not JSON, or has no string at the path, are ignored,
-whatever their event type. So are fields other than `data`, such as `id` and
-`retry`, so github-hookbar does not ask the server to resume where a
-previous connection left off. An event bigger than 32 MB ends the
-connection. The file holds exactly the string, as UTF-8, with no line ending
-added, so an empty string leaves it empty. When an event's value differs
-from what the file holds, github-hookbar rewrites the file in place while it
-holds an exclusive lock on the file, taken with `flock(2)`, as it does for
-the pull request list described below. A program that holds a shared lock on
-the file while reading it, for example with `flock -s`, therefore never sees
-it half written. github-hookbar makes the file and its directory if there
-are none, and changes the file on a thread of its own, so a reader that holds
-its lock for a long time does not hold up the menu bar. The file keeps its
-last value while github-hookbar is not connected to the stream.
+github-hookbar reads each event's data only as far as it needs to. It skips
+whatever is off the path without keeping it, and stops reading once it has
+found the string or knows there is none. Events without a string at the path
+are ignored, whatever their event type. Data that is not JSON may give a
+string or not. Fields other than `data`, such as `id` and `retry`, are
+ignored too, so github-hookbar does not ask the server to resume where a
+previous connection left off. A string of more than 32 MB, counted as UTF-8,
+ends the connection. The file holds exactly the string, as UTF-8, with no
+line ending added, so an empty string leaves it empty. When an event's value
+differs from what the file holds, github-hookbar rewrites the file in place
+while it holds an exclusive lock on the file, taken with `flock(2)`, as it
+does for the pull request list described below. A program that holds a shared
+lock on the file while reading it, for example with `flock -s`, therefore
+never sees it half written. github-hookbar makes the file and its directory
+if there are none, and changes the file on a thread of its own, so a reader
+that holds its lock for a long time does not hold up the menu bar. The file
+keeps its last value while github-hookbar is not connected to the stream.
 
 The server must answer with status 200 and the content type
 `text/event-stream`. A stream that ends, or that the server answers any
@@ -272,8 +294,9 @@ redelivered webhook does not add a second line. When the pull request is
 closed, whether or not it was merged, github-hookbar removes its line. Lines
 about other pull requests, and lines that are not about a pull request, stay
 as they are. The relay keeps no history, so a pull request opened or closed
-while github-hookbar is not connected changes the list only when the list is
-next refreshed, or when another delivery about it arrives. A delivery says
+while github-hookbar is not connected changes the list when github-hookbar
+catches up after connecting again, as described in the section on the relay,
+or when another delivery about it arrives. A delivery says
 what state the pull request was in when GitHub made it, so redelivering an
 old delivery from GitHub can put a closed pull request back on the list until
 the next refresh.
@@ -317,13 +340,13 @@ bar.
 
 ## Building and running
 
-Requires the Xcode command line tools, for `swiftc`. The tests also need
-`/usr/bin/jq`, which macOS includes from macOS 15 on. There is no Xcode
-project; the app is nine Swift files: `main.swift` and
-`settingswindow.swift`, which hold the menu bar app and its settings window,
-and `timing.swift`, `configuration.swift`, `prlist.swift`, `lockedfile.swift`,
-`connection.swift`, `stream.swift`, and `train.swift`, which hold what the
-tests cover, apart from the train's window.
+Requires the Xcode command line tools, for `swiftc`. Catching up after
+reconnecting, and the tests, also need `jq`, which macOS includes from macOS
+15 on. There is no Xcode project; the app is nine Swift files: `main.swift`
+and `settingswindow.swift`, which hold the menu bar app and its settings
+window, and `timing.swift`, `configuration.swift`, `prlist.swift`,
+`lockedfile.swift`, `connection.swift`, `stream.swift`, and `train.swift`,
+which hold what the tests cover, apart from the train's window.
 
 ```sh
 make              # builds ./github-hookbar
@@ -336,12 +359,12 @@ each time it loses a connection or fails to connect, each time it writes the
 value file, each new reason it cannot write the value file, each time the
 value file turns out to hold the latest value already after such a failure,
 each `pull_request` delivery with whether it runs the command or changes the
-pull request list, each time the command finishes,
-with its exit status and output, one line of output per log line, each
-refresh of the pull request list, and each failure to change the list. The
-lines go to standard error and to the system log, which keeps them however
-github-hookbar was started. They include the URLs of pull requests in private
-repositories.
+pull request list, each time the command finishes, with its exit status and
+output, one line of output per log line, each refresh of the pull request
+list, each failure to change the list, and each time it looks for pull
+requests opened while it was not connected or fails to. The lines go to
+standard error and to the system log, which keeps them however github-hookbar
+was started. They include the URLs of pull requests in private repositories.
 zsh has a `log` command of its own, so give the full path:
 
 ```sh

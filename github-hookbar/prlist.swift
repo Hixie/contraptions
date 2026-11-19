@@ -207,6 +207,127 @@ func trackedPullRequests(fromSearchOutput text: String) throws -> [TrackedPullRe
     }
 }
 
+/// How long before github-hookbar last heard from the relay a pull request
+/// may have been opened without its delivery having arrived yet.
+let catchUpMargin: TimeInterval = 10 * 60
+
+/// When github-hookbar may have missed deliveries, which the relay does not
+/// keep: from shortly before it last heard from the relay, by connecting or
+/// by a delivery arriving, until it connects again after the connection
+/// ended. Opening a new connection while connected, as reconnecting and
+/// saving the settings do, is not taken to miss anything, so that new
+/// settings do not run the command for pull requests opened before them.
+/// It looks no earlier than when it first connected, so that it does not run
+/// the command again for pull requests opened before it started.
+struct MissedDeliveries {
+    /// When github-hookbar last heard from the relay, while connected.
+    private var heard: Date?
+    private var firstConnected: Date?
+    /// Where to start looking for what was missed, while there is something
+    /// to look for.
+    private var lookFrom: Date?
+
+    mutating func heard(at time: Date) {
+        heard = time
+    }
+
+    /// Notes a change in the connection to the relay, and returns, when it
+    /// connects after missing deliveries, when to look for them from.
+    mutating func changed(to state: ConnectionState) -> Date? {
+        switch state {
+        case .connected(let since):
+            heard = since
+            firstConnected = firstConnected ?? since
+            defer { lookFrom = nil }
+            return lookFrom
+        case .connecting:
+            heard = nil
+        case .disconnected:
+            if let heard, let firstConnected {
+                notLooked(from: max(heard - catchUpMargin, firstConnected))
+            }
+            heard = nil
+        }
+        return nil
+    }
+
+    /// Notes that looking for what was missed from a time failed, so the next
+    /// connection looks from then.
+    mutating func notLooked(from time: Date) {
+        lookFrom = min(lookFrom ?? time, time)
+    }
+}
+
+/// The most pull requests each part of `openedPullRequestsQuery` asks for.
+let catchUpLimit = 100
+
+/// The GraphQL query that finds open pull requests, newest first: those of
+/// each of the given authors, or, without authors, those GitHub's search
+/// finds in the owners' repositories. GitHub lists an author's pull requests
+/// as soon as they are opened, while its search can take a while to include
+/// them. There is no query when both lists are empty, since that would cover
+/// every pull request on GitHub.
+func openedPullRequestsQuery(authors: [String], owners: [String]) -> String? {
+    func literal(_ text: String) -> String {
+        // JSON's strings are GraphQL's.
+        String(decoding: try! JSONEncoder().encode(text), as: UTF8.self)
+    }
+    let fields = "nodes { ... on PullRequest { url number title createdAt headRefName "
+        + "author { login } repository { nameWithOwner owner { login } } } }"
+    let order = "orderBy: {field: CREATED_AT, direction: DESC}"
+    if !authors.isEmpty {
+        return "query { " + authors.enumerated().map { index, author in
+            "author\(index): user(login: \(literal(author))) { "
+                + "pullRequests(first: \(catchUpLimit), states: OPEN, \(order)) { \(fields) } }"
+        }.joined(separator: " ") + " }"
+    }
+    guard let search = openPullRequestSearch(authors: [], owners: owners) else { return nil }
+    return "query { owners: search(query: \(literal(search + " sort:created-desc")), type: ISSUE, "
+        + "first: \(catchUpLimit)) { \(fields) } }"
+}
+
+/// The jq program that turns the answer to `openedPullRequestsQuery` into
+/// the pull_request deliveries GitHub sent when the pull requests made since
+/// `since` were opened, one line of JSON each. An author GitHub does not
+/// know, such as a bot, which is not a user, has no pull requests. The
+/// program fails when GitHub answers with any other error, and when a list
+/// holds as many pull requests as the query asks for and all were made since
+/// then, since there may be more.
+func openedPullRequestsFilter(since: Date) -> String {
+    """
+    "\(ISO8601DateFormatter().string(from: since))" as $since
+    | if .data == null or any(.errors[]?; .type != "NOT_FOUND") then
+        error("GitHub answered: " + ([.message?, .errors[]?.message] | map(strings) | join("; ")))
+      else
+        [.data[] | ((.pullRequests? // .) | .nodes?) // []] as $lists
+        | if any($lists[]; length == \(catchUpLimit) and all(.[]; .createdAt >= $since)) then
+            error("more than \(catchUpLimit) pull requests may have been opened since \\($since)")
+          else
+            $lists[][] | select(.createdAt >= $since)
+            | {action: "opened",
+               pull_request: {html_url: .url, number, title,
+                              user: {login: (.author.login // "ghost")},
+                              head: {ref: .headRefName}, state: "open"},
+               repository: {full_name: .repository.nameWithOwner,
+                            owner: {login: .repository.owner.login}}}
+            | tojson
+          end
+      end
+    """
+}
+
+/// A shell script that runs the GraphQL query in its second argument with
+/// the gh command, filters the answer through the jq program in its third,
+/// and writes the result to the file named by its first. gh fails whenever
+/// GitHub's answer holds an error, so the filter, not gh, decides which
+/// answers fail; an answer that never arrives gives jq no input, which fails.
+let catchUpScript = #"gh api graphql -f query="$2" | jq -n -r "input | $3" > "$1""#
+
+/// The deliveries in what `catchUpScript` writes.
+func openedEvents(fromCatchUpOutput text: String) throws -> [PullRequestEvent] {
+    try text.split(separator: "\n").map { try PullRequestEvent(Data($0.utf8)) }
+}
+
 /// The parts of a pull_request delivery that decide whether to run the
 /// command, what to run it with, and how it changes the pull request list.
 struct PullRequestEvent: Decodable {

@@ -168,8 +168,9 @@ struct Delivery {
         var headers: [String: String] = [:]
         // The first line is the request line, not a header. The values are
         // bytes, read as Latin-1, which every byte is.
-        for line in request[..<blank.lowerBound].split(separator: Data("\r\n".utf8)).dropFirst() {
-            let text = String(String.UnicodeScalarView(line.map { Unicode.Scalar($0) }))
+        for line in request[..<blank.lowerBound].split(separator: UInt8(ascii: "\n")).dropFirst() {
+            let text = String(String.UnicodeScalarView(
+                (line.last == UInt8(ascii: "\r") ? line.dropLast() : line).map { Unicode.Scalar($0) }))
             let parts = text.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
             if parts.count == 2 {
                 headers[parts[0].lowercased()] = parts[1].trimmingCharacters(in: .whitespaces)
@@ -257,11 +258,13 @@ func makeTemporaryFile() throws -> (FileHandle, String) {
     return (FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), String(cString: template))
 }
 
-/// Asks GitHub, with the gh command, for the pull requests a search finds.
-/// The login shell can print to standard output as it starts, so the pull
-/// requests go to a file of their own.
-func lookUpPullRequests(_ search: String,
-                        completion: @escaping (Result<[TrackedPullRequest], Error>) -> Void) {
+/// Runs a script that asks GitHub something with the gh command, and reads
+/// what it found with `read`. The login shell can print to standard output
+/// as it starts, so the script writes what it found to the file named by its
+/// first argument, before `arguments`.
+func askGitHub<Found>(_ script: String, _ arguments: [String],
+                      reading read: @escaping (String) throws -> Found,
+                      completion: @escaping (Result<Found, Error>) -> Void) {
     let path: String
     do {
         path = try makeTemporaryFile().1
@@ -269,14 +272,13 @@ func lookUpPullRequests(_ search: String,
         completion(.failure(error))
         return
     }
-    runInLoginShell(searchScript, arguments: [path, search]) { status, output in
+    runInLoginShell(script, arguments: [path] + arguments) { status, output in
         defer { unlink(path) }
         completion(Result {
             guard status == 0 else {
-                throw Problem(description: "the search exited with status \(status)\n\(output)")
+                throw Problem(description: "gh exited with status \(status)\n\(output)")
             }
-            return try trackedPullRequests(fromSearchOutput: String(contentsOfFile: path,
-                                                                    encoding: .utf8))
+            return try read(String(contentsOfFile: path, encoding: .utf8))
         })
     }
 }
@@ -308,21 +310,35 @@ func makeMainMenu() -> NSMenu {
 
 // MARK: - Menu bar app
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+/// What the indicator shows.
+enum Indicator: Equatable {
+    case connecting
+    /// Connected to the relay, with whether the last delivery arrived late.
+    case connected(late: Bool)
+    case disconnected
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSViewToolTipOwner {
     private let configurationURL: URL
     private var configuration: Configuration?
     private let relay = PersistentConnection()
     private var stream: (connection: PersistentConnection, file: StreamValueFile)?
     private let train = TrainController()
     private var recent: [Run] = []
+    /// The pull requests the command has run for.
+    private var ranFor: Set<URL> = []
     /// How long after GitHub made it the last delivery on this connection
     /// arrived, when its delivery ID says when that was.
     private var lastDeliveryAge: TimeInterval?
+    private var missed = MissedDeliveries()
     private var dimming = Dimming()
+    private var indicator: Indicator?
     private let pullRequestList = PullRequestList(path: pullRequestListPath)
     /// Why a change to the pull request list failed, if one has since the
     /// last refresh that succeeded.
     private var pullRequestListProblem: String?
+    /// Why the last attempt to catch up after reconnecting failed, if it did.
+    private var catchUpProblem: String?
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private let settingsWindow: SettingsWindow
@@ -339,6 +355,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         super.init()
         relay.onChange = { [weak self] in
             guard let self else { return }
+            if let since = missed.changed(to: relay.state) {
+                catchUp(since: since)
+            }
             changed(relayName, relay.state)
         }
         settingsWindow.onSave = { [weak self] in
@@ -353,6 +372,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         // A layer, so that a delivery can dim the indicator.
         statusItem.button?.wantsLayer = true
+        // The tooltip says how late the last delivery arrived, which changes
+        // with every delivery, so its text is made only when it is shown,
+        // over the whole indicator, whatever size the menu bar makes it.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(placeToolTip),
+            name: NSView.frameDidChangeNotification, object: statusItem.button)
+        placeToolTip()
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake),
             name: NSWorkspace.didWakeNotification, object: nil)
@@ -401,9 +427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let stream {
             let file = stream.file
             stream.connection.start { [weak self] in
-                let connection = EventStreamConnection(url: settings.url)
-                connection.onEvent = { data in
-                    self?.streamed(data, into: file)
+                let connection = EventStreamConnection(url: settings.url, path: settings.path)
+                connection.onValue = { value in
+                    self?.streamed(value, into: file)
                 }
                 return connection
             }
@@ -425,10 +451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Writes the value from an event's data to the file, and sends a
-    /// train carrying it when it is new.
-    private func streamed(_ data: String, into file: StreamValueFile) {
-        file.take(data) { [weak self] change in
+    /// Writes a value from the event stream to the file, and sends a train
+    /// carrying it when it is new.
+    private func streamed(_ value: String, into file: StreamValueFile) {
+        file.take(value) { [weak self] change in
             guard let self, let change else { return }
             log("\(change)")
             updateMenu()
@@ -449,6 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Dims the indicator briefly for every delivery, notes how late it
     /// arrived, and then handles it.
     private func received(_ delivery: Delivery) {
+        missed.heard(at: Date())
         lastDeliveryAge = delivery.headers["x-github-delivery"].flatMap(creationTime(ofDelivery:))
             .map { Date().timeIntervalSince($0) }
         // Each delivery replaces the animation with one from the indicator's
@@ -465,7 +492,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func handle(_ delivery: Delivery) {
-        guard let configuration else { return }
         guard delivery.headers["x-github-event"] == "pull_request" else { return }
         let event: PullRequestEvent
         do {
@@ -474,9 +500,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("ignoring a pull_request delivery that could not be read: \(error)")
             return
         }
+        handle(event, from: "pull_request delivery "
+               + (delivery.headers["x-github-delivery"] ?? "without an ID"))
+    }
+
+    /// Changes the pull request list and runs the command as an event says,
+    /// naming where the event came from in the log.
+    private func handle(_ event: PullRequestEvent, from source: String) {
+        guard let configuration else { return }
         let url = event.pullRequest.htmlUrl
-        let described = "pull_request delivery \(delivery.headers["x-github-delivery"] ?? "without an ID")"
-            + " for \(url.absoluteString), \(event.action) by \(event.pullRequest.user.login)"
+        let described = "\(source) for \(url.absoluteString), \(event.action) by "
+            + event.pullRequest.user.login
         if let change = event.listChange(configuration) {
             log("\(described): \(change)")
             pullRequestList.make(change) { [weak self] error in
@@ -488,6 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let item = Run(event)
+        ranFor.insert(url)
         log("\(described): running the command")
         recent = Array(([item] + recent).prefix(recentLength))
         updateMenu()
@@ -511,7 +546,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func refreshPullRequestList() {
         guard let search = trackedPullRequestSearch else { return }
         log("refreshing the pull request list from GitHub's search for \(search)")
-        pullRequestList.refresh({ lookUpPullRequests(search, completion: $0) }) { [weak self] error in
+        pullRequestList.refresh({
+            askGitHub(searchScript, [search], reading: trackedPullRequests(fromSearchOutput:),
+                      completion: $0)
+        }) { [weak self] error in
             if error == nil {
                 log("refreshed the pull request list")
                 self?.pullRequestListProblem = nil
@@ -519,6 +557,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.pullRequestListChanged(error)
         }
         updateMenu()
+    }
+
+    /// Refreshes the pull request list, and runs the command for the pull
+    /// requests the configuration chooses that were opened since a time,
+    /// unless it has already run for them. When looking fails, the next
+    /// connection looks again.
+    private func catchUp(since: Date) {
+        refreshPullRequestList()
+        guard let configuration, configuration.actions.contains("opened"),
+              let query = openedPullRequestsQuery(authors: configuration.authors,
+                                                  owners: configuration.orgs) else {
+            return
+        }
+        log("looking for pull requests opened since \(logTimeFormatter.string(from: since))")
+        askGitHub(catchUpScript, [query, openedPullRequestsFilter(since: since)],
+                  reading: openedEvents(fromCatchUpOutput:)) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let events):
+                catchUpProblem = nil
+                for event in events where !ranFor.contains(event.pullRequest.htmlUrl) {
+                    handle(event, from: "a pull request found after reconnecting")
+                }
+            case .failure(let error):
+                catchUpProblem = "\(error)"
+                log("could not look for pull requests opened while not connected: \(error)")
+                missed.notLooked(from: since)
+            }
+            updateMenu()
+        }
     }
 
     private var trackedPullRequestSearch: String? {
@@ -557,31 +625,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenu()
     }
 
-    /// Shows the state in the indicator and its tooltip. While connected,
-    /// the indicator is orange when the last delivery arrived late.
+    /// Shows the state in the indicator. While connected, the indicator is
+    /// orange when the last delivery arrived late. Setting the image redraws
+    /// the indicator, so it is set only when what it shows changes.
     private func updateIndicator() {
-        let symbol: String
-        var tint: NSColor?
+        let shown: Indicator
         switch relay.state {
         case .connecting:
-            symbol = "ellipsis.circle"
+            shown = .connecting
         case .connected:
-            symbol = "arrow.triangle.pull"
-            if let lastDeliveryAge, isLate(lastDeliveryAge) {
-                tint = .systemOrange
-            }
+            shown = .connected(late: lastDeliveryAge.map(isLate) == true)
         case .disconnected:
-            symbol = "exclamationmark.triangle"
+            shown = .disconnected
+        }
+        guard shown != indicator else { return }
+        indicator = shown
+        let symbol: String
+        switch shown {
+        case .connecting: symbol = "ellipsis.circle"
+        case .connected: symbol = "arrow.triangle.pull"
+        case .disconnected: symbol = "exclamationmark.triangle"
         }
         var image = NSImage(systemSymbolName: symbol, accessibilityDescription: "github-hookbar")
         // The menu bar draws a template image in its own color, so a colored
         // indicator is an ordinary image drawn in that color.
-        if let tint {
-            image = image?.withSymbolConfiguration(.init(paletteColors: [tint]))
+        if shown == .connected(late: true) {
+            image = image?.withSymbolConfiguration(.init(paletteColors: [.systemOrange]))
             image?.isTemplate = false
         }
         statusItem.button?.image = image
-        statusItem.button?.toolTip = statusLines.joined(separator: "\n")
+    }
+
+    @objc private func placeToolTip() {
+        guard let button = statusItem.button else { return }
+        button.removeAllToolTips()
+        button.addToolTip(button.bounds, owner: self, userData: nil)
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint,
+              userData data: UnsafeMutableRawPointer?) -> String {
+        statusLines.joined(separator: "\n")
     }
 
     private var statusLines: [String] {
@@ -629,11 +712,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(withTitle: "Command: \(configuration.command)", action: nil,
                          keyEquivalent: "")
         }
-        if let pullRequestListProblem {
-            let item = menu.addItem(withTitle: "Could not change the pull request list: "
-                                    + pullRequestListProblem.prefix { !$0.isNewline },
+        for case let (title, problem?) in [("Could not change the pull request list: ",
+                                            pullRequestListProblem),
+                                           ("Could not catch up after reconnecting: ",
+                                            catchUpProblem)] {
+            let item = menu.addItem(withTitle: title + problem.prefix { !$0.isNewline },
                                     action: nil, keyEquivalent: "")
-            item.toolTip = pullRequestListProblem
+            item.toolTip = problem
         }
         if !recent.isEmpty {
             menu.addItem(.separator())

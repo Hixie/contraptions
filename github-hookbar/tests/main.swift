@@ -265,24 +265,28 @@ expect(!list.isRefreshing, "the later refresh failing ends the refreshing")
 
 // MARK: - The search script
 
-/// Runs `searchScript` with a fake gh that records its arguments and answers
-/// with `response` filtered through the jq program it is given, and returns
-/// the script's exit status, what it wrote to its output file, and the
-/// arguments gh was given.
-func runSearchScript(_ search: String, response: String) -> (Int32, String?, [String]) {
+/// Runs a script that writes what gh finds to the file named by its first
+/// argument, with a fake gh that records its arguments and answers with
+/// `response` filtered through the jq program it is given, and returns the
+/// script's exit status, what it wrote to its output file, and the arguments
+/// gh was given.
+func runGitHubScript(_ script: String, _ arguments: [String],
+                     response: String) -> (Int32, String?, [String]) {
     let directory = temporaryDirectory()
     let fake = directory + "/gh"
     FileManager.default.createFile(atPath: fake, contents: Data("""
         #!/bin/sh
         printf '%s\\n' "$@" > "$FAKE_GH_ARGUMENTS"
         while [ $# -gt 0 ]; do [ "$1" = --jq ] && filter=$2; shift; done
-        jq -r "$filter" "$FAKE_GH_RESPONSE"
+        if [ -n "$filter" ]; then exec jq -r "$filter" "$FAKE_GH_RESPONSE"; fi
+        cat "$FAKE_GH_RESPONSE"
+        ! grep -q '"errors"' "$FAKE_GH_RESPONSE"
         """.utf8), attributes: [.posixPermissions: 0o755])
     FileManager.default.createFile(atPath: directory + "/response.json",
                                    contents: Data(response.utf8))
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", searchScript, "sh", directory + "/output.tsv", search]
+    process.arguments = ["-c", script, "sh", directory + "/output.tsv"] + arguments
     process.environment = ["PATH": "\(directory):/usr/bin:/bin",
                            "FAKE_GH_ARGUMENTS": directory + "/arguments.txt",
                            "FAKE_GH_RESPONSE": directory + "/response.json"]
@@ -290,7 +294,7 @@ func runSearchScript(_ search: String, response: String) -> (Int32, String?, [St
     do {
         try process.run()
     } catch {
-        expect(false, "could not run the search script: \(error)")
+        expect(false, "could not run the script: \(error)")
         return (-1, nil, [])
     }
     process.waitUntilExit()
@@ -303,7 +307,7 @@ func searchResponse(count: Int, _ nodes: String) -> String {
 }
 
 let awkwardSearch = #"is:pr author:o'brien $(touch nowhere) "quoted""#
-let (searchStatus, searchOutput, searchArguments) = runSearchScript(awkwardSearch, response:
+let (searchStatus, searchOutput, searchArguments) = runGitHubScript(searchScript, [awkwardSearch], response:
     searchResponse(count: 2, """
         {"number": 12, "headRefName": "fix-bug", "repository": {"nameWithOwner": "octo/one"}},
         {"number": 3, "headRefName": "new", "repository": {"nameWithOwner": "octo/three"}}
@@ -316,9 +320,10 @@ expect(searchArguments.prefix(3) == ["api", "graphql", "--paginate"],
 expect(searchOutput.map { try? trackedPullRequests(fromSearchOutput: $0) } == [first, third],
        "the script writes each pull request as a line: \(String(describing: searchOutput))")
 
-let (tooManyStatus, _, _) = runSearchScript("is:pr", response: searchResponse(count: 1001, ""))
+let (tooManyStatus, _, _) = runGitHubScript(searchScript, ["is:pr"],
+                                            response: searchResponse(count: 1001, ""))
 expect(tooManyStatus != 0, "the script fails when the search finds more than GitHub returns")
-let (enoughStatus, enoughOutput, _) = runSearchScript("is:pr",
+let (enoughStatus, enoughOutput, _) = runGitHubScript(searchScript, ["is:pr"],
                                                       response: searchResponse(count: 1000, ""))
 expect(enoughStatus == 0 && enoughOutput == "",
        "the script succeeds when the search finds as many as GitHub returns")
@@ -473,42 +478,186 @@ expect(event("closed", author: "hubot", state: "closed")
 expect((try? PullRequestEvent(Data(#"{"action": "opened"}"#.utf8))) == nil,
        "a delivery without a pull request is not read")
 
+// MARK: - Catching up after reconnecting
+
+expect(openedPullRequestsQuery(authors: [], owners: []) == nil,
+       "accepting every author and owner leaves nothing to look for")
+let authorsQuery = openedPullRequestsQuery(authors: ["octocat", #"o"brien"#], owners: ["octo"])
+expect(authorsQuery?.contains(#"author0: user(login: "octocat") { pullRequests(first: 100, "#
+                              + "states: OPEN, orderBy: {field: CREATED_AT, direction: DESC})") == true
+       && authorsQuery?.contains(#"author1: user(login: "o\"brien")"#) == true
+       && authorsQuery?.contains("search") == false,
+       "each author's open pull requests are listed, newest first: \(String(describing: authorsQuery))")
+let ownersQuery = openedPullRequestsQuery(authors: [], owners: ["octo", "github"])
+expect(ownersQuery?.contains(#"owners: search(query: "is:pr is:open user:octo user:github "#
+                             + #"sort:created-desc", type: ISSUE, first: 100)"#) == true
+       && ownersQuery?.contains("user(") == false,
+       "without authors, the owners' repositories are searched: \(String(describing: ownersQuery))")
+
+/// A pull request as `openedPullRequestsQuery` describes it.
+func pullRequestNode(_ number: Int, made: String, author: String? = "OctoCat") -> String {
+    #"{"url": "https://github.com/Octo/one/pull/\#(number)", "number": \#(number), "#
+        + #""title": "Number \#(number)", "createdAt": "\#(made)", "headRefName": "branch\#(number)", "#
+        + #""author": \#(author.map { #"{"login": "\#($0)"}"# } ?? "null"), "#
+        + #""repository": {"nameWithOwner": "Octo/one", "owner": {"login": "Octo"}}}"#
+}
+
+// 1,800,000,000 seconds after 1970 is 2027-01-15T08:00:00Z.
+let catchUpSince = Date(timeIntervalSince1970: 1_800_000_000)
+let catchUpFilter = openedPullRequestsFilter(since: catchUpSince)
+let (catchUpStatus, catchUpOutput, catchUpArguments) = runGitHubScript(
+    catchUpScript, ["query { the query }", catchUpFilter], response: """
+        {"data": {"author0": {"pullRequests": {"nodes": [
+                    \(pullRequestNode(7, made: "2027-01-15T09:00:00Z")),
+                    \(pullRequestNode(6, made: "2027-01-15T08:00:00Z")),
+                    \(pullRequestNode(5, made: "2027-01-15T07:59:59Z"))]}},
+                  "author1": null,
+                  "owners": {"nodes": [\(pullRequestNode(8, made: "2027-01-16T00:00:00Z", author: nil))]}},
+         "errors": [{"type": "NOT_FOUND", "path": ["author1"], "message": "no such user"}]}
+        """)
+expect(catchUpStatus == 0,
+       "the catch-up script succeeds, though GitHub does not know an author: \(catchUpStatus)")
+expect(catchUpArguments == ["api", "graphql", "-f", "query=query { the query }", ""],
+       "the query reaches gh as it was given: \(catchUpArguments)")
+let caughtUp = catchUpOutput.flatMap { try? openedEvents(fromCatchUpOutput: $0) } ?? []
+expect(caughtUp.map(\.pullRequest.number) == [7, 6, 8],
+       "the pull requests made since the time are found, from every list: \(caughtUp.map(\.pullRequest.number))")
+if let seven = caughtUp.first {
+    expect(seven.action == "opened" && seven.pullRequest.htmlUrl.absoluteString
+           == "https://github.com/Octo/one/pull/7" && seven.pullRequest.title == "Number 7"
+           && seven.pullRequest.state == "open",
+           "each is the delivery GitHub sent when it was opened")
+    expect(seven.matches(chosen) && seven.listChange(chosen)
+           == .add(TrackedPullRequest(repository: "Octo/one", branch: "branch7", number: 7)),
+           "a pull request found after reconnecting runs the command and is listed")
+}
+expect(caughtUp.last?.pullRequest.user.login == "ghost" && caughtUp.last?.matches(chosen) == false,
+       "a pull request whose author's account is gone is the ghost's, which is not chosen")
+expect((try? openedEvents(fromCatchUpOutput: "{}\n")) == nil,
+       "output that is not a delivery fails the whole catch-up")
+
+let fullList = (0..<catchUpLimit).map { pullRequestNode($0, made: "2027-01-15T08:00:00Z") }
+let (fullStatus, _, _) = runGitHubScript(catchUpScript, ["", catchUpFilter], response:
+    #"{"data": {"owners": {"nodes": [\#(fullList.joined(separator: ","))]}}}"#)
+expect(fullStatus != 0, "the script fails when every pull request in a full list is new")
+let oldestOutside = fullList.dropLast() + [pullRequestNode(99, made: "2027-01-15T07:00:00Z")]
+let (outsideStatus, outsideOutput, _) = runGitHubScript(catchUpScript, ["", catchUpFilter], response:
+    #"{"data": {"owners": {"nodes": [\#(oldestOutside.joined(separator: ","))]}}}"#)
+expect(outsideStatus == 0
+       && outsideOutput.map { $0.split(separator: "\n").count } == catchUpLimit - 1,
+       "a full list reaching back before the time holds all that is new")
+for (response, message) in [
+    (#"{"data": {"owners": null}, "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]}"#,
+     "GitHub answers with an error other than not knowing an author"),
+    (#"{"errors": [{"message": "Bad credentials"}]}"#, "GitHub answers without data"),
+    ("", "gh gets no answer"),
+] {
+    let (status, _, _) = runGitHubScript(catchUpScript, ["", catchUpFilter], response: response)
+    expect(status != 0, "the catch-up script fails when \(message): \(status)")
+}
+
+let firstConnection = Date(timeIntervalSince1970: 1_000_000)
+var missed = MissedDeliveries()
+expect(missed.changed(to: .connecting) == nil
+       && missed.changed(to: .disconnected(reason: "down", retryAt: nil)) == nil
+       && missed.changed(to: .connected(since: firstConnection)) == nil,
+       "the first connection has nothing to catch up on")
+missed.heard(at: firstConnection + 3600)
+expect(missed.changed(to: .disconnected(reason: "timed out", retryAt: nil)) == nil
+       && missed.changed(to: .connecting) == nil,
+       "losing the connection has nothing to catch up on yet")
+expect(missed.changed(to: .connected(since: firstConnection + 4000))
+       == firstConnection + 3600 - catchUpMargin,
+       "connecting again catches up from shortly before the relay was last heard from")
+_ = missed.changed(to: .connecting)
+missed.notLooked(from: firstConnection + 3000)
+expect(missed.changed(to: .connected(since: firstConnection + 5000)) == firstConnection + 3000,
+       "a catch-up that failed is tried again from where it started, when that is earlier")
+_ = missed.changed(to: .disconnected(reason: "down", retryAt: nil))
+missed.notLooked(from: firstConnection + 9000)
+expect(missed.changed(to: .connected(since: firstConnection + 6000))
+       == firstConnection + 5000 - catchUpMargin,
+       "a catch-up that failed does not move a later one's start later")
+missed.heard(at: firstConnection + 7000)
+expect(missed.changed(to: .connecting) == nil
+       && missed.changed(to: .connected(since: firstConnection + 7001)) == nil,
+       "opening a new connection while connected, as new settings do, catches up on nothing")
+var missedEarly = MissedDeliveries()
+_ = missedEarly.changed(to: .connected(since: firstConnection))
+_ = missedEarly.changed(to: .disconnected(reason: "down", retryAt: nil))
+expect(missedEarly.changed(to: .connected(since: firstConnection + 10)) == firstConnection,
+       "a catch-up looks no earlier than the first connection")
+
 // MARK: - Event streams
 
-/// The data of the events in a stream that arrives in the given pieces.
-func events(_ pieces: [Data]) -> [String] {
-    var parser = EventStreamParser()
+/// The values at `path` in the events of a stream that arrives in the given
+/// pieces.
+func values(_ pieces: [Data], at path: [String] = ["a"]) -> [String] {
+    var parser = EventStreamParser(path: path)
     return pieces.flatMap { (try? parser.read($0)) ?? ["failed"] }
 }
 
-func events(_ pieces: String...) -> [String] {
-    events(pieces.map { Data($0.utf8) })
+func values(_ pieces: String..., at path: [String] = ["a"]) -> [String] {
+    values(pieces.map { Data($0.utf8) }, at: path)
 }
 
 let streamText = ": a comment\n\nevent: update\nid: 7\nretry: 10\ndata: {\"a\": \"✓\"}\n\n"
-    + "data: first\ndata:second\ndata:  third\ndata\n\n"
-expect(events(streamText) == [#"{"a": "✓"}"#, "first\nsecond\n third\n"],
-       "each event's data lines, joined: \(events(streamText))")
-expect(events(Data(streamText.utf8).map { Data([$0]) }) == events(streamText),
+    + "data: {\"a\":\ndata:  \"two\"\ndata\ndata: }\n\n"
+expect(values(streamText) == ["✓", "two"],
+       "each event's data lines, joined, give the value: \(values(streamText))")
+expect(values(Data(streamText.utf8).map { Data([$0]) }) == values(streamText),
        "a stream split between every byte, even within a character, reads the same")
-expect(events("data: a\r\n\r\ndata: b\r\rdata: c\n\n") == ["a", "b", "c"],
+expect(values(#"data: "a"\#r\#n\#r\#ndata: "b"\#r\#rdata: "c"\#n\#n"#, at: []) == ["a", "b", "c"],
        "lines can end with CRLF, CR, or LF")
-expect(events("data: a\r", "\ndata: b\r", "\n\r", "\n") == ["a\nb"],
+expect(values("data: [\"a\"\r", "\ndata: ,\"b\"]\r", "\n\r", "\n", at: ["1"]) == ["b"],
        "a CRLF split between pieces is one line ending")
-expect(events("\u{feff}data: a\n\n\u{feff}data: b\n\n") == ["a"],
+expect(values("\u{feff}data: \"a\"\n\n\u{feff}data: \"b\"\n\n", at: []) == ["a"],
        "a byte order mark is dropped only at the start of the stream")
-expect(events("event: ping\n\n\n: comment\n\n") == [], "events without data are not dispatched")
-expect(events("data:\u{301}x\n\n") == ["\u{301}x"],
-       "the field name ends at a colon that a combining mark follows")
-expect(events("data: done\n\ndata: cut short\n") == ["done"],
-       "an event that the stream does not finish is not dispatched")
-var limited = EventStreamParser(limit: 8)
-expect((try? limited.read(Data("data: 12\n\ndata: 1\ndata".utf8))) == ["12"],
-       "events up to the limit are read")
-expect((try? limited.read(Data("xxx".utf8))) == [],
-       "an event that reaches the limit is still read")
-expect((try? limited.read(Data("x".utf8))) == nil,
-       "an event that grows past the limit fails the stream")
+expect(values([Data([0xef, 0xbb]), Data("data: \"a\"\n\ndata: \"b\"\n\n".utf8)], at: []) == ["b"],
+       "a field name that starts like a byte order mark is not data")
+expect(values("event: ping\n\n\n: comment\n\n") == [], "events without data give no value")
+expect(values("dat: \"no\"\ndatum: \"no\"\ndatas: \"no\"\ndata:\"yes\"\n\n", at: []) == ["yes"],
+       "only the field named data counts, with or without a space after its colon")
+expect(values("data: {\"a\": 1}\n\ndata: {\"b\": \"x\"}\n\ndata: {\"a\": \"x\"}\n\n") == ["x"],
+       "events without a string at the path give no value")
+expect(values("data: {\"a\": \"1\"}\n\ndata: {\"a\": \"2\"} and more\n\n") == ["1", "2"],
+       "each event is read afresh, and only as far as its value")
+expect(values("data: \"done\"\n\ndata: \"cut short\"\n", at: []) == ["done"],
+       "an event that the stream does not finish gives no value")
+var limited = EventStreamParser(path: [], limit: 8)
+expect((try? limited.read(Data("data: \"12345678\"\n\ndata: \"1".utf8))) == ["12345678"],
+       "values up to the limit are read")
+expect((try? limited.read(Data("2345678".utf8))) == [],
+       "a value that reaches the limit is still read")
+expect((try? limited.read(Data("9".utf8))) == nil,
+       "a value that grows past the limit fails the stream")
+var bigSkipped = EventStreamParser(path: ["a"], limit: 8)
+expect((try? bigSkipped.read(Data("data: {\"b\": \"\(String(repeating: "x", count: 100))\", \"a\": \"y\"}\n\n".utf8)))
+       == ["y"], "the limit is on the value, not on what is skipped")
+
+/// How a reader given JSON text all at once, and a byte at a time, comes
+/// out, when both agree.
+func outcome(at path: [String], inJSON text: String, line: Int = #line) -> JSONPathReader.Outcome? {
+    func read(_ pieces: [Data]) -> JSONPathReader.Outcome? {
+        var reader = JSONPathReader(path: path)
+        for piece in pieces {
+            guard (try? piece.withUnsafeBytes { try reader.read($0) }) != nil else { return nil }
+        }
+        return reader.outcome
+    }
+    let whole = read([Data(text.utf8)])
+    let bytes = read(Data(text.utf8).map { Data([$0]) })
+    expect(whole == bytes, "reading at once or a byte at a time agree on \(text): \(String(describing: whole)), "
+           + String(describing: bytes), line: line)
+    return whole
+}
+
+func string(at path: [String], inJSON text: String, line: Int = #line) -> String? {
+    if case .found(let string)? = outcome(at: path, inJSON: text, line: line) {
+        return string
+    }
+    return nil
+}
 
 expect(string(at: ["message", "text"], inJSON: #"{"message": {"text": "hi", "n": 1}}"#) == "hi",
        "a path through objects")
@@ -516,25 +665,55 @@ let listJSON = #"{"a": [{"b": "x"}, "y"]}"#
 expect(string(at: ["a", "0", "b"], inJSON: listJSON) == "x", "a path through an array")
 expect(string(at: ["a", "1"], inJSON: listJSON) == "y", "a path to an element of an array")
 expect(string(at: [], inJSON: #""top""#) == "top", "an empty path is the whole text")
+expect(string(at: ["0"], inJSON: #"{"0": "x"}"#) == "x", "a number can name a member of an object")
 expect(string(at: ["a", "+1"], inJSON: listJSON) == nil && string(at: ["a", "01"], inJSON: listJSON)
        == nil, "an index must be written plainly")
 for (path, json) in [(["a", "2"], listJSON), (["a", "-1"], listJSON), (["a", "first"], listJSON),
-                     (["a", "1", "z"], listJSON), (["missing"], listJSON),
+                     (["a", "1", "z"], listJSON), (["missing"], listJSON), (["a"], "[]"),
+                     (["0"], "[]"), (["a"], #"["x"]"#),
                      (["n"], #"{"n": 1}"#), (["n"], #"{"n": null}"#), (["n"], #"{"n": {}}"#),
                      (["message"], "1"), (["message"], "not JSON")] {
     expect(string(at: path, inJSON: json) == nil, "\(path) leads to no string in \(json)")
 }
+expect(string(at: ["a"], inJSON: #"{"a": "\"q\" \\ \/ \b\f\n\r\t \u00e9 \ud83d\ude00 \u2603"}"#)
+       == "\"q\" \\ / \u{8}\u{c}\n\r\t é 😀 ☃", "escapes stand for what they mean")
+expect(string(at: [], inJSON: #""\ud800x \udc00 \ud800""#) == "\u{fffd}x \u{fffd} \u{fffd}",
+       "a surrogate without its pair is a replacement character")
+expect(string(at: ["é", "\""], inJSON: #"{"\u00e9": {"\"": "x"}}"#) == "x",
+       "keys are compared as what their escapes stand for")
+expect(string(at: ["a"], inJSON: #"{"ab": "no", "": "no", "b": "no", "a": "yes"}"#) == "yes",
+       "a key must match exactly")
+let skippedJSON = #"{"s": {"x": "}\"]", "y": [1, {"z": "{["}, []], "n": -1.5e3, "t": true, "f": null}, "#
+    + #""l": [[], {}, "]"], "a": "found"}"#
+expect(string(at: ["a"], inJSON: skippedJSON) == "found",
+       "objects, arrays, strings, numbers, true, false and null off the path are skipped")
+expect(string(at: ["a", "1"], inJSON: #"{"a": [{"b": ["]"]}, "y"]}"#) == "y",
+       "the elements before the one on the path are skipped, whatever they hold")
+expect(outcome(at: ["a"], inJSON: #"{"a": "x", and then not JSON"#) == .found("x"),
+       "reading stops at the value")
+expect(outcome(at: ["a"], inJSON: #"{"a": 5"#) == .absent,
+       "reading stops once the path leads to something other than a string")
+expect(outcome(at: ["a", "b"], inJSON: #"{"a": {"c": 1}, "#) == .absent,
+       "reading stops once an object on the path ends without the next key")
+expect(outcome(at: ["a"], inJSON: #"{"b": "x", "a": "#) == .reading,
+       "an answer that has not arrived yet is still being read")
+var limitedReader = JSONPathReader(path: [], limit: 3)
+expect((try? Data(#""abc""#.utf8).withUnsafeBytes { try limitedReader.read($0) }) != nil
+       && limitedReader.outcome == .found("abc"), "a string up to the limit is read")
+limitedReader = JSONPathReader(path: [], limit: 3)
+expect((try? Data(#""abcd""#.utf8).withUnsafeBytes { try limitedReader.read($0) }) == nil,
+       "a string longer than the limit fails")
 
 let valuePath = temporaryDirectory() + "/new/value.txt"
 let valueFile = StreamValueFile(StreamSettings(url: URL(fileURLWithPath: "/"),
                                                path: ["message", "text"], file: valuePath))
 
-/// Gives the value file an event's data, and returns what it says changed,
-/// as the log would say it.
-func take(_ data: String, at time: Date = Date()) -> String? {
+/// Gives the value file a value, and returns what it says changed, as the
+/// log would say it.
+func take(_ value: String, at time: Date = Date()) -> String? {
     var change: ValueFileChange?
     waitForMain { done in
-        valueFile.take(data, at: time) {
+        valueFile.take(value, at: time) {
             change = $0
             done()
         }
@@ -552,7 +731,7 @@ let firstWrite = Date(timeIntervalSince1970: 1000)
 expect(valueFile.latest == nil, "a new value file has seen no value")
 var firstChange: ValueFileChange?
 waitForMain { done in
-    valueFile.take(#"{"message": {"text": "first"}}"#) {
+    valueFile.take("first") {
         firstChange = $0
         done()
     }
@@ -562,43 +741,41 @@ if case .wrote(let file, let value)? = firstChange {
 } else {
     expect(false, "the first value is written: \(String(describing: firstChange))")
 }
-expect(take(#"{"message": {"text": "hello\n"}}"#, at: firstWrite) == "wrote \(valuePath)"
+expect(take("hello\n", at: firstWrite) == "wrote \(valuePath)"
        && valueFile.latest == "hello\n"
        && contents(valuePath) == "hello\n" && valueFile.writtenAt == firstWrite,
        "the value is written, and its directory made: \(String(describing: contents(valuePath)))")
-expect(take(#"{"message": {"text": "hello\n"}}"#) == nil
+expect(take("hello\n") == nil
        && valueFile.writtenAt == firstWrite,
        "a value the file already holds is not written again")
-expect(take("1") == nil && contents(valuePath) == "hello\n",
-       "an event without a value leaves the file alone")
 try? "changed by hand".write(toFile: valuePath, atomically: false, encoding: .utf8)
-expect(take(#"{"message": {"text": "hello\n"}}"#) == "wrote \(valuePath)"
+expect(take("hello\n") == "wrote \(valuePath)"
        && contents(valuePath) == "hello\n",
        "a file changed by something else gets the value again")
 let firstInode = inode(valuePath)
-expect(take(#"{"message": {"text": ""}}"#) == "wrote \(valuePath)" && inode(valuePath) == firstInode
+expect(take("") == "wrote \(valuePath)" && inode(valuePath) == firstInode
        && contents(valuePath) == "",
        "an empty value empties the file")
 try? FileManager.default.removeItem(atPath: valuePath)
 try? FileManager.default.createDirectory(atPath: valuePath + "/in-the-way",
                                          withIntermediateDirectories: true)
-let writeProblem = take(#"{"message": {"text": "x"}}"#)
+let writeProblem = take("x")
 expect(writeProblem?.hasPrefix("could not write the value file: cannot open \(valuePath): ") == true
        && valueFile.problem != nil,
        "a file that cannot be written is a problem: \(String(describing: writeProblem))")
-expect(take(#"{"message": {"text": "x"}}"#) == nil && valueFile.problem != nil,
+expect(take("x") == nil && valueFile.problem != nil,
        "the same problem again is no change")
 try? FileManager.default.removeItem(atPath: valuePath)
-expect(take(#"{"message": {"text": "x"}}"#) == "wrote \(valuePath)"
+expect(take("x") == "wrote \(valuePath)"
        && valueFile.problem == nil && contents(valuePath) == "x", "writing the file once it can be written clears the problem")
 try? FileManager.default.removeItem(atPath: valuePath)
 try? FileManager.default.createDirectory(atPath: valuePath + "/in-the-way",
                                          withIntermediateDirectories: true)
-_ = take(#"{"message": {"text": "y"}}"#)
+_ = take("y")
 try? FileManager.default.removeItem(atPath: valuePath)
 try? "x".write(toFile: valuePath, atomically: false, encoding: .utf8)
 let heldWrittenAt = valueFile.writtenAt
-expect(valueFile.problem != nil && take(#"{"message": {"text": "x"}}"#)
+expect(valueFile.problem != nil && take("x")
        == "\(valuePath) already holds the latest value" && valueFile.problem == nil
        && valueFile.writtenAt == heldWrittenAt,
        "a file that already holds the value clears the problem, without saying it was written")
@@ -638,20 +815,20 @@ func startServer(_ response: String, closes: Bool = true) -> (NWListener, UInt16
 }
 
 /// Follows the stream at a server that answers with `response` until the
-/// connection ends, and returns whether it was ready, the events, and why it
-/// ended.
+/// connection ends, and returns whether it was ready, the values at the path
+/// `a` in its events, and why it ended.
 func follow(_ response: String, closes: Bool = true,
             idleLimit: TimeInterval = 60) -> (Bool, [String], String?) {
     let (server, port) = startServer(response, closes: closes)
     defer { server.cancel() }
     let connection = EventStreamConnection(url: URL(string: "http://127.0.0.1:\(port)/events")!,
-                                           idleLimit: idleLimit)
+                                           path: ["a"], idleLimit: idleLimit)
     var ready = false
     var events: [String] = []
     var reason: String?
     waitForMain { done in
         connection.onReady = { ready = true }
-        connection.onEvent = { events.append($0) }
+        connection.onValue = { events.append($0) }
         connection.onEnded = {
             reason = $0
             done()
@@ -664,7 +841,7 @@ func follow(_ response: String, closes: Bool = true,
 let streamHead = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
     + "Connection: close\r\n\r\n"
 let (streamReady, streamed, streamEnd) = follow(streamHead + streamText)
-expect(streamReady && streamed == events(streamText), "the stream's events arrive: \(streamed)")
+expect(streamReady && streamed == values(streamText), "the stream's values arrive: \(streamed)")
 expect(streamEnd == "the server ended the stream",
        "the stream ends: \(String(describing: streamEnd))")
 
@@ -678,20 +855,21 @@ let (pageReady, pageEvents, pageEnd) = follow(
 expect(!pageReady && pageEvents.isEmpty
        && pageEnd == "the server answered with content type text/html, not text/event-stream",
        "a response that is not an event stream: \(String(describing: pageEnd))")
-let (idleReady, idleEvents, idleEnd) = follow(streamHead + "data: a\n\n", closes: false,
+let (idleReady, idleEvents, idleEnd) = follow(streamHead + "data: {\"a\": \"a\"}\n\n", closes: false,
                                               idleLimit: 0.2)
 expect(idleReady && idleEvents == ["a"] && idleEnd != nil
        && idleEnd != "the server ended the stream",
        "a stream that goes quiet ends: \(String(describing: idleEnd))")
 
-// An event that cancels the connection is the last, and the connection does
+// A value that cancels the connection is the last, and the connection does
 // not then say it ended.
-let (cancelServer, cancelPort) = startServer(streamHead + "data: a\n\ndata: b\n\n")
-let cancelled = EventStreamConnection(url: URL(string: "http://127.0.0.1:\(cancelPort)/")!)
+let (cancelServer, cancelPort) = startServer(streamHead + "data: {\"a\": \"a\"}\n\ndata: {\"a\": \"b\"}\n\n")
+let cancelled = EventStreamConnection(url: URL(string: "http://127.0.0.1:\(cancelPort)/")!,
+                                      path: ["a"])
 var cancelledEvents: [String] = []
 var cancelledEnded = false
 waitForMain { done in
-    cancelled.onEvent = {
+    cancelled.onValue = {
         cancelledEvents.append($0)
         cancelled.cancel()
         done()
