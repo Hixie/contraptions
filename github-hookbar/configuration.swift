@@ -47,6 +47,12 @@ let settingGroups: [(title: String, help: String, settings: [Setting])] = [
                 help: "The file that holds the latest value. A leading ~ stands for your "
                     + "home directory."),
     ]),
+    ("Power source", "Optionally, github-hookbar can run a command whenever the computer "
+        + "switches between battery and wall power.", [
+        Setting(name: "power.run", label: "Command:", placeholder: "none",
+                help: "A command line for your login shell, which gets battery or wall as its "
+                    + "last argument. Leave it empty to run none."),
+    ]),
 ]
 
 let settings = settingGroups.flatMap(\.settings)
@@ -169,6 +175,8 @@ struct Configuration {
     let actions: [String]
     let command: String
     let stream: StreamSettings?
+    /// The command line to run when the power source changes, if any.
+    let powerCommand: String?
 
     var relay: String { "\(host):\(port)" }
 
@@ -225,6 +233,8 @@ struct Configuration {
         let actions = list("github.actions")
         self.actions = actions.isEmpty ? ["opened"] : actions
         command = try required("command.run")
+        let powerCommand = values["power.run"] ?? ""
+        self.powerCommand = powerCommand.isEmpty ? nil : powerCommand
 
         let url = values["stream.url"] ?? ""
         guard !url.isEmpty else {

@@ -368,6 +368,7 @@ if case .success(let parsed) = configuration(minimal) {
     expect(parsed.host == "::1" && parsed.relay == "::1:8081", "an IPv6 relay: \(parsed.host)")
     expect(parsed.authors.isEmpty && parsed.orgs.isEmpty, "no authors or owners accepts anyone")
     expect(parsed.stream == nil, "no event stream")
+    expect(parsed.powerCommand == nil, "no power command")
 } else {
     expect(false, "a minimal configuration is read: \(String(describing: problem(minimal)))")
 }
@@ -408,6 +409,66 @@ if case .success(let parsed) = configuration(withStream) {
            "an event stream: \(String(describing: parsed.stream))")
 } else {
     expect(false, "a stream is read: \(String(describing: problem(withStream)))")
+}
+for (text, expected) in [(minimal + "[power]\nrun =\n", nil),
+                         (minimal + "[power]\nrun = notify --now\n", "notify --now")] {
+    if case .success(let parsed) = configuration(text) {
+        expect(parsed.powerCommand == expected,
+               "the power command: \(String(describing: parsed.powerCommand))")
+    } else {
+        expect(false, "a power command is read: \(String(describing: problem(text)))")
+    }
+}
+
+// MARK: - Power source
+
+do {
+    let monitor = PowerSourceMonitor()
+    var noticed: [PowerSource] = []
+    monitor.onChange = { noticed.append($0) }
+    for source in [PowerSource.wall, .wall, .battery, .battery, .wall, .wall, .battery] {
+        monitor.note(source)
+    }
+    expect(noticed == [.wall, .battery, .wall, .battery],
+           "the first source and each switch are noticed: \(noticed)")
+    expect(monitor.source == .battery,
+           "the monitor keeps the last source: \(String(describing: monitor.source))")
+}
+do {
+    var started: [String] = []
+    var finishers: [() -> Void] = []
+    let runner = LatestRunner<String> { value, done in
+        started.append(value)
+        finishers.append(done)
+    }
+    runner.run("a")
+    runner.run("b")
+    runner.run("c")
+    expect(started == ["a"], "a value waits while a job runs: \(started)")
+    finishers[0]()
+    expect(started == ["a", "c"], "only the latest waiting value runs next: \(started)")
+    finishers[1]()
+    runner.run("d")
+    expect(started == ["a", "c", "d"], "a value runs at once when nothing runs: \(started)")
+}
+let startedMonitor = PowerSourceMonitor()
+var startedWith: [PowerSource] = []
+startedMonitor.onChange = { startedWith.append($0) }
+expect((try? startedMonitor.start()) != nil, "IOKit says when the power source changes")
+expect(startedWith == [PowerSource.current],
+       "starting notes the current power source: \(startedWith)")
+do {
+    let pmset = Process()
+    let output = Pipe()
+    pmset.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+    pmset.arguments = ["-g", "ps"]
+    pmset.standardOutput = output
+    try! pmset.run()
+    let report = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    pmset.waitUntilExit()
+    let expected: PowerSource = report.contains("'Battery Power'") ? .battery : .wall
+    expect(PowerSource.current == expected,
+           "the current power source is the one pmset reports: \(PowerSource.current)")
 }
 
 /// What setting a setting does to INI text.

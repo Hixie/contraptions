@@ -183,11 +183,14 @@ struct Delivery {
 
 // MARK: - Running the command
 
+/// How a command finished: its exit status and the end of its output.
+typealias Outcome = (status: Int32, output: String)
+
 /// One run of the command for one pull request.
 final class Run {
     let event: PullRequestEvent
-    /// The exit status and the output, once the command has finished.
-    var outcome: (status: Int32, output: String)?
+    /// How the command finished, once it has.
+    var outcome: Outcome?
 
     init(_ event: PullRequestEvent) {
         self.event = event
@@ -195,6 +198,31 @@ final class Run {
 
     var summary: String {
         "\(event.repository.fullName)#\(event.pullRequest.number) \(event.pullRequest.title)"
+    }
+}
+
+/// Logs that a command finished. The system log cuts a message off after
+/// about a kilobyte, so each line of output is a log line of its own.
+func logFinished(_ command: String, _ status: Int32, _ output: String) {
+    let lines = output.split(whereSeparator: \.isNewline)
+    log("\(command) exited with status \(status)"
+        + (lines.isEmpty ? " and printed nothing" : " and printed:"))
+    for line in lines {
+        log("  | \(line)")
+    }
+}
+
+/// A menu item's image and tooltip for a command that is running or has
+/// finished.
+func showOutcome(_ outcome: Outcome?, on item: NSMenuItem) {
+    switch outcome {
+    case nil:
+        item.image = NSImage(systemSymbolName: "clock", accessibilityDescription: "running")
+        item.toolTip = "The command is running."
+    case let (status, output)?:
+        item.image = NSImage(systemSymbolName: status == 0 ? "checkmark" : "xmark",
+                             accessibilityDescription: status == 0 ? "succeeded" : "failed")
+        item.toolTip = "The command exited with status \(status).\n\(output)"
     }
 }
 
@@ -245,6 +273,13 @@ func runInLoginShell(_ script: String, arguments: [String],
     } catch {
         completion(-1, "could not start \(loginShellPath()): \(error.localizedDescription)")
     }
+}
+
+/// Runs a command line in the user's shell, as runInLoginShell does, with
+/// an argument added at its end.
+func runCommand(_ command: String, with argument: String,
+                completion: @escaping (Int32, String) -> Void) {
+    runInLoginShell(command + " \"$1\"", arguments: [argument], completion: completion)
 }
 
 /// Makes a new, empty file that only this user can read, and opens it.
@@ -325,6 +360,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
     private var stream: (connection: PersistentConnection, file: StreamValueFile)?
     private let train = TrainController()
     private var recent: [Run] = []
+    private let power = PowerSourceMonitor()
+    /// Runs the power command, if the settings name one, one run at a time.
+    private lazy var powerRunner = LatestRunner<PowerSource> { [weak self] source, done in
+        self?.runPowerCommand(for: source, then: done)
+    }
+    /// The power source the power command last ran for, and how it
+    /// finished, once it has.
+    private var powerRun: (source: PowerSource, outcome: Outcome?)?
+    /// The power command in the settings last read successfully.
+    private var powerCommand: String?
     /// The pull requests the command has run for.
     private var ranFor: Set<URL> = []
     /// How long after GitHub made it the last delivery on this connection
@@ -363,6 +408,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
         settingsWindow.onSave = { [weak self] in
             self?.connect()
         }
+        power.onChange = { [weak self] source in
+            log("the computer draws \(source) power")
+            self?.powerRunner.run(source)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -383,6 +432,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
             self, selector: #selector(didWake),
             name: NSWorkspace.didWakeNotification, object: nil)
         connect()
+        do {
+            try power.start()
+        } catch {
+            log("\(error)")
+        }
         if !FileManager.default.fileExists(atPath: configurationURL.path) {
             settingsWindow.show()
         }
@@ -402,6 +456,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
             return
         }
         self.configuration = configuration
+        if configuration.powerCommand != powerCommand {
+            powerCommand = configuration.powerCommand
+            if let source = power.source {
+                powerRunner.run(source)
+            }
+        }
         relay.start { [weak self] in
             self?.lastDeliveryAge = nil
             let connection = RelayConnection(configuration)
@@ -443,6 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
     }
 
     @objc private func didWake() {
+        power.check()
         if configuration == nil {
             connect()
         } else {
@@ -526,18 +587,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
         log("\(described): running the command")
         recent = Array(([item] + recent).prefix(recentLength))
         updateMenu()
-        runInLoginShell(configuration.command + " \"$1\"",
-                        arguments: [url.absoluteString]) { [weak self] status, output in
+        runCommand(configuration.command, with: url.absoluteString) { [weak self] status, output in
             item.outcome = (status, output)
-            // The system log cuts a message off after about a kilobyte, so
-            // each line of output is a log line of its own.
-            let lines = output.split(whereSeparator: \.isNewline)
-            log("the command for \(url.absoluteString) exited with status \(status)"
-                + (lines.isEmpty ? " and printed nothing" : " and printed:"))
-            for line in lines {
-                log("  | \(line)")
-            }
+            logFinished("the command for \(url.absoluteString)", status, output)
             self?.updateMenu()
+        }
+    }
+
+    /// Runs the power command, if the settings name one, for a power source,
+    /// and calls `done` once it has finished.
+    private func runPowerCommand(for source: PowerSource, then done: @escaping () -> Void) {
+        guard let command = configuration?.powerCommand else { return done() }
+        log("running the power command for \(source) power")
+        powerRun = (source, nil)
+        updateMenu()
+        runCommand(command, with: source.rawValue) { [weak self] status, output in
+            logFinished("the power command for \(source) power", status, output)
+            self?.powerRun = (source, (status, output))
+            self?.updateMenu()
+            done()
         }
     }
 
@@ -711,6 +779,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
         if let configuration {
             menu.addItem(withTitle: "Command: \(configuration.command)", action: nil,
                          keyEquivalent: "")
+            if let command = configuration.powerCommand {
+                let item = menu.addItem(withTitle: "Power command: \(command)", action: nil,
+                                        keyEquivalent: "")
+                if let powerRun {
+                    item.title += " (last run for \(powerRun.source) power)"
+                    showOutcome(powerRun.outcome, on: item)
+                }
+            }
         }
         for case let (title, problem?) in [("Could not change the pull request list: ",
                                             pullRequestListProblem),
@@ -727,17 +803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
                                           action: #selector(openPullRequest(_:)), keyEquivalent: "")
                 menuItem.target = self
                 menuItem.tag = index
-                switch item.outcome {
-                case nil:
-                    menuItem.image = NSImage(systemSymbolName: "clock",
-                                             accessibilityDescription: "running")
-                    menuItem.toolTip = "The command is running."
-                case let (status, output)?:
-                    menuItem.image = NSImage(
-                        systemSymbolName: status == 0 ? "checkmark" : "xmark",
-                        accessibilityDescription: status == 0 ? "succeeded" : "failed")
-                    menuItem.toolTip = "The command exited with status \(status).\n\(output)"
-                }
+                showOutcome(item.outcome, on: menuItem)
                 menu.addItem(menuItem)
             }
         }

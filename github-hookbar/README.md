@@ -8,7 +8,9 @@ github-hookbar also keeps a file listing those pull requests and their
 branches until they are closed, so that other programs can find the pull
 request for a branch. It can also follow a stream of server-sent events and
 keep a value from those events in a file, as described in the section on
-following an event stream.
+following an event stream, and run another command whenever the computer
+switches between battery and wall power, as described in the section on
+the power source.
 
 ## What the indicator means
 
@@ -35,6 +37,11 @@ for, newest first, each marked with a clock while the command runs, a tick
 when it exits with status 0, and a cross otherwise. Hovering over one shows
 the exit status and everything the command printed. Choosing one opens the
 pull request on GitHub.
+
+When the settings name a power command, the menu names it too. Once it has
+run, the menu says which power source it last ran for, marked as the pull
+requests are, and hovering over it shows the exit status and everything it
+printed.
 
 When a change to the pull request list fails, the menu says so until the
 list is next refreshed, and hovering over that line shows the whole error.
@@ -123,7 +130,7 @@ while github-hookbar is not connected, it tries again straight away.
 github-hookbar keeps its configuration in
 `~/.config/github-hookbar/config.ini`, or in the file given with
 `--config PATH`. The settings window, which opens by itself when the file does
-not exist yet, has a field for each setting, in three groups. Each group
+not exist yet, has a field for each setting, in four groups. Each group
 says what it is for, and each field says what it holds.
 
 **Webhook relay**
@@ -151,6 +158,11 @@ says what it is for, and each field says what it holds.
 - **Save to**: the file to keep the value in. A leading `~` stands for your
   home directory.
 
+**Power source**
+
+- **Command**: the command line to run when the computer switches between
+  battery and wall power. Empty means none.
+
 **Save** edits the file in place. Only the lines of the fields you changed are
 rewritten, so comments, layout, and anything changed in the file while the
 window was open stay as they were, and a setting the file lacks is added after
@@ -161,10 +173,10 @@ reconnects with them. **Edit File…** opens the file itself.
 
 The file is in INI format; see [config.example.ini](config.example.ini). The
 window's settings are, in order, `address` in `[relay]`, `authors`, `orgs` and
-`actions` in `[github]`, `run` in `[command]`, and `url`, `path` and `file`
-in `[stream]`. github-hookbar refuses a file that sets any other key, or sets
-one twice, so a misspelled or repeated key cannot quietly widen what runs the
-command. The window says so when it opens.
+`actions` in `[github]`, `run` in `[command]`, `url`, `path` and `file` in
+`[stream]`, and `run` in `[power]`. github-hookbar refuses a file that sets
+any other key, or sets one twice, so a misspelled or repeated key cannot
+quietly widen what runs the command. The window says so when it opens.
 
 The configuration is read when github-hookbar starts, when **Reconnect** is
 chosen, and after **Save**. Attempts to connect again after a connection ends
@@ -230,6 +242,21 @@ password, which can hold secrets.
 
 **Reconnect** and **Save** open the stream again. When its settings did not
 change, the menu goes on saying when the file was last written.
+
+## The power source
+
+github-hookbar asks macOS to say whenever the computer switches between a
+limited power source, such as its battery, and an unlimited one, such as a
+wall outlet. Each time it does, github-hookbar runs the power command from
+the settings, if they name one, in your login shell in the same way as the
+pull request command, with `battery` or `wall` as its last argument. It
+also runs the command once when it starts, and when saved settings change
+the command, with the power source at that moment, and checks the power
+source when the computer wakes, in case it switched while the computer
+slept. It runs the power command once at a time: a switch while the
+command runs waits until it finishes, and only the latest such switch
+runs the command then, so each run finishes before the next starts and
+the last run is for the latest power source.
 
 ## The freight train
 
@@ -342,11 +369,12 @@ bar.
 
 Requires the Xcode command line tools, for `swiftc`. Catching up after
 reconnecting, and the tests, also need `jq`, which macOS includes from macOS
-15 on. There is no Xcode project; the app is nine Swift files: `main.swift`
+15 on. There is no Xcode project; the app is ten Swift files: `main.swift`
 and `settingswindow.swift`, which hold the menu bar app and its settings
 window, and `timing.swift`, `configuration.swift`, `prlist.swift`,
-`lockedfile.swift`, `connection.swift`, `stream.swift`, and `train.swift`,
-which hold what the tests cover, apart from the train's window.
+`lockedfile.swift`, `connection.swift`, `stream.swift`, `train.swift`, and
+`power.swift`, which hold what the tests cover, apart from the train's
+window.
 
 ```sh
 make              # builds ./github-hookbar
@@ -361,8 +389,10 @@ value file turns out to hold the latest value already after such a failure,
 each `pull_request` delivery with whether it runs the command or changes the
 pull request list, each time the command finishes, with its exit status and
 output, one line of output per log line, each refresh of the pull request
-list, each failure to change the list, and each time it looks for pull
-requests opened while it was not connected or fails to. The lines go to
+list, each failure to change the list, each time it looks for pull
+requests opened while it was not connected or fails to, and each switch
+between battery and wall power, with when the power command finishes, its
+exit status and output. The lines go to
 standard error and to the system log, which keeps them however github-hookbar
 was started. They include the URLs of pull requests in private repositories.
 zsh has a `log` command of its own, so give the full path:

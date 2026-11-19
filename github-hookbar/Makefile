@@ -7,7 +7,7 @@ AGENT_PLIST = $(AGENT_DIR)/$(AGENT_LABEL).plist
 # Everything the tests exercise, which leaves out the menu bar, the settings
 # window, and the train's window.
 LIBRARY = timing.swift configuration.swift prlist.swift lockedfile.swift connection.swift \
-  stream.swift train.swift
+  stream.swift train.swift power.swift
 SOURCES = main.swift settingswindow.swift $(LIBRARY)
 TEST_SOURCES = $(LIBRARY) tests/main.swift
 
