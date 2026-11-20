@@ -1,4 +1,5 @@
 import AppKit
+import Network
 
 // ghbar: a menu bar indicator for the state of the checks GitHub reports on
 // the head commit of one branch of one repository. The indicator is green when
@@ -823,6 +824,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsWindow: SettingsWindowController?
     private var latest: MonitorState = .unconfigured
     private var dynamicSignature: String?
+    /// Whether the menu is showing. While it is not, its contents are left
+    /// alone until it is next opened.
+    private var menuIsOpen = false
+    /// What the status item shows, once it has been set.
+    private var shownIndicator: Indicator?
+    private let network = NWPathMonitor()
     private let flyby = FlybyController()
     private var lastHealth: Health?
     private var lastFailure: String?
@@ -868,7 +875,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.apply(state)
         }
         monitor.onRelayChange = { [weak self] in
-            self?.refreshMenuContents()
+            self?.refreshOpenMenu()
         }
         apply(.unconfigured)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -878,6 +885,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             object: nil
         )
         applySettings()
+        network.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied {
+                self?.monitor.networkAvailable()
+            }
+        }
+        network.start(queue: .main)
         if demonstratesBanner {
             demonstrateBanner()
         } else if settings.repository == nil {
@@ -998,7 +1011,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func apply(_ state: MonitorState) {
         latest = state
         updateStatusItem()
-        refreshMenuContents()
+        refreshOpenMenu()
         if case .ready(let status) = state {
             considerRed(status)
         }
@@ -1132,17 +1145,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Sets the parts of the status item that differ from what it shows.
     private func updateStatusItem() {
         guard let button = statusItem?.button else { return }
-        button.image = indicatorImage(indicator, pointSize: 14)
-        if settings.showsMenuBarName {
-            button.title = settings.displayName
-            button.imagePosition = .imageLeading
-        } else {
-            button.title = ""
-            button.imagePosition = .imageOnly
+        if indicator != shownIndicator {
+            shownIndicator = indicator
+            button.image = indicatorImage(indicator, pointSize: 14)
         }
-        button.toolTip = tooltip()
+        let title = settings.showsMenuBarName ? settings.displayName : ""
+        if button.title != title {
+            button.title = title
+        }
+        let position: NSControl.ImagePosition = settings.showsMenuBarName ? .imageLeading : .imageOnly
+        if button.imagePosition != position {
+            button.imagePosition = position
+        }
+        let tooltip = tooltip()
+        if button.toolTip != tooltip {
+            button.toolTip = tooltip
+        }
     }
 
     private func tooltip() -> String {
@@ -1164,6 +1185,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         refreshMenuContents()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+    }
+
+    private func refreshOpenMenu() {
+        if menuIsOpen {
+            refreshMenuContents()
+        }
     }
 
     private func refreshMenuContents() {

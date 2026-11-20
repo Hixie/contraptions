@@ -37,31 +37,7 @@ func parseRelayAddress(_ text: String) -> RelayAddress? {
     return RelayAddress(host: String(host), port: port)
 }
 
-// MARK: - Frames
-
-struct FrameTooLong: Error {
-    let length: Int
-}
-
-/// Takes every complete frame out of the buffer, leaving the start of any
-/// frame that has not all arrived. A frame is the length of an HTTP request,
-/// as a 32-bit big-endian integer, followed by the request. Consumed bytes
-/// are removed rather than sliced off, so that their storage is freed.
-func takeFrames(from buffer: inout Data) throws(FrameTooLong) -> [Data] {
-    var frames: [Data] = []
-    var offset = buffer.startIndex
-    while buffer.endIndex - offset >= 4 {
-        let length = buffer[offset..<offset + 4].reduce(0) { $0 << 8 | Int($1) }
-        guard length <= maximumRequestLength else {
-            throw FrameTooLong(length: length)
-        }
-        guard buffer.endIndex - offset - 4 >= length else { break }
-        frames.append(Data(buffer[offset + 4..<offset + 4 + length]))
-        offset += 4 + length
-    }
-    buffer.removeSubrange(buffer.startIndex..<offset)
-    return frames
-}
+// MARK: - Deliveries
 
 /// One delivery: the headers of the HTTP request that carried it, and its
 /// body, exactly as GitHub sent it.
@@ -69,23 +45,44 @@ struct Delivery {
     /// The header values, by header name in lowercase. Proxies on the way
     /// can change the case of header names.
     let headers: [String: String]
+    /// The part of the request after the headers, sharing its storage.
     let body: Data
 
-    /// Splits an HTTP request into its headers and body.
+    /// Splits an HTTP request into its headers and body. A line ends at a
+    /// line feed, and a carriage return before it is dropped. The headers
+    /// end at the first empty line; a request with no empty line is not a
+    /// delivery.
     init?(_ request: Data) {
-        guard let blank = request.range(of: Data("\r\n\r\n".utf8)) else { return nil }
         var headers: [String: String] = [:]
-        // The first line is the request line, not a header. The values are
-        // bytes, read as Latin-1, which every byte is.
-        for line in request[..<blank.lowerBound].split(separator: Data("\r\n".utf8)).dropFirst() {
-            let text = String(String.UnicodeScalarView(line.map { Unicode.Scalar($0) }))
+        var lineStart = request.startIndex
+        var isRequestLine = true
+        while let end = request[lineStart...].firstIndex(of: UInt8(ascii: "\n")) {
+            var line = request[lineStart..<end]
+            lineStart = end + 1
+            if line.last == UInt8(ascii: "\r") {
+                line = line.dropLast()
+            }
+            if line.isEmpty {
+                // An empty line before the request line is passed over, as
+                // RFC 9112 says.
+                if isRequestLine { continue }
+                self.headers = headers
+                body = request[lineStart...]
+                return
+            }
+            // The first line is the request line, not a header. The values
+            // are bytes, read as Latin-1, which every byte is.
+            if isRequestLine {
+                isRequestLine = false
+                continue
+            }
+            let text = String(String.UnicodeScalarView(line.lazy.map { Unicode.Scalar($0) }))
             let parts = text.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
             if parts.count == 2 {
                 headers[parts[0].lowercased()] = parts[1].trimmingCharacters(in: .whitespaces)
             }
         }
-        self.headers = headers
-        body = Data(request[blank.upperBound...])
+        return nil
     }
 }
 
@@ -138,69 +135,82 @@ struct WebhookEvent {
     /// token leave out.
     init?(_ delivery: Delivery) throws(UnreadableDelivery) {
         let name = delivery.headers["x-github-event"] ?? ""
-        do {
+        do throws(JSONError) {
             switch name {
             case "check_run":
-                let payload = try gitHubDecoder.decode(CheckRunPayload.self, from: delivery.body)
-                let run = payload.checkRun
-                guard run.app.slug == actionsApp else { return nil }
-                let url = (run.detailsUrl ?? run.htmlUrl).flatMap(URL.init(string:))
-                if run.conclusion == "cancelled" {
-                    kind = .cancelled(suite: run.checkSuite.id)
+                let payload = try checkRunPaths.read(delivery.body)
+                guard try payload.string("check_run.app.slug") == actionsApp else { return nil }
+                let suite = try payload.int("check_run.check_suite.id")
+                let run = try payload.string("check_run.name")
+                let details = try payload.optionalString("check_run.details_url")
+                let page = try payload.optionalString("check_run.html_url")
+                let url = (details ?? page).flatMap(URL.init(string:))
+                let conclusion = try payload.optionalString("check_run.conclusion")
+                if conclusion == "cancelled" {
+                    kind = .cancelled(suite: suite)
                 } else {
-                    switch checkState(runStatus: run.status, conclusion: run.conclusion) {
+                    switch checkState(runStatus: try payload.string("check_run.status"), conclusion: conclusion) {
                     case .running:
-                        kind = .runStarted(suite: run.checkSuite.id, run: run.name, url: url,
-                                           at: run.startedAt ?? Date())
+                        kind = .runStarted(suite: suite, run: run, url: url,
+                                           at: try payload.optionalDate("check_run.started_at") ?? Date())
                     case .failing:
-                        kind = .runFailed(suite: run.checkSuite.id, run: run.name, url: url,
-                                          at: run.completedAt ?? Date())
+                        kind = .runFailed(suite: suite, run: run, url: url,
+                                          at: try payload.optionalDate("check_run.completed_at") ?? Date())
                     case .passing, .other:
                         return nil
                     }
                 }
-                repository = payload.repository.fullName
-                sha = run.headSha
-                branch = run.checkSuite.headBranch
-                before = run.checkSuite.before
+                repository = try payload.string("repository.full_name")
+                sha = try payload.string("check_run.head_sha")
+                branch = try payload.optionalString("check_run.check_suite.head_branch")
+                before = try payload.optionalString("check_run.check_suite.before")
             case "check_suite":
-                let payload = try gitHubDecoder.decode(CheckSuitePayload.self, from: delivery.body)
-                let suite = payload.checkSuite
-                guard suite.status == "completed", suite.app.slug == actionsApp else { return nil }
-                repository = payload.repository.fullName
-                sha = suite.headSha
-                branch = suite.headBranch
-                before = suite.before
-                kind = suite.conclusion == "cancelled"
-                    ? .cancelled(suite: suite.id)
-                    : .suiteFinished(suite: suite.id,
-                                     state: checkState(runStatus: "completed", conclusion: suite.conclusion),
-                                     detail: suite.conclusion ?? "completed", at: suite.updatedAt)
+                let payload = try checkSuitePaths.read(delivery.body)
+                guard try payload.optionalString("check_suite.status") == "completed",
+                      try payload.string("check_suite.app.slug") == actionsApp else { return nil }
+                let suite = try payload.int("check_suite.id")
+                let conclusion = try payload.optionalString("check_suite.conclusion")
+                let updated = try payload.date("check_suite.updated_at")
+                repository = try payload.string("repository.full_name")
+                sha = try payload.string("check_suite.head_sha")
+                branch = try payload.optionalString("check_suite.head_branch")
+                before = try payload.optionalString("check_suite.before")
+                kind = conclusion == "cancelled"
+                    ? .cancelled(suite: suite)
+                    : .suiteFinished(suite: suite,
+                                     state: checkState(runStatus: "completed", conclusion: conclusion),
+                                     detail: conclusion ?? "completed", at: updated)
             case "status":
-                let payload = try gitHubDecoder.decode(StatusPayload.self, from: delivery.body)
-                repository = payload.repository.fullName
-                sha = payload.sha
+                let payload = try statusPaths.read(delivery.body)
+                let state = try payload.string("state")
+                repository = try payload.string("repository.full_name")
+                sha = try payload.string("sha")
                 branch = nil
                 before = nil
-                kind = .status(context: payload.context,
-                               StatusRecord(id: payload.id, state: checkState(commitStatus: payload.state),
-                                            detail: payload.description ?? payload.state,
-                                            url: payload.targetUrl.flatMap(URL.init(string:))))
+                kind = .status(context: try payload.string("context"),
+                               StatusRecord(id: try payload.int("id"), state: checkState(commitStatus: state),
+                                            detail: try payload.optionalString("description") ?? state,
+                                            url: try payload.optionalString("target_url").flatMap(URL.init(string:))))
             case "push":
-                let payload = try gitHubDecoder.decode(PushPayload.self, from: delivery.body)
+                let payload = try pushPaths.read(delivery.body)
+                let ref = try payload.string("ref")
                 let prefix = "refs/heads/"
-                guard payload.ref.hasPrefix(prefix) else { return nil }
-                repository = payload.repository.fullName
-                sha = payload.after
-                branch = String(payload.ref.dropFirst(prefix.count))
-                before = payload.before
-                kind = .push(headline: payload.headCommit.map { firstLine($0.message) },
-                             deleted: payload.deleted ?? false, at: payload.repository.pushedAt)
+                guard ref.hasPrefix(prefix) else { return nil }
+                repository = try payload.string("repository.full_name")
+                sha = try payload.string("after")
+                branch = String(ref.dropFirst(prefix.count))
+                before = try payload.string("before")
+                // The time of the push is read if it is in a form GitHub uses
+                // for times, and left out otherwise, since the push is worth
+                // reading without it.
+                kind = .push(headline: try payload.optionalString("head_commit.message").map(firstLine),
+                             deleted: try payload.optionalBool("deleted") ?? false,
+                             at: payload.value("repository.pushed_at")?.date)
             default:
                 return nil
             }
         } catch {
-            throw UnreadableDelivery(event: name, reason: error.localizedDescription)
+            throw UnreadableDelivery(event: name, reason: error.description)
         }
     }
 }
@@ -208,118 +218,42 @@ struct WebhookEvent {
 /// The app that runs GitHub Actions workflows.
 let actionsApp = "github-actions"
 
-private struct RepositoryField: Decodable {
-    let fullName: String
-}
+private let checkRunPaths = JSONPaths([
+    "check_run.head_sha", "check_run.name", "check_run.status", "check_run.conclusion",
+    "check_run.started_at", "check_run.completed_at", "check_run.details_url", "check_run.html_url",
+    "check_run.check_suite.id", "check_run.check_suite.head_branch", "check_run.check_suite.before",
+    "check_run.app.slug", "repository.full_name",
+])
 
-private struct AppField: Decodable {
-    let slug: String
-}
+private let checkSuitePaths = JSONPaths([
+    "check_suite.id", "check_suite.head_sha", "check_suite.head_branch", "check_suite.before",
+    "check_suite.status", "check_suite.conclusion", "check_suite.updated_at", "check_suite.app.slug",
+    "repository.full_name",
+])
 
-private struct CheckRunPayload: Decodable {
-    struct Run: Decodable {
-        struct Suite: Decodable {
-            let id: Int
-            let headBranch: String?
-            let before: String?
-        }
-        let headSha: String
-        let name: String
-        let status: String
-        let conclusion: String?
-        let startedAt: Date?
-        let completedAt: Date?
-        let detailsUrl: String?
-        let htmlUrl: String?
-        let checkSuite: Suite
-        let app: AppField
-    }
-    let checkRun: Run
-    let repository: RepositoryField
-}
+private let statusPaths = JSONPaths([
+    "id", "sha", "context", "state", "description", "target_url", "repository.full_name",
+])
 
-private struct CheckSuitePayload: Decodable {
-    struct Suite: Decodable {
-        let id: Int
-        let headSha: String
-        let headBranch: String?
-        let before: String?
-        let status: String?
-        let conclusion: String?
-        let updatedAt: Date
-        let app: AppField
-    }
-    let checkSuite: Suite
-    let repository: RepositoryField
-}
-
-private struct StatusPayload: Decodable {
-    let id: Int
-    let sha: String
-    let context: String
-    let state: String
-    let description: String?
-    let targetUrl: String?
-    let repository: RepositoryField
-}
-
-private struct PushPayload: Decodable {
-    struct Commit: Decodable {
-        let message: String
-    }
-    struct Repository: Decodable {
-        let fullName: String
-        let pushedAt: Date?
-
-        private enum CodingKeys: String, CodingKey {
-            case fullName, pushedAt
-        }
-
-        /// The push's time is read if it is in a form GitHub uses for times,
-        /// and left out otherwise, since the push is worth reading without it.
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            fullName = try container.decode(String.self, forKey: .fullName)
-            pushedAt = (try? container.decodeIfPresent(FlexibleTime.self, forKey: .pushedAt))??.date
-        }
-    }
-    let ref: String
-    let before: String
-    let after: String
-    let deleted: Bool?
-    let headCommit: Commit?
-    let repository: Repository
-}
-
-/// A time GitHub gives either as seconds since 1970, as it does for when a
-/// push happened, or as an ISO 8601 string.
-private struct FlexibleTime: Decodable {
-    let date: Date
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let seconds = try? container.decode(Double.self) {
-            date = Date(timeIntervalSince1970: seconds)
-        } else {
-            date = try container.decode(Date.self)
-        }
-    }
-}
+private let pushPaths = JSONPaths([
+    "ref", "before", "after", "deleted", "head_commit.message", "repository.full_name",
+    "repository.pushed_at",
+])
 
 // MARK: - The connection
 
 /// One connection to the relay, which sends each delivery as a frame and
-/// nothing in between. It reports when the connection is up, each delivery,
-/// each frame that is not an HTTP request, and once that the connection has
-/// ended; a frame that the end of the connection cuts short is not a
-/// delivery. All methods and callbacks run on the main thread.
+/// nothing in between. A frame is the length of an HTTP request, as a 32-bit
+/// big-endian integer, followed by the request. The connection reports when
+/// it is up, each delivery, each frame that is not an HTTP request, and once
+/// that it has ended; a frame that the end of the connection cuts short is
+/// not a delivery. All methods and callbacks run on the main thread.
 final class RelayConnection {
     var onReady: (() -> Void)?
     var onDelivery: ((Delivery) -> Void)?
     var onUnreadable: ((String) -> Void)?
     var onEnded: ((String) -> Void)?
     private let connection: NWConnection
-    private var buffer = Data()
     private var ended = false
 
     init(_ address: RelayAddress) {
@@ -356,6 +290,10 @@ final class RelayConnection {
         connection.cancel()
     }
 
+    deinit {
+        connection.cancel()
+    }
+
     private func end(_ reason: String) {
         guard !ended else { return }
         cancel()
@@ -363,32 +301,37 @@ final class RelayConnection {
     }
 
     private func receive() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) {
-            [weak self] data, _, isComplete, error in
-            guard let self, !ended else { return }
-            if let data {
-                buffer.append(data)
-                do throws(FrameTooLong) {
-                    for frame in try takeFrames(from: &buffer) {
-                        guard !ended else { return }
-                        if let delivery = Delivery(frame) {
-                            onDelivery?(delivery)
-                        } else {
-                            onUnreadable?("A frame from the relay was not an HTTP request")
-                        }
-                    }
-                } catch {
-                    end("the relay sent a frame of \(error.length) bytes")
-                }
+        read(4) { [weak self] prefix in
+            guard let self else { return }
+            let length = prefix.reduce(0) { $0 << 8 | Int($1) }
+            guard length <= maximumRequestLength else {
+                return end("the relay sent a frame of \(length) bytes")
             }
-            if ended {
-                return
+            read(length) { [weak self] request in
+                guard let self else { return }
+                if let delivery = Delivery(request) {
+                    onDelivery?(delivery)
+                } else {
+                    onUnreadable?("A frame from the relay was not an HTTP request")
+                }
+                receive()
+            }
+        }
+    }
+
+    /// Hands the next `count` bytes to `then` once they have all arrived,
+    /// or ends the connection if it fails or closes first.
+    private func read(_ count: Int, then: @escaping (Data) -> Void) {
+        guard count > 0 else { return then(Data()) }
+        connection.receive(minimumIncompleteLength: count, maximumLength: count) {
+            [weak self] data, _, _, error in
+            guard let self, !ended else { return }
+            if let data, data.count == count {
+                then(data)
             } else if let error {
                 end(describe(error))
-            } else if isComplete {
-                end("the relay closed the connection")
             } else {
-                receive()
+                end("the relay closed the connection")
             }
         }
     }

@@ -225,7 +225,7 @@ func snapshot(sha: String = "a1", _ suites: [Int: CheckState?] = [1: nil], finis
 }
 
 func request(_ event: String, _ body: String, eventHeader: String = "X-GitHub-Event") -> Data {
-    Data("POST /webhook HTTP/1.1\r\nContent-Type: application/json\r\n\(eventHeader): \(event)\r\n\r\n\(body)".utf8)
+    Data("POST http://relay.example:8081/webhook HTTP/1.1\r\nContent-Type: application/json\r\n\(eventHeader): \(event)\r\n\r\n\(body)".utf8)
 }
 
 func quoted(_ text: String?) -> String {
@@ -268,6 +268,15 @@ func pushBody(ref: String = "refs/heads/main", before: String = "a1", after: Str
               message: String = "Second\n\nBody", deleted: Bool = false, pushed: Int? = nil) -> String {
     let time = pushed.map { #", "pushed_at": \#(Int(at($0).timeIntervalSince1970))"# } ?? ""
     return #"{"ref": "\#(ref)", "before": "\#(before)", "after": "\#(after)", "deleted": \#(deleted), "head_commit": {"message": "\#(message.replacingOccurrences(of: "\n", with: "\\n"))"}, "repository": {"full_name": "octo/repo"\#(time)}}"#
+}
+
+/// Whether a delivery is passed over without complaint.
+func ignored(_ name: String, _ body: String) -> Bool {
+    do {
+        return try WebhookEvent(Delivery(request(name, body))!) == nil
+    } catch {
+        return false
+    }
 }
 
 func read(_ name: String, _ body: String) -> WebhookEvent? {
@@ -321,32 +330,140 @@ for text in ["relay.example.com", "relay:0", "relay:port", ":8081", "relay:70000
     expect(parseRelayAddress(text) == nil, "\"\(text)\" is not an address")
 }
 
-// MARK: - Frames
+// MARK: - Reading JSON
 
-do {
-    let first = Data("one".utf8)
-    let second = Data("second".utf8)
-    let third = frame(Data("third".utf8))
-    var buffer = frame(first) + frame(second) + third.prefix(5)
-    let frames = try takeFrames(from: &buffer)
-    expect(frames == [first, second], "complete frames come out in order")
-    expect(buffer == third.prefix(5), "the start of an incomplete frame stays behind")
-    buffer.append(third.dropFirst(5))
-    expect(try takeFrames(from: &buffer) == [Data("third".utf8)], "the rest of the frame completes it")
-    expect(buffer.isEmpty, "nothing is left once every frame is taken")
-    var partialLength = Data([0, 0])
-    expect(try takeFrames(from: &partialLength).isEmpty, "half a length is not a frame")
-    expect(partialLength.count == 2, "half a length waits for the rest")
-} catch {
-    expect(false, "frames that fit are read without complaint: \(error)")
+/// What `body` complains of, or nil if it does not complain.
+func complaint(_ body: () throws -> Void) -> String? {
+    do {
+        try body()
+        return nil
+    } catch {
+        return "\(error)"
+    }
 }
 
 do {
-    var huge = Data([0xff, 0xff, 0xff, 0xff])
-    _ = try takeFrames(from: &huge)
-    expect(false, "a frame longer than any delivery is refused")
+    let paths = JSONPaths(["a.b", "a.c", "d", "e.f"])
+    func fields(_ text: String) -> JSONFields? { try? paths.read(Data(text.utf8)) }
+    func problem(_ document: Data) -> String? { complaint { _ = try paths.read(document) } }
+
+    // Escapes are built from a backslash, so that the document holds them.
+    let b = String(Unicode.Scalar(0x5C))
+    let u = b + "u"
+    func absent(_ text: String, _ path: String) -> Bool { fields(text).map { $0.value(path) == nil } ?? false }
+    let read = fields(#"""
+        {"x": [1, {"b": 2}, "}", {"a": {"b": 3}}], "a": {"z": null, "b": "\#(u)00e9\#(u)D83D\#(u)de00\n\"\\\/\t", "c": -1.5e+3},
+         "d": true, "e": null}
+        """#)
+    expect(read?.value("a.b") == .string("\u{E9}\u{1F600}\n\"\\/\t"), "escapes, a surrogate pair among them, are decoded")
+    expect(read?.value("a.c") == .number("-1.5e+3"), "a number is kept as it is written")
+    expect(fields(#"{"\#(u)0064": 1E5}"#)?.value("d") == .number("1E5"),
+           "a key written with escapes is the key it stands for, and an exponent may be a capital E")
+    expect(fields(#"{"d": "\#(b)b\#(b)f\#(b)r\#(b)n\#(b)t"}"#)?.value("d") == .string("\u{8}\u{C}\r\n\t"),
+           "every escape of a control character is decoded")
+    expect(read?.value("d") == .bool(true), "true is read")
+    expect(absent(#"{"e": null, "d": 1}"#, "e.f"), "a path that runs through null has no value")
+    expect(absent(#"{"x": {"a": {"b": 1}}, "b": 2, "d": null}"#, "a.b"),
+           "a key is taken only on its path, not wherever it appears")
+    expect(fields(#"{"x": {"a": {"b": 1}}, "b": 2, "d": null}"#)?.value("d") == .null, "null is read")
+    expect(fields(#"{"d": {"x": [1, {}]}}"#)?.value("d") == .container, "an object is passed over, not kept")
+    expect(fields(#"{"d": 1, "d": 0}"#)?.value("d") == .number("0"), "of a key given twice, the last counts")
+    expect(fields(#"{"a": {"b": 1}, "a": {"b": 2}}"#)?.value("a.b") == .number("2")
+           && absent(#"{"a": {"b": 1}, "a": {"c": 2}}"#, "a.b")
+           && absent(#"{"a": {"b": 1}, "a": null}"#, "a.b"),
+           "of an object given twice, the last counts")
+    expect(fields(#"{"d": "naïve 🙂"}"#)?.value("d") == .string("naïve 🙂"), "UTF-8 in a string is kept")
+    expect(fields(" \n{ \"d\" : [ ] , \"a\" : { } }\r\n\t")?.value("d") == .container, "whitespace is passed over")
+    let deep = #"{"d": "#  + String(repeating: "[", count: 100_000) + String(repeating: "]", count: 100_000) + "}"
+    expect(fields(deep)?.value("d") == .container, "a deeply nested value is passed over")
+
+    expect(problem(Data("[]".utf8)) == "unexpected byte 0x5b where an object should start, at offset 0",
+           "a document that is not an object is complained about, saying where")
+    expect(problem(Data(#"{"a": 1}"#.utf8)) == "a is not an object", "a value where an object is wanted is named")
+    expect(problem(Data(#"{"a": }"#.utf8)) == "unexpected byte 0x7d where a value should start, at offset 6",
+           "where an object is wanted, a document that is not JSON says so")
+    expect(problem(Data(#"{"d": 1"#.utf8)) == "the document ends after a value in an object",
+           "a document cut short says so")
+    expect(problem(Data(#"{"d": "\#(u)d83d\#(u)0041"}"#.utf8))
+           == "the string at offset 6 holds half of a surrogate pair",
+           "a first half followed by an escape that is not a second half, in a string that is kept, is named")
+    expect(problem(Data(#"{"d": "\#(u)DE00"}"#.utf8)) == "the string at offset 6 holds half of a surrogate pair",
+           "a second half alone, in a string that is kept, is named")
+    expect(fields(#"{"\#(u)d800": {"d": 2}, "d": 1}"#)?.value("d") == .number("1"),
+           "a key holding half of a surrogate pair is passed over with its value")
+    for (text, why) in [
+        ("", "an empty document"),
+        (#"{"d": 1,}"#, "a comma before the end of an object"),
+        (#"{"x": [1,]}"#, "a comma before the end of an array"),
+        (#"{"x": [1 2]}"#, "values in an array with no comma between them"),
+        (#"{"x": {"y" 1}}"#, "a key with no colon after it"),
+        (#"{"x": {y: 1}}"#, "a key that is not a string"),
+        (#"{"x": 01}"#, "a number with a leading zero"),
+        (#"{"x": 1.}"#, "a number with no digits after its point"),
+        (#"{"x": -}"#, "a minus sign alone"),
+        (#"{"x": 1e+}"#, "an exponent with no digits"),
+        (#"{"x": tru}"#, "a word cut short"),
+        (#"{"x": nul"#, "a document that ends in a word"),
+        (#"{"x": +1}"#, "a plus sign before a number"),
+        (#"{"x": "\x"}"#, "an escape JSON does not have"),
+        (#"{"x": "\#(u)12"}"#, "a \\u escape cut short"),
+        (#"{"x": "\#(u)12g4"}"#, "a \\u escape that is not hexadecimal"),
+        (#"{"d": "\#(u)d83d"}"#, "the first half of a surrogate pair alone, in a string that is kept"),
+        (#"{"d": "\#(u)d83dA"}"#, "a first half followed by something else"),
+        ("{\"x\": \"a\tb\"}", "a tab in a string"),
+        (#"{"x": "open}"#, "a string that is not closed"),
+        (#"{"x": "\"#, "a document that ends in an escape"),
+        (#"{"d": 1} {}"#, "anything after the document"),
+    ] {
+        expect(problem(Data(text.utf8)) != nil, "\(why) is complained about")
+    }
+    for (bytes, why) in [
+        ([0xC3, 0x28], "a sequence that stops early"),
+        ([0xC0, 0x80], "a character written in more bytes than it needs"),
+        ([0xED, 0xA0, 0x80], "a surrogate written in UTF-8"),
+        ([0xF4, 0x90, 0x80, 0x80], "a character after U+10FFFF"),
+        ([0x80], "a continuation byte alone"),
+        ([0xE2, 0x82], "a sequence cut short by the end of the string"),
+        ([0xE2, 0x82, 0x78], "a three-byte sequence whose last byte is not a continuation"),
+        ([0xF0, 0x9F, 0x98, 0x41], "a four-byte sequence whose last byte is not a continuation"),
+        ([0xE0, 0x80, 0x80], "a three-byte character written in more bytes than it needs"),
+        ([0xF0, 0x80, 0x80, 0x80], "a four-byte character written in more bytes than it needs"),
+    ] as [([UInt8], String)] {
+        let document = Data(#"{"x": ""#.utf8) + Data(bytes) + Data(#""}"#.utf8)
+        expect(problem(document) != nil, "\(why) is not UTF-8, and is complained about")
+    }
+    expect(problem(Data(#"{"x": ""#.utf8) + Data([0xF0, 0x9F, 0x98])) == "unexpected byte 0xf0 that starts a sequence that is not UTF-8, at offset 7",
+           "a document that ends inside a UTF-8 sequence is complained about")
+    expect(problem(Data(#"{"x": "\#u{10FFFF}é€"}"#.utf8)) == nil, "the longest UTF-8 sequences are read")
+    expect(problem(Data(#"{"x": "\#u{80}\#u{800}\#u{D7FF}\#u{E000}\#u{10000}"}"#.utf8)) == nil,
+           "the first and last characters of each length of UTF-8 sequence are read")
+    expect(problem(Data(#"{"x": ["\#(u)d83d", "\#(u)DE00"]}"#.utf8)) == nil,
+           "half a surrogate pair is passed over in a string that is not kept")
+}
+
+do {
+    let paths = JSONPaths(["text", "count", "flag", "time", "later", "gone", "empty"])
+    let fields = try paths.read(Data(#"""
+        {"text": "x", "count": 3, "flag": false, "time": "2027-01-15T08:00:00Z",
+         "later": "2027-01-15T00:00:00.5-08:00", "empty": null}
+        """#.utf8))
+    expect(try fields.string("text") == "x" && fields.int("count") == 3 && fields.optionalBool("flag") == false,
+           "values are read as what they are")
+    expect(try fields.date("time") == Date(timeIntervalSince1970: 1_800_000_000),
+           "a time is read from ISO 8601")
+    expect(try fields.date("count") == Date(timeIntervalSince1970: 3), "or from seconds since 1970")
+    expect(try fields.date("later") == Date(timeIntervalSince1970: 1_800_000_000.5),
+           "a time may have a fraction of a second, and a time zone")
+    expect(try fields.optionalString("gone") == nil && fields.optionalDate("empty") == nil,
+           "a value that is missing or null is no value")
+    expect(complaint { _ = try fields.string("count") } == "count is not a string", "a number is not a string")
+    expect(complaint { _ = try fields.int("text") } == "text is not a whole number", "a string is not a number")
+    expect(complaint { _ = try fields.date("text") } == "text is not a time", "a string that is not a time")
+    expect(complaint { _ = try fields.optionalBool("count") } == "count is not true or false",
+           "a number is not true or false, even when the value may be missing")
+    expect(complaint { _ = try fields.string("empty") } == "empty has no value", "a value that must be there")
 } catch {
-    expect(error.length == 0xffff_ffff, "the refusal names the length")
+    expect(false, "a well-formed document is read: \(error)")
 }
 
 // MARK: - Deliveries
@@ -354,8 +471,19 @@ do {
 do {
     let delivery = Delivery(request("push", pushBody(after: "b2"), eventHeader: "x-github-EVENT"))
     expect(delivery?.headers["x-github-event"] == "push", "header names are read without regard to case")
+    expect(delivery?.headers.keys.sorted() == ["content-type", "x-github-event"],
+           "the request line is not read as a header")
+    expect(delivery?.headers["content-type"] == "application/json",
+           "a header's value leaves out the carriage return that ends its line")
+    expect(delivery?.body == Data(pushBody(after: "b2").utf8), "the body is everything after the headers")
+    let bare = Delivery(Data("POST / HTTP/1.1\nX-GitHub-Event: push\n\n{}\r\n\r\n".utf8))
+    expect(bare?.headers["x-github-event"] == "push" && bare?.body == Data("{}\r\n\r\n".utf8),
+           "lines may end in a line feed alone, and the headers end at the first empty line")
     expect(Delivery(Data("POST / HTTP/1.1\r\nX-GitHub-Event: push\r\n".utf8)) == nil,
            "a request with no end to its headers is not a delivery")
+    let early = Delivery(Data("\r\n\nPOST / HTTP/1.1\r\nX-GitHub-Event: push\r\n\r\n{}".utf8))
+    expect(early?.headers["x-github-event"] == "push" && early?.body == Data("{}".utf8),
+           "empty lines before the request line are passed over")
 
     let failed = read("check_run", checkRunBody(sha: "c3"))
     if case .runFailed(let suite, let run, _, let time)? = failed?.kind {
@@ -365,9 +493,17 @@ do {
     }
     expect(failed?.repository == "octo/repo" && failed?.sha == "c3" && failed?.branch == "main",
            "a check run names its repository, its commit, and the branch its suite was started for")
+    // The decoys come after the values they imitate, so that taking one
+    // would replace the value.
+    let crowded = read("check_run", String(checkRunBody(sha: "c3").dropLast()) + #"""
+        , "sender": {"login": "octo", "head_sha": "x9", "repository": {"full_name": "other/repo"}},
+        "pull_requests": [{"head": {"sha": "x8", "ref": "topic"}}, [], {}], "note": "}{\"]["}
+        """#)
+    expect(crowded?.repository == "octo/repo" && crowded?.sha == "c3",
+           "keys of the same names elsewhere in a delivery are passed over")
     expect(read("check_run", checkRunBody(before: "b2"))?.before == "b2",
            "a check run names the commit the branch was on before the push that started its suite")
-    expect(read("check_run", checkRunBody(app: "cubic")) == nil && read("check_suite", checkSuiteBody(app: "cubic")) == nil,
+    expect(ignored("check_run", checkRunBody(app: "cubic")) && ignored("check_suite", checkSuiteBody(app: "cubic")),
            "check runs and suites of apps other than GitHub Actions are passed over")
     if case .runStarted(_, _, _, let time)? = read("check_run", checkRunBody(status: "in_progress",
                                                                              conclusion: nil))?.kind {
@@ -375,7 +511,7 @@ do {
     } else {
         expect(false, "a check run in progress is read as started")
     }
-    expect(read("check_run", checkRunBody(conclusion: "success")) == nil,
+    expect(ignored("check_run", checkRunBody(conclusion: "success")),
            "a check run that passed says nothing until its suite finishes")
     let fork = read("check_run", checkRunBody(branch: nil))
     expect(fork != nil && fork?.branch == nil, "a check run started in a fork names no branch")
@@ -385,7 +521,7 @@ do {
     } else {
         expect(false, "a finished check suite is read")
     }
-    expect(read("check_suite", checkSuiteBody(status: "in_progress")) == nil,
+    expect(ignored("check_suite", checkSuiteBody(status: "in_progress")),
            "a suite that has not finished is not read")
     for (name, body) in [("check_run", checkRunBody(suite: 4, conclusion: "cancelled")),
                          ("check_suite", checkSuiteBody(suite: 4, conclusion: "cancelled"))] {
@@ -424,9 +560,16 @@ do {
     } else {
         expect(false, "a push with an odd time is still read")
     }
+    let endless = read("push", pushBody(after: "b2").replacingOccurrences(
+        of: #""full_name": "octo/repo""#, with: #""full_name": "octo/repo", "pushed_at": 1e400"#))
+    if case .push(_, _, let time)? = endless?.kind {
+        expect(time == nil, "a push time too large for any date is left out")
+    } else {
+        expect(false, "a push with a time too large for any date is still read")
+    }
     expect(push?.sha == "b2" && push?.branch == "main" && push?.before == "a1",
            "a push names the branch, where it was, and where it now is")
-    expect(read("push", pushBody(ref: "refs/tags/v1", after: "b2")) == nil, "a push of a tag is not read")
+    expect(ignored("push", pushBody(ref: "refs/tags/v1", after: "b2")), "a push of a tag is not read")
 
     do {
         expect(try WebhookEvent(Delivery(request("pull_request", "not json"))!) == nil,
@@ -1125,8 +1268,11 @@ final class FakeRelay {
     var address: RelayAddress { RelayAddress(host: "127.0.0.1", port: listener.port!.rawValue) }
 
     func send(_ requests: Data...) {
-        let frames = requests.reduce(Data()) { $0 + frame($1) }
-        clients.last!.send(content: frames, completion: .contentProcessed { _ in })
+        sendBytes(requests.reduce(Data()) { $0 + frame($1) })
+    }
+
+    func sendBytes(_ bytes: Data) {
+        clients.last!.send(content: bytes, completion: .contentProcessed { _ in })
     }
 
     func dropClient() {
@@ -1141,6 +1287,66 @@ final class FakeRelay {
         }
         waitUntil { stopped }
     }
+}
+
+// MARK: - Frames
+
+/// A connection to the relay, and what it has reported.
+final class RelayListener {
+    let connection: RelayConnection
+    var ready = false
+    var deliveries: [Delivery] = []
+    var unreadable: [String] = []
+    var ended: String?
+
+    init(_ relay: FakeRelay) {
+        connection = RelayConnection(relay.address)
+        connection.onReady = { [unowned self] in ready = true }
+        connection.onDelivery = { [unowned self] in deliveries.append($0) }
+        connection.onUnreadable = { [unowned self] in unreadable.append($0) }
+        connection.onEnded = { [unowned self] in ended = $0 }
+        connection.start()
+        waitUntil { self.ready && relay.clients.count == 1 }
+    }
+}
+
+do {
+    let relay = FakeRelay()
+    let listener = RelayListener(relay)
+    let status = frame(request("status", statusBody()))
+    relay.sendBytes(frame(request("push", pushBody(after: "b2"))) + frame(Data()) + status.prefix(2))
+    waitUntil { listener.deliveries.count == 1 && listener.unreadable.count == 1 }
+    expect(listener.deliveries[0].body == Data(pushBody(after: "b2").utf8),
+           "a frame is read as one delivery, with the request's body")
+    expect(listener.unreadable == ["A frame from the relay was not an HTTP request"],
+           "an empty frame is not a request")
+    relay.sendBytes(status.dropFirst(2).prefix(5))
+    relay.sendBytes(status.dropFirst(7))
+    waitUntil { listener.deliveries.count == 2 }
+    expect(listener.deliveries[1].headers["x-github-event"] == "status" && listener.ended == nil,
+           "a frame that arrives in pieces is read once all of it has arrived")
+    let head = Data("POST / HTTP/1.1\r\nX-GitHub-Event: push\r\n\r\n".utf8)
+    relay.sendBytes(frame(head + Data(count: maximumRequestLength - head.count)))
+    waitUntil { listener.deliveries.count == 3 }
+    expect(listener.deliveries[2].body.count == maximumRequestLength - head.count && listener.ended == nil,
+           "a frame as long as the longest delivery is read")
+    let tooLong = maximumRequestLength + 1
+    relay.sendBytes(Data([UInt8(tooLong >> 24), UInt8(tooLong >> 16 & 0xff), UInt8(tooLong >> 8 & 0xff),
+                          UInt8(tooLong & 0xff)]))
+    waitUntil { listener.ended != nil }
+    expect(listener.ended == "the relay sent a frame of \(tooLong) bytes",
+           "a frame longer than the longest delivery ends the connection")
+    relay.stop()
+}
+
+do {
+    let relay = FakeRelay()
+    let listener = RelayListener(relay)
+    relay.sendBytes(frame(request("push", pushBody(after: "b2"))).dropLast())
+    relay.dropClient()
+    waitUntil { listener.ended != nil }
+    expect(listener.deliveries.isEmpty, "a frame that the end of the connection cuts short is not a delivery")
+    relay.stop()
 }
 
 func shownStatus(_ monitor: BranchMonitor) -> BranchStatus? {
@@ -1343,6 +1549,27 @@ do {
 }
 
 do {
+    // The relay is tried again as soon as the network can be used.
+    let relay = FakeRelay()
+    let github = FakeGitHub()
+    let monitor = BranchMonitor(makeFetch: github.fetch)
+    monitor.configure(repository: repository, branch: "main", refreshSeconds: 3600, relay: relay.address)
+    waitUntil { monitor.relayState == .connected && relay.clients.count == 1 }
+    github.answer(snapshot())
+    monitor.networkAvailable()
+    expect(monitor.relayState == .connected, "a usable network leaves a connected relay alone")
+    relay.dropClient()
+    waitUntil { isUnavailable(monitor.relayState) }
+    let asked = github.asked
+    monitor.networkAvailable()
+    expect(monitor.relayState == .connecting, "a usable network tries the relay at once")
+    waitUntil { monitor.relayState == .connected && relay.clients.count == 2 }
+    expect(github.asked == asked && monitor.nextPoll != nil,
+           "connecting again asks GitHub, no sooner than the polling interval allows")
+    relay.stop()
+}
+
+do {
     // Nothing listens on the port a stopped relay listened on.
     let gone = FakeRelay()
     let address = gone.address
@@ -1362,6 +1589,8 @@ do {
     monitor.configure(repository: repository, branch: "main", refreshSeconds: 3600, relay: nil)
     github.answer(snapshot())
     expect(monitor.relayState == .off && monitor.nextPoll != nil, "with no relay chosen, GitHub is polled")
+    monitor.networkAvailable()
+    expect(monitor.relayState == .off, "with no relay chosen, a usable network connects to nothing")
     monitor.askNow()
     github.answer(snapshot([1: .failing]))
     monitor.askNow()

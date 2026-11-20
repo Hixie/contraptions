@@ -324,16 +324,19 @@ When the connection ends, the indicator asks GitHub as soon as the interval
 allows, since anything that changed while the connection was dying was never
 delivered. Until the relay is back, the indicator asks GitHub at the
 interval, as it does without a relay, and tries the relay again each time it
-asks; the menu says when it will next ask. A request to GitHub that fails is
-tried again at that interval too, and deliveries go on being followed in the
-meantime. TCP keepalive notices a connection that died without closing
-within about a minute and a half of quiet. Waking the computer starts a new
-connection straight away, since the old one may have died while the computer
-slept, and asks GitHub. **Refresh Now** asks GitHub, and tries the relay if
-it is not connected.
+asks; the menu says when it will next ask. It also tries the relay again
+whenever macOS reports that the network can be used, as it does when the
+computer joins a network or a lost one comes back. A request to GitHub that
+fails is tried again at that interval too, and deliveries go on being
+followed in the meantime. TCP keepalive notices a connection that died
+without closing within about a minute and a half of quiet. Waking the
+computer starts a new connection straight away, since the old one may have
+died while the computer slept, and asks GitHub. **Refresh Now** asks GitHub,
+and tries the relay if it is not connected.
 
 A delivery of one of the four events that cannot be read, for example
-because the webhook sends form data rather than JSON, is reported in the
+because the webhook sends form data rather than JSON, or because a value the
+indicator needs from it is missing or of the wrong kind, is reported in the
 menu, in place of the line that says the relay is connected, and so is a
 frame from the relay that is not an HTTP request.
 
@@ -353,7 +356,8 @@ project. The menu bar indicator is `main.swift`. What it knows about a
 commit's checks is in `checks.swift`, the requests to GitHub are in
 `github.swift`, the relay connection and the deliveries it carries are in
 `relay.swift`, and following the branch, and deciding when to ask GitHub,
-are in `monitor.swift`. Settings are in `settings.swift`.
+are in `monitor.swift`. The values a delivery is read for are taken out of
+its JSON by `json.swift`. Settings are in `settings.swift`.
 The plane is `flyby.swift`, and the hand-off to an
 agent is `handoff.swift`. Running other programs is in `tool.swift`.
 

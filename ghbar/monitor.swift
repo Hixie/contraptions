@@ -349,6 +349,12 @@ final class BranchMonitor {
         refreshNow()
     }
 
+    /// Connects to the relay if it is not connected, since a relay that was
+    /// out of reach may be reachable over the network the computer now has.
+    func networkAvailable() {
+        connectIfNeeded()
+    }
+
     private func pollNow() {
         timer?.invalidate()
         timer = nil
