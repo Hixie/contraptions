@@ -8,7 +8,8 @@ bottom, and wraps around.
 
 ## What the colors mean
 
-- **Gray**: no sample recorded in that slot yet (only seen right after launch).
+- **Gray**: no sample recorded in that slot yet (seen right after launch, and
+  right after the displays wake).
 - **Green**: a reply arrived in under 100 ms.
 - **Orange**: a reply arrived, but took between 100 ms and 300 ms.
 - **Red**: the reply took 300 ms or more, or no reply arrived at all.
@@ -37,25 +38,34 @@ with a two second pause between the end of one ping and the start of the
 next. It uses the unprivileged ICMP socket that macOS offers to ordinary
 programs, the same mechanism `/sbin/ping` uses, rather than starting a `ping`
 process for each sample. A two second deadline defines a lost sample: if no
-reply arrives within it, the sample is recorded as lost and renders red. On a
-healthy connection this means a new sample roughly every two seconds, so the
-grid covers about the last twenty seconds; when the network is down each
-sample takes the full deadline, so the grid covers about the last
-half-minute.
+reply arrives within it, the sample is recorded as lost and renders red. A
+ping that cannot be sent at all, for example because no network is usable, is
+recorded as lost at once. On a healthy connection this means a new sample
+roughly every two seconds, so the grid covers about the last twenty seconds;
+when replies stop arriving each sample takes the full deadline, so the grid
+covers about the last half-minute.
 
-The thresholds, sampling cadence, and target host are constants at the top of
-[main.swift](main.swift).
+Nobody can see the grid while the displays sleep, so the app stops pinging
+then, and clears the grid, whose samples would be stale by the time the
+displays wake. It starts pinging again when they wake.
+
+The thresholds, sampling cadence, and target host are constants in
+[configuration.swift](configuration.swift).
 
 ## Building and running
 
 Requires the Xcode command line tools (for `swiftc`). There is no Xcode
-project; the whole app is one Swift file.
+project; `make` compiles the Swift files directly.
 
 ```sh
 make            # builds ./pingbar
+make test       # builds and runs the tests in tests/main.swift
 ./pingbar       # runs the menu bar indicator in the foreground
 ./pingbar --once  # runs a single ping, prints the result, and exits
 ```
+
+The tests ping the loopback interface and one address that nothing answers,
+and they put fully transparent windows on screen that ignore the mouse.
 
 `./pingbar --once` exits with status 0 on a reply and 1 on a loss, so it can
 also serve as a quick scriptable connectivity check.
