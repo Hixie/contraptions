@@ -4,8 +4,10 @@ Runs a long command, such as a test suite, a build or a gate, for an
 agent that has to wait for it. Waiting costs one tool call. If the
 command stops printing for a while, longrun says so, with what each of
 its processes is doing, and leaves it running. If it stays silent,
-longrun says so again less and less often. The command ends
-when whoever started it is gone.
+longrun says so again less and less often. If the computer switches to
+battery power, longrun says so too, or freezes the command until the
+computer is back on wall power. The command ends when whoever started
+it is gone.
 
 It works for any command. It knows nothing about any one test suite,
 apart from recognising the summaries that some test runners print, and
@@ -14,9 +16,9 @@ the lines in which some say that a test has been running for a while.
 ## Running it
 
 ```sh
-longrun run [--quiet MINUTES] [--owner PID] [--keep] -- COMMAND ARG...
-longrun run [--keep] 'COMMAND LINE'
-longrun wait RUN
+longrun run [--quiet MINUTES] [--owner PID] [--keep] [--freeze-on-battery] -- COMMAND ARG...
+longrun run [--keep] [--freeze-on-battery] 'COMMAND LINE'
+longrun wait [--freeze-on-battery] RUN
 longrun stop RUN
 longrun list
 ```
@@ -36,7 +38,8 @@ and prints the part that matters at the end. A command whose output goes
 to `tail` prints nothing until it ends, so it looks stalled.
 
 `run` prints `longrun: started DIR` once the command is running, then
-blocks until the command ends or stalls.
+blocks until the command ends or stalls, or the computer switches to
+battery power.
 
 When the command ends, `run` prints what happened and how long it took,
 the path of the log and its length, and a part of the log with each line
@@ -47,6 +50,7 @@ status, or 128 plus the signal number if a signal ended it. For example:
 longrun: exit 1 after 4m12s: deno task test
 log: /…/scratchpad/longrun/1026-102900-test-z8ubjjle/log (71601 lines)
 longest silence: 2m40s after its output in line 5 (from 1m02s to 3m42s after the start)
+frozen for 1h12m while the computer was on battery
  6|  ERRORS
  …
 27| FAILED | 1 passed | 1 failed (11ms)
@@ -58,6 +62,11 @@ below). It names the line that holds the last output before that
 silence, or says that the silence came before any output, and says when
 the silence started and ended. A command whose longest silence comes
 close to the `--quiet` time is one that should print more progress.
+The `frozen for` line is there when longrun froze the command while the
+computer was on battery (see "Battery power" below). A silence counts
+the time the command was frozen, since the command really did print
+nothing then, so a silence that a freeze explains is not one that calls
+for more progress output.
 
 The part of the log shown is the test runner's own summary when longrun
 recognises it, and otherwise the last 5 lines of a run that succeeded or
@@ -256,6 +265,71 @@ run: … (samples in stall-1/; the log has 152 lines, ending, after its last out
 …
 ```
 
+## Battery power
+
+Some commands run for hours, and the computer can switch to its battery
+while they do. The supervisor hears of each switch as it happens, from
+the notification that macOS posts (`kIOPSNotifyPowerSource`, through
+`notify_register_file_descriptor`). It then asks IOKit how long the
+power source will last, as the `battery-notice` hook does: IOKit says
+the time is unlimited while the computer draws wall power, and gives an
+estimate on battery. It does nothing on a schedule. `state.json` says
+which source the computer last switched to, as `power`.
+
+When the computer switches from wall power to battery while a `run` or
+`wait` call waits for the command, longrun writes a report, and the call
+prints it and exits with status 75, as for a stall, while the command
+keeps running. The report's first line says `ON BATTERY`, which tells
+it apart from a stall and from a command that itself exits with 75:
+
+```
+longrun: ON BATTERY, the computer switched to battery power 1h02m into the run. The command is still running (6 processes, 230% CPU between them).
+run: /…/scratchpad/longrun/0412-093015-pytest-k3v8a2qd (the log has 1204 lines, ending:)
+1200| tests/test_cleanup.py::test_partial_files PASSED
+…
+1204| tests/test_cleanup.py::test_interrupted_run_removes_its_files
+Freezing stops its processes until the computer is on wall power again, so a timeout that counts real time can expire while they are stopped.
+To freeze it and wait:  longrun wait --freeze-on-battery 0412-093015-pytest-k3v8a2qd
+To let it run and wait: longrun wait 0412-093015-pytest-k3v8a2qd
+To end it:              longrun stop 0412-093015-pytest-k3v8a2qd
+```
+
+Each switch to battery is reported once. As after a stall, no stall
+falls due after the report until a call waits again. A call that starts while the
+computer is on battery is not told about it, nor is a run that started
+on battery, since whoever started the call knew already; the hook tells
+an agent at its next prompt or tool call. A switch while nothing waits
+for the run, such as between a stall report and the next `wait`, is not
+reported either, for the same reason.
+
+`--freeze-on-battery`, given to `run` or to `wait`, asks longrun to
+freeze the command whenever the computer runs on battery, for the rest
+of the run. The call goes on waiting for the command. While the
+computer is on battery, the supervisor stops each of the command's
+processes with SIGSTOP, listing them again after each round until a
+round finds no process that another started before it was stopped.
+When the computer is back on wall power, it continues them with
+SIGCONT, the last stopped first. A process that was already stopped
+when the run froze, such as one that a test stopped on purpose, is left
+stopped. If the computer is on battery when the option is given, the
+run freezes at once. While the run is frozen, no stall falls due, and
+the time it was frozen does not count towards the next one: the stall
+report says how long the command was silent while it ran. A call that
+starts waiting while the run is frozen counts from when it started. `longrun
+list` shows a frozen run as `frozen`, and the result says how long the
+run was frozen in all.
+
+A frozen process notices nothing until it continues, but the clocks
+keep counting. Timeouts that count real time, such as `alarm()`,
+pytest-timeout's, or a server's idle timeout, can expire as soon as the
+processes continue, and a peer on the network may have given up on a
+connection. Commands whose tests count time spent on the CPU, or that
+wait only for each other, freeze and continue safely.
+
+Ending a frozen run, in any of the ways listed below, sends SIGTERM and
+then continues the processes, so that each acts on the signal at once,
+rather than when SIGKILL follows.
+
 ## How a run ends
 
 longrun starts a supervisor process, in a session of its own, that runs
@@ -283,17 +357,18 @@ descended from it. It does this when:
 Descendants are found through their parent processes when the run is
 ended, so a daemon, a process that has left the process group and whose
 parent has exited, is not found. If the supervisor itself is killed
-with SIGKILL, nothing ends the command; `longrun list` shows such a run
-with the command's process id.
+with SIGKILL, nothing ends the command, or continues it if it was
+frozen; `longrun list` shows such a run with the command's process id.
 
-A run whose stall was reported and that nothing waits for lives on
-until one of these happens. In a subagent, the hooks below end it when
-the subagent finishes. In the main session, they keep the agent from
-finishing its turn until it has either waited for the run or stopped
-it. A `run` or `wait` call that reports a stall returns only after the
-supervisor has either recorded that the call no longer waits or
-exited, so the hooks never count a call that has returned as one that
-is still waiting for a live run.
+A run whose stall or switch to battery was reported and that nothing
+waits for lives on until one of these happens. In a subagent, the hooks
+below end it when the subagent finishes. In the main session, they keep
+the agent from finishing its turn until it has either waited for the
+run or stopped it. A `run` or `wait` call that reports a stall or a
+switch to battery returns only after the supervisor has either recorded
+that the call no longer waits or exited, so the hooks never count a
+call that has returned as one that is still waiting for a live run.
+
 `longrun list` shows each run and whether it is still running.
 
 When the command exits by itself, processes it left running in its
@@ -350,9 +425,9 @@ that no stalled run is forgotten:
   nothing is waiting for, such as one whose stall the subagent was told
   about.
 - When the main agent is about to finish its turn, it sends the agent
-  back once if a run the main agent started has reported a stall and
-  nothing is waiting for it, naming the runs and the commands that
-  continue or end them.
+  back once if a run the main agent started has reported a stall or a
+  switch to battery and nothing is waiting for it, naming the runs and
+  the commands that continue or end them.
 
 Claude Code clamps the timeout to `BASH_MAX_TIMEOUT_MS`, so that has to
 be large as well. The settings:
@@ -503,6 +578,17 @@ silent for more than 10 minutes, set to about how long it stays silent.
 The intervals then start at that many minutes instead of 10, and double
 in the same way.
 
+If the computer switches to battery power while the command runs, the
+call returns with exit status 75 and a report that starts with
+`ON BATTERY`. The command is still running. If you would rather not
+spend the battery on it, run `longrun wait --freeze-on-battery RUN`,
+which freezes the command's processes until the computer is back on
+wall power, then lets them continue and goes on waiting. Otherwise run
+`longrun wait RUN` to let it run, or `longrun stop RUN` to end it. A
+freeze can make a test whose timeout counts real time fail once it
+continues. To have a long command frozen whenever the computer is on
+battery from the start, give `--freeze-on-battery` to `longrun run`.
+
 When the command's job is to start a process that outlives it, such as
 a development server, a local service or a copy of an app that later
 commands drive, give `--keep`. Without it, longrun ends whatever the
@@ -516,8 +602,8 @@ not redirect their output, and do not wrap a longrun call in `$(...)`.
 longrun keeps the command's whole output in a log in your scratchpad,
 and a command whose output goes to `tail` prints nothing until it ends,
 so it looks stalled. longrun's exit status is the result: the command's
-own status, or 75 for a stall. A pipeline reports `tail`'s status
-instead.
+own status, or 75 for a stall or a switch to battery. A pipeline
+reports `tail`'s status instead.
 
 In a main session, use `run_in_background: true` on a `longrun run` call
 only when you have other work to do while the command runs. If you would
@@ -554,6 +640,11 @@ within that directory. A run directory holds:
 - `result.txt`: what `run` prints when the command ends;
 - `stall-N.txt` and `stall-N/`: the Nth stall report and its `sample`
   output;
+- `battery-N.txt`: the report of the Nth switch to battery that a call
+  was told about;
+- `freeze-on-battery`: an empty file, present once `--freeze-on-battery`
+  has been given, which the supervisor looks for when the computer
+  switches to battery;
 - `py/PID.txt`: Python stacks written by each Python process;
 - `supervisor.log`: the supervisor's own errors;
 - `lock`: locked by the supervisor while it runs, which is how `list`
@@ -614,8 +705,10 @@ longrun's values are correct to within a microsecond.
 It is the clock that longrun measures silence with. It counts from when
 the machine started, and it stops while the machine sleeps, so the
 difference between two records' monotonic times is how long the command
-ran in between. The difference between their wall-clock times also
-counts any time the machine slept, and any change to the system clock.
+ran in between, or was frozen (see "Battery power" above; `state.json`
+says how long in all, in seconds, as `frozen`). The difference between
+their wall-clock times also counts any time the machine slept, and any
+change to the system clock.
 Monotonic times can be compared only with others from the same machine
 since it last started.
 
@@ -713,9 +806,13 @@ longrun writes it when it creates the directory.
 
 ## Requirements and tests
 
-longrun needs macOS, for kqueue, `sample` and SIGINFO, and Python 3.9 or
-later with nothing beyond the standard library. The tests run real
-commands and take two to three minutes on a busy machine:
+longrun needs macOS, for kqueue, `sample`, SIGINFO, notify(3) and IOKit,
+and Python 3.9 or later with nothing beyond the standard library. The
+tests run real commands and take about five minutes on a busy
+machine. They stand in for the power source with `$LONGRUN_POWER`,
+which names a file: the computer counts as on battery while the file
+holds `battery`, and the switches are announced with the notification
+whose name is the file's path:
 
 ```sh
 python3 -m unittest test_longrun

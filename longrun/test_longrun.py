@@ -3,6 +3,7 @@
 FIFO that the test opens when it is ready."""
 
 import contextlib
+import ctypes
 import io
 import os
 import re
@@ -74,6 +75,9 @@ class Runs(unittest.TestCase):
         # As inside another run.
         self.env["LONGRUN_RUN"] = "/an/outer/run"
         self.env["LONGRUN_PYSTACKS"] = "/an/outer/run/py"
+        # A stand-in for the power source, which starts on wall power.
+        self.env["LONGRUN_POWER"] = os.path.join(self.base, "power")
+        self.switch("wall")
         # The hooks run in this process and look here first.
         old = os.environ.pop("LONGRUN_DIR", None)
         if old is not None:
@@ -129,6 +133,21 @@ class Runs(unittest.TestCase):
 
     def state(self, rundir):
         return longrun.load(rundir, "state.json")
+
+    def switch(self, source):
+        """Switches the stand-in power source to "battery" or "wall", and
+        says so as macOS does."""
+        stand_in = self.env["LONGRUN_POWER"]
+        with open(stand_in, "w") as f:
+            f.write(source)
+        ctypes.CDLL("/usr/lib/libSystem.B.dylib").notify_post(
+            stand_in.encode())
+
+    def frozen(self, pid):
+        return longrun.processes()[pid].state.startswith("T")
+
+    def until_frozen(self, rundir, frozen=True):
+        until(rundir, lambda: ("frozen_since" in self.state(rundir)) == frozen)
 
     def test_exit_status_output_and_log(self):
         result = self.longrun("run", "--", "sh", "-c",
@@ -1044,6 +1063,198 @@ class Runs(unittest.TestCase):
             self.assertIn(os.path.basename(rundir), reply["reason"])
         self.longrun("stop", rundir)
 
+    def test_a_switch_to_battery_is_reported_and_the_run_continues(self):
+        ready, gate = self.fifo("ready"), self.fifo("gate")
+        proc, rundir = self.start(f"echo before; echo > {ready}; "
+                                  f"read x < {gate}; echo after")
+        with open(ready) as f:
+            f.read()
+        self.switch("battery")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertTrue(report.startswith("longrun: ON BATTERY, "), report)
+        self.assertIn("1| before", report)
+        self.assertIn("longrun wait --freeze-on-battery "
+                      + os.path.basename(rundir), report)
+        child = self.state(rundir)["child"]
+        self.assertFalse(self.frozen(child))
+        self.assertEqual(self.state(rundir)["battery"], 1)
+        # A notification while the computer stays on battery, and a wait,
+        # do not report it again.
+        waiting = self.client("wait", rundir)
+        self.switch("battery")
+        self.release(gate)
+        output, code = self.finish(waiting)
+        self.assertEqual(code, 0)
+        self.assertIn("2| after", output)
+        self.assertNotIn("ON BATTERY", output)
+        self.assertNotIn("frozen", output)
+        self.assertEqual(self.state(rundir)["battery"], 1)
+
+    def test_after_a_battery_report_only_a_waiting_call_counts(self):
+        quiet = 0.02 * 60
+        gate = self.fifo("gate")
+        proc, rundir = self.start("--quiet", "0.02",
+                                  f"read x < {gate}; echo after")
+        self.switch("battery")
+        self.assertEqual(self.finish(proc)[1], longrun.STALLED)
+        # No stall falls due while nothing waits, as after a stall. One
+        # that did would be written within a second or two of falling due.
+        time.sleep(4 * quiet)
+        self.assertEqual(self.state(rundir)["stalls"], 0)
+        # Nor is a switch to battery reported while nothing waits.
+        for source in ("wall", "battery"):
+            self.switch(source)
+            until(rundir, lambda: self.state(rundir)["power"] == source)
+        waiting = self.client("wait", rundir)
+        self.release(gate)
+        output, code = self.finish(waiting)
+        self.assertEqual(code, 0)
+        self.assertIn("1| after", output)
+        self.assertEqual(self.state(rundir)["battery"], 1)
+
+    def test_a_wait_during_a_freeze_counts_from_when_it_started(self):
+        quiet = 0.02 * 60
+        proc, rundir = self.start("--quiet", "0.02", "--freeze-on-battery",
+                                  "sleep 300")
+        self.assertEqual(self.finish(proc)[1], longrun.STALLED)
+        self.switch("battery")
+        self.until_frozen(rundir)
+        # Frozen for long before the wait starts. The wait's countdown,
+        # twice the quiet time after a stall, starts when it does, and
+        # only the freeze after that puts its report off.
+        time.sleep(6 * quiet)
+        waiting = self.client("wait", rundir)
+        until(rundir, lambda: self.state(rundir).get("waiting") == 1)
+        thawed = time.monotonic()
+        self.switch("wall")
+        report, code = self.finish(waiting)
+        self.assertEqual(code, longrun.STALLED)
+        elapsed = time.monotonic() - thawed
+        self.assertGreaterEqual(elapsed, 2 * quiet)
+        self.assertLess(elapsed, 5 * quiet)
+        self.longrun("stop", rundir)
+
+    def test_a_run_started_on_battery_is_not_reported(self):
+        gate = self.fifo("gate")
+        self.switch("battery")
+        proc, rundir = self.start(f"read x < {gate}; echo after")
+        self.switch("battery")
+        self.release(gate)
+        output, code = self.finish(proc)
+        self.assertEqual(code, 0)
+        self.assertNotIn("ON BATTERY", output)
+
+    def test_a_run_can_be_frozen_on_battery(self):
+        gate = self.fifo("gate")
+        proc, rundir = self.start(
+            "--freeze-on-battery", f"sh -c 'read x < {gate}; echo after'; "
+            f"echo done")
+        child = self.state(rundir)["child"]
+        pids = longrun.members(longrun.processes(), child, child)
+        self.assertGreaterEqual(len(pids), 2)
+        self.assertFalse([p for p in pids if self.frozen(p)])
+        self.switch("battery")
+        self.until_frozen(rundir)
+        self.assertEqual([p for p in pids if not self.frozen(p)], [])
+        self.assertIn("running, 0 stalls, frozen", self.longrun("list").stdout)
+        self.switch("wall")
+        self.until_frozen(rundir, False)
+        self.assertEqual([p for p in pids if self.frozen(p)], [])
+        self.release(gate)
+        output, code = self.finish(proc)
+        self.assertEqual(code, 0)
+        self.assertIn("1| after", output)
+        self.assertRegex(output, r"\nfrozen for \ds while the computer was "
+                                 r"on battery\n")
+        self.assertNotIn("ON BATTERY", output)
+
+    def test_wait_can_freeze_a_run_after_the_switch(self):
+        gate = self.fifo("gate")
+        proc, rundir = self.start(f"read x < {gate}; echo after")
+        self.switch("battery")
+        self.assertEqual(self.finish(proc)[1], longrun.STALLED)
+        child = self.state(rundir)["child"]
+        self.assertFalse(self.frozen(child))
+        waiting = self.client("wait", "--freeze-on-battery",
+                              os.path.basename(rundir))
+        self.until_frozen(rundir)
+        self.assertTrue(self.frozen(child))
+        self.switch("wall")
+        self.until_frozen(rundir, False)
+        self.release(gate)
+        output, code = self.finish(waiting)
+        self.assertEqual(code, 0)
+        self.assertIn("frozen for ", output)
+
+    def test_time_frozen_is_not_silence(self):
+        quiet = 0.02 * 60
+        ready = self.fifo("ready")
+        # The command's output is a line it has not finished, which is
+        # judged only when it ends or a stall falls due.
+        proc, rundir = self.start("--quiet", "0.02", "--freeze-on-battery",
+                                  f"printf 'tests ...'; echo > {ready}; "
+                                  f"sleep 300")
+        with open(ready) as f:
+            f.read()
+        self.switch("battery")
+        self.until_frozen(rundir)
+        # Frozen for longer than a stall takes to fall due.
+        time.sleep(3 * quiet)
+        thawed = time.monotonic()
+        self.switch("wall")
+        report, code = self.finish(proc)
+        self.assertEqual(code, longrun.STALLED)
+        self.assertGreaterEqual(time.monotonic() - thawed, quiet)
+        self.assertIn("STALLED, no output for 1s.", report)
+        self.longrun("stop", rundir)
+
+    def test_a_frozen_run_ends_without_waiting_to_be_killed(self):
+        self.switch("battery")
+        proc, rundir = self.start("--freeze-on-battery", "sleep 300")
+        self.until_frozen(rundir)
+        result = self.longrun("stop", rundir)
+        self.assertIn("killed by SIGTERM, stopped by longrun stop",
+                      result.stdout)
+        self.finish(proc)
+
+    def test_a_process_stopped_before_the_freeze_stays_stopped(self):
+        pid = os.path.join(self.base, "pid")
+        proc, rundir = self.start(
+            "--freeze-on-battery", f"sleep 300 & kill -STOP $!; "
+            f"echo $! > {pid}.new; mv {pid}.new {pid}; sleep 300")
+        created(pid)
+        with open(pid) as f:
+            stopped = int(f.read())
+        self.addCleanup(longrun.signal_all, [stopped], None, signal.SIGKILL)
+        child = self.state(rundir)["child"]
+        self.switch("battery")
+        self.until_frozen(rundir)
+        self.assertTrue(self.frozen(child))
+        self.switch("wall")
+        self.until_frozen(rundir, False)
+        self.assertFalse(self.frozen(child))
+        self.assertTrue(self.frozen(stopped))
+        os.kill(stopped, signal.SIGKILL)
+        self.longrun("stop", rundir)
+        self.finish(proc)
+
+    def test_stop_hook_sends_the_agent_back_to_a_run_on_battery(self):
+        scratchpad = tempfile.mkdtemp(dir=self.base)
+        self.env["LONGRUN_DIR"] = os.path.join(scratchpad, "longrun")
+        proc, rundir = self.start("sleep 300")
+        self.switch("battery")
+        self.assertEqual(self.finish(proc)[1], longrun.STALLED)
+        stop = {"hook_event_name": "Stop", "scratchpad_dir": scratchpad,
+                "session_id": "test-session"}
+        reply = longrun.hook(stop)
+        self.assertEqual(reply["decision"], "block")
+        self.assertIn(os.path.basename(rundir), reply["reason"])
+        self.assertIn("switched to battery power", reply["reason"])
+        self.assertEqual(self.state(rundir)["stalls"], 0)
+        self.longrun("stop", rundir)
+        self.assertIsNone(longrun.hook(stop))
+
     def test_run_directory_of_another_user_is_refused(self):
         self.env["LONGRUN_DIR"] = "/usr"
         result = self.longrun("list")
@@ -1094,6 +1305,7 @@ class Hooks(unittest.TestCase):
             self.assertIsNone(self.pre(command), command)
         for command in ["~/dev/contraptions/longrun/longrun.py wait r1",
                         "cd x && longrun stop r1", "(longrun run make)",
+                        "longrun wait --freeze-on-battery r1",
                         "X=1 longrun run make", "env A=b longrun run make",
                         "nohup longrun run make"]:
             self.assertIsNotNone(self.pre(command), command)
@@ -1195,6 +1407,41 @@ class Reports(unittest.TestCase):
         supervisor.reported()
         self.assertEqual((told, supervisor.written), (["stall 3"], 3))
 
+    def test_a_report_is_told_once_to_each_waiting_call(self):
+        rundir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, rundir)
+        longrun.save(rundir, "spec.json", {"quiet": 60})
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        supervisor = longrun.Supervisor(rundir, listener)
+        pairs = {}
+        for name, told in (("leaving", True), ("waiting", False)):
+            pairs[name] = socket.socketpair()
+            for end in pairs[name]:
+                self.addCleanup(end.close)
+            pairs[name][1].setblocking(False)
+            supervisor.clients[pairs[name][0].fileno()] = [pairs[name][0],
+                                                           told]
+
+        def heard(name):
+            try:
+                return pairs[name][1].recv(64)
+            except BlockingIOError:
+                return b""
+        os.write(supervisor.reports[1], b"1\n")
+        supervisor.reported()
+        self.assertEqual((heard("waiting"), heard("leaving"), supervisor.told),
+                         (b"stall 1\n", b"", 1))
+        # Every call has been told something now, so the next report is
+        # kept for the next call that waits.
+        os.write(supervisor.reports[1], b"2\n")
+        supervisor.reported()
+        self.assertEqual((heard("waiting"), heard("leaving"), supervisor.told),
+                         (b"", b"", 1))
+        supervisor.tell("done", everyone=True)
+        self.assertEqual((heard("waiting"), heard("leaving")),
+                         (b"done\n", b"done\n"))
+
     def test_a_timing_file_that_cannot_be_written_is_removed(self):
         rundir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, rundir)
@@ -1225,6 +1472,19 @@ class Reports(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(longrun.attach(rundir, conn), longrun.STALLED)
         self.assertEqual(output.getvalue(), "the report\n")
+
+
+class Power(unittest.TestCase):
+    def test_the_power_source_comes_from_macos(self):
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop("LONGRUN_POWER", None)
+            fd = longrun.power_events()
+            self.addCleanup(os.close, fd)
+            battery = longrun.on_battery()
+        source = subprocess.run(["pmset", "-g", "batt"], capture_output=True,
+                                text=True, check=True).stdout
+        self.assertEqual(battery, "'Battery Power'" in source, source)
+        self.assertNotEqual(battery, "'AC Power'" in source, source)
 
 
 class Timing(unittest.TestCase):

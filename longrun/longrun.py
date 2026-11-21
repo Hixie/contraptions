@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import contextlib
+import ctypes
 import fcntl
 import glob
 import json
@@ -55,6 +56,7 @@ HANG = (r"(^|(?<=\.\.\.))'.*' has been running for over \((\d+m)?\d+s\)$"
         r'|  File ".*", line (\d+|\?\?\?) in '
         r"|^  <no Python frame>$|^(  )?\.\.\.$")
 LINE = 4096  # Bytes at the start of a line that are searched for a warning.
+FREEZE = "freeze-on-battery"  # Present in a run that is frozen on battery.
 
 
 # Files and directories ------------------------------------------------------
@@ -283,20 +285,21 @@ class Process(NamedTuple):
     ppid: int
     pgid: int
     cpu: float  # Percent of one core, as ps reports it.
+    state: str  # As ps reports it; it starts with T while stopped.
     command: str
 
 
 def processes() -> dict[int, Process]:
     """Every process, by pid."""
     out = subprocess.run(
-        ["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,args="],
+        ["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,stat=,args="],
         capture_output=True, text=True, errors="replace", check=True,
         env={**{k: v for k, v in os.environ.items() if k != "LC_ALL"},
              "LC_CTYPE": "UTF-8", "LC_NUMERIC": "C"}).stdout
     table = {}
     for line in filter(None, out.split("\n")):
-        pid, ppid, pgid, cpu, command = (line + " ").split(None, 4)
-        table[int(pid)] = Process(int(ppid), int(pgid), float(cpu),
+        pid, ppid, pgid, cpu, state, command = (line + " ").split(None, 5)
+        table[int(pid)] = Process(int(ppid), int(pgid), float(cpu), state,
                                   command.strip())
     return table
 
@@ -349,6 +352,76 @@ def default_signals() -> None:
     the standard handling of SIGNALS whatever its parent did with them."""
     for sig in SIGNALS:
         signal.signal(sig, signal.SIG_DFL)
+
+
+# Power -------------------------------------------------------------------------
+
+# What macOS posts when the computer switches between wall power and its
+# battery, and what IOKit says of the time left on wall power.
+POWER_NOTIFICATION = "com.apple.system.powersources.source"
+TIME_REMAINING_UNLIMITED = -2.0
+
+
+def power_events() -> int:
+    """A file descriptor that becomes readable, holding four bytes for
+    each notification, when the computer may have switched between wall
+    power and battery. With $LONGRUN_POWER set, the notification is the
+    one named by its value instead."""
+    name = os.environ.get("LONGRUN_POWER") or POWER_NOTIFICATION
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    fd, token = ctypes.c_int(-1), ctypes.c_int()
+    error = libc.notify_register_file_descriptor(
+        name.encode(), ctypes.byref(fd), 0, ctypes.byref(token))
+    if error:
+        raise OSError(f"cannot register for {name} notifications: "
+                      f"notify status {error}")
+    return fd.value
+
+
+def on_battery() -> bool:
+    """Whether the computer runs on battery power. With $LONGRUN_POWER
+    set, which the tests do, it does while the file that it names holds
+    `battery`."""
+    stand_in = os.environ.get("LONGRUN_POWER")
+    if stand_in:
+        with contextlib.suppress(FileNotFoundError):
+            return read(stand_in).strip() == "battery"
+        return False
+    iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    iokit.IOPSGetTimeRemainingEstimate.restype = ctypes.c_double
+    return iokit.IOPSGetTimeRemainingEstimate() != TIME_REMAINING_UNLIMITED
+
+
+def still_running(table: dict[int, Process], pids: list[int]) -> str:
+    number = count(len(pids), "process", "processes")
+    return (f"The command is still running ({number}, "
+            f"{sum(table[p].cpu for p in pids):.0f}% CPU between them).")
+
+
+def battery_report(rundir: str, child: int, elapsed: float,
+                   extent: tuple[int, int]) -> str:
+    """Says that the computer has switched to battery power, elapsed
+    seconds into the run, how much the command is doing and has printed,
+    and how to continue the run."""
+    table = processes()
+    pids = members(table, child, child)
+    first, log, total = log_tail(rundir, extent, 1 << 16)
+    run = os.path.basename(rundir)
+    lines = [f"longrun: ON BATTERY, the computer switched to battery power "
+             f"{duration(elapsed)} into the run. "
+             + still_running(table, pids),
+             f"run: {rundir} (the log has {count(total, 'line')}"
+             f"{', ending:' * bool(log)})"]
+    if log:
+        lines.append(section(log, list(range(max(0, len(log) - 5),
+                                             len(log))), first))
+    lines += ["Freezing stops its processes until the computer is on wall "
+              "power again, so a timeout that counts real time can expire "
+              "while they are stopped.",
+              f"To freeze it and wait:  longrun wait --freeze-on-battery {run}",
+              f"To let it run and wait: longrun wait {run}",
+              f"To end it:              longrun stop {run}"]
+    return "\n".join(lines) + "\n"
 
 
 # Summaries ---------------------------------------------------------------------
@@ -474,6 +547,9 @@ def summary(rundir: str, spec: dict, state: dict,
         if length(longest) >= MINUTE:
             parts.append("longest silence: "
                          + describe_silence(longest, found[0].at))
+    if state.get("frozen"):
+        parts.append(f"frozen for {duration(state['frozen'])} while the "
+                     f"computer was on battery")
     left = state.get("leftovers", [])
     if left:
         number = count(len(left), "process", "processes")
@@ -650,13 +726,11 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
             detail = top_of_stack(read(sampled))
         alike.setdefault((table[pid].command[:160], tuple(detail)),
                          []).append(pid)
-    cpu = sum(table[p].cpu for p in pids)
     first, log, total = log_tail(rundir, extent, 1 << 16)
     since = f" after its output in line {heard}" * (heard > 0)
     lines = [f"longrun: STALLED, no output for {duration(quiet)}"
-             f"{f' other than hang warnings{since}' * warned}. The command "
-             f"is still running ({count(len(pids), 'process', 'processes')}, "
-             f"{cpu:.0f}% CPU between them)."]
+             f"{f' other than hang warnings{since}' * warned}. "
+             + still_running(table, pids)]
     found = records(rundir, recorded)
     lines.append(analysis(found, total) if found else
                  "longrun could not record when the output arrived.")
@@ -695,10 +769,12 @@ def diagnose(rundir: str, number: int, child: int, quiet: float,
 
 class Supervisor:
     """Runs the command, watches the log it writes, and tells the
-    connected clients when it stalls and when it ends. It outlives the
-    client that started it, so that a run can continue after a stall
-    report, and it ends the command when the owner exits, when a waiting
-    client goes away without being told anything, or when told to."""
+    connected clients when it stalls, when the computer switches to
+    battery power, and when it ends. It outlives the client that started
+    it, so that a run can continue after a report, and it ends the
+    command when the owner exits, when a waiting client goes away without
+    being told anything, or when told to. On battery, it freezes the
+    command if the run asks for that."""
 
     def __init__(self, rundir: str, listener: socket.socket):
         self.rundir, self.listener = rundir, listener
@@ -716,6 +792,12 @@ class Supervisor:
         # a call next waits.
         self.interval = self.spec["quiet"]
         self.due: float | None = None
+        # The processes that the run froze, in the order it stopped them,
+        # or None while it is not frozen, when it froze them, and how
+        # long it has been frozen since the command's latest output.
+        self.frozen: list[int] | None = None
+        self.frozen_at = 0.0
+        self.frozen_quiet = 0.0
         self.ending: set[int] = set()  # Processes sent SIGTERM.
         self.kill_at: float | None = None  # When to send them SIGKILL.
         self.killed = False
@@ -773,6 +855,9 @@ class Supervisor:
         self.heard(time.monotonic(), 0, (0, 0), False)
         self.longest = Silence(self.last, self.last, 0)
         self.write_record()
+        self.power = power_events()
+        self.battery = on_battery()
+        self.state["power"] = "battery" if self.battery else "wall"
         try:
             self.child = subprocess.Popen(
                 self.spec["argv"], cwd=self.spec["cwd"], env=env,
@@ -789,6 +874,9 @@ class Supervisor:
         self.save()
         self.watch(self.listener.fileno(), select.KQ_FILTER_READ)
         self.watch(self.reports[0], select.KQ_FILTER_READ)
+        self.watch(self.power, select.KQ_FILTER_READ)
+        if self.battery:
+            self.freeze()
         try:
             self.watch(self.child.pid, select.KQ_FILTER_PROC,
                        fflags=select.KQ_NOTE_EXIT)
@@ -814,7 +902,7 @@ class Supervisor:
                 self.listen()
                 self.judge_line(False)
                 if now >= self.stall_at():
-                    self.stall(now - self.last)
+                    self.stall(now - self.last - self.frozen_quiet)
             self.record()
         self.finish(self.child.returncode)
         self.log.close()
@@ -823,7 +911,8 @@ class Supervisor:
         """When to report a stall, or to judge the line the command is
         writing, if it would be due by then were it real output."""
         if (self.due is None or "reason" in self.state
-                or self.child.returncode is not None):
+                or self.child.returncode is not None
+                or self.frozen is not None):
             return None
         if self.line and self.line[-1][0] > self.judged:
             return min(self.due, self.line[-1][0] + self.spec["quiet"])
@@ -848,6 +937,7 @@ class Supervisor:
                         self.longest, Silence(self.last, moment,
                                               self.last_line), key=length)
                 self.last, self.last_line = moment, line
+                self.frozen_quiet = 0.0
                 self.interval = self.spec["quiet"]
                 self.due = self.last + self.interval
         if line == self.last_line:
@@ -861,6 +951,8 @@ class Supervisor:
                 self.accept()
             elif event.ident == self.reports[0]:
                 self.reported()
+            elif event.ident == self.power:
+                self.power_changed()
             elif event.ident in self.clients:
                 self.hear(event.ident)
         elif event.filter == select.KQ_FILTER_SIGNAL:
@@ -877,6 +969,7 @@ class Supervisor:
         unless the command finished by itself and the run keeps what it
         leaves."""
         self.child.wait()
+        self.thaw()
         self.ending.discard(self.child.pid)
         self.listen()
         self.judge_line(True)
@@ -1021,7 +1114,7 @@ class Supervisor:
         if not self.send(conn.fileno(), f"running {self.child.pid}"):
             return
         if self.written > self.told:
-            self.tell(f"stall {self.written}")
+            self.tell_stall()
         elif self.due is None and self.state["stalls"] == self.told:
             self.due = time.monotonic() + self.interval
 
@@ -1031,9 +1124,13 @@ class Supervisor:
         except OSError:
             data = b""
         if data.startswith(b"stop"):
+            # It waits for the end, and is told nothing else.
+            self.clients[fd][1] = True
             self.end("stopped by longrun stop")
         elif data.startswith(b"abandon") and len(self.clients) == 1:
             self.end("the subagent that started it finished")
+        elif data.startswith(b"freeze") and self.battery:
+            self.freeze()
         elif not data:
             self.drop(fd)
 
@@ -1056,11 +1153,17 @@ class Supervisor:
         if not told and not self.clients:
             self.end("the call waiting for it was interrupted")
 
-    def tell(self, message: str) -> None:
-        for fd in list(self.clients):
-            if self.send(fd, message):
-                self.clients[fd][1] = True
-        if self.clients:
+    def tell(self, message: str, everyone: bool = False) -> bool:
+        """Sends message to the clients that have not been told anything,
+        or to every client if everyone, and returns whether any got it."""
+        told = False
+        for fd, client in list(self.clients.items()):
+            if (everyone or not client[1]) and self.send(fd, message):
+                client[1] = told = True
+        return told
+
+    def tell_stall(self) -> None:
+        if self.tell(f"stall {self.written}"):
             self.told = self.written
 
     def stall(self, quiet: float) -> None:
@@ -1099,7 +1202,84 @@ class Supervisor:
             return
         self.written = latest
         self.save()
-        self.tell(f"stall {self.written}")
+        self.tell_stall()
+
+    def power_changed(self) -> None:
+        """Freezes the run, or tells the clients, when the computer
+        switches to battery power, and thaws the run when it switches
+        back."""
+        os.read(self.power, 4096)
+        was, self.battery = self.battery, on_battery()
+        self.state["power"] = "battery" if self.battery else "wall"
+        if not self.battery:
+            self.thaw()
+        elif not was and not self.freeze():
+            self.report_battery()
+        self.save()
+
+    def report_battery(self) -> None:
+        """Tells the clients that are waiting for a running command that
+        the computer has switched to battery power."""
+        if (self.child.returncode is None and "reason" not in self.state
+                and not all(told for _, told in self.clients.values())):
+            number = self.state["battery"] = self.state.get("battery", 0) + 1
+            with open(os.path.join(self.rundir, f"battery-{number}.txt"),
+                      "w") as f:
+                f.write(battery_report(
+                    self.rundir, self.child.pid,
+                    time.time() - self.state["started"], self.listen()))
+            self.save()
+            if self.tell(f"battery {number}"):
+                # As after a stall, no stall falls due until a call waits.
+                self.due = None
+
+    def freeze(self) -> bool:
+        """Stops the command's processes with SIGSTOP, other than those
+        that are stopped already, if the run asks to be frozen on battery,
+        and returns whether it asks. Processes are listed again after
+        each round, until a round finds none that a process started
+        before it was stopped."""
+        if not os.path.exists(os.path.join(self.rundir, FREEZE)):
+            return False
+        if (self.frozen is None and self.child.returncode is None
+                and "reason" not in self.state):
+            # What the command printed before the freeze counts from when
+            # it arrived, even in a line that it has not finished.
+            self.listen()
+            self.judge_line(False)
+            self.frozen, self.frozen_at = [], time.monotonic()
+            self.state["frozen_since"] = time.time()
+            while True:
+                table = processes()
+                found = [p for p in members(table, self.child.pid,
+                                            self.child.pid)
+                         if p not in self.frozen
+                         and not table[p].state.startswith("T")]
+                if not found:
+                    break
+                signal_all(found, None, signal.SIGSTOP)
+                self.frozen.extend(found)
+            self.save()
+        return True
+
+    def thaw(self) -> None:
+        """Continues the processes that freeze() stopped, the last first,
+        and moves the next stall report later by as much of the freeze as
+        fell within its countdown, so that the freeze does not count as
+        silence."""
+        if self.frozen is None:
+            return
+        signal_all(reversed(self.frozen), None, signal.SIGCONT)
+        now = time.monotonic()
+        self.frozen_quiet += now - max(self.frozen_at, self.last)
+        if self.due is not None:
+            # The countdown to it started an interval before it.
+            self.due += now - max(self.frozen_at, self.due - self.interval)
+        self.frozen = None
+        self.state["frozen"] = (self.state.get("frozen", 0.0)
+                                + now - self.frozen_at)
+        del self.state["frozen_since"]
+        self.save()
 
     def end(self, reason: str) -> None:
         """Ends the command and everything it started."""
@@ -1107,6 +1287,8 @@ class Supervisor:
             self.state["reason"] = reason
             self.terminate(members(processes(), self.child.pid,
                                    self.child.pid))
+            # A stopped process acts on SIGTERM once it continues.
+            self.thaw()
 
     def terminate(self, pids: list[int]) -> None:
         """Sends SIGTERM to pids now, and SIGKILL GRACE seconds later to
@@ -1155,7 +1337,7 @@ class Supervisor:
         with open(os.path.join(self.rundir, "result.txt"), "w") as f:
             f.write(summary(self.rundir, self.spec, self.state, extent))
         self.save()
-        self.tell("done")
+        self.tell("done", everyone=True)
 
 
 # The client ----------------------------------------------------------------------
@@ -1177,10 +1359,11 @@ def connect(rundir: str) -> socket.socket | None:
 
 def attach(rundir: str, conn: socket.socket | None, request: bytes = b"",
            announce: bool = False) -> int:
-    """Waits for the run to stall or end, prints the report, and returns
-    the exit status to use. After a stall, it returns once the supervisor
-    closes the connection, which the supervisor does after it has
-    stopped counting the call as waiting, or when it exits."""
+    """Waits for the run to stall, to switch to battery power or to end,
+    prints the report, and returns the exit status to use. After a stall
+    or a switch to battery, it returns once the supervisor closes the
+    connection, which the supervisor does after it has stopped counting
+    the call as waiting, or when it exits."""
     if conn is not None:
         if request:
             conn.sendall(request)
@@ -1189,9 +1372,9 @@ def attach(rundir: str, conn: socket.socket | None, request: bytes = b"",
             kind, _, arg = message.strip().partition(" ")
             if kind == "running" and announce:
                 print(f"longrun: started {rundir}", flush=True)
-            elif kind == "stall" and not request:
+            elif kind in ("stall", "battery") and request != b"stop\n":
                 sys.stdout.write(read(os.path.join(rundir,
-                                                   f"stall-{arg}.txt")))
+                                                   f"{kind}-{arg}.txt")))
                 with contextlib.suppress(OSError):  # The supervisor is gone.
                     conn.shutdown(socket.SHUT_WR)
                 messages.read()
@@ -1211,7 +1394,7 @@ def attach(rundir: str, conn: socket.socket | None, request: bytes = b"",
 
 
 def start(argv: list[str], quiet: float, owner: int | None,
-          keep: bool) -> int:
+          keep: bool, freeze: bool) -> int:
     if argv and argv[0] == "--":
         argv = argv[1:]
     if not argv:
@@ -1237,6 +1420,8 @@ def start(argv: list[str], quiet: float, owner: int | None,
                                    "CLAUDE_CODE_SESSION_ID")})
     with open(os.path.join(rundir, "README.md"), "w") as f:
         f.write(RUN_README.format(readme=os.path.join(HERE, "README.md")))
+    if freeze:
+        open(os.path.join(rundir, FREEZE), "w").close()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     here = os.getcwd()
     os.chdir(rundir)
@@ -1284,6 +1469,7 @@ def show(base: str) -> None:
     for rundir, spec, state, live in runs(base):
         status = (describe(state) if state.get("status") == "exited" else
                   f"running, {count(state.get('stalls', 0), 'stall')}"
+                  f"{', frozen' * ('frozen_since' in state)}"
                   if live else f"its supervisor is gone; the command was "
                   f"pid {state.get('child')}")
         print(f"{os.path.basename(rundir)}  {status}  "
@@ -1298,8 +1484,8 @@ def hook(event: dict) -> dict | None:
     Claude Code exempts from the time limit it puts on a subagent's calls
     (see README.md). When a subagent finishes, end the runs it started
     that nothing is waiting for. When the main agent is about to finish,
-    send it back to any run that stalled and that nothing is waiting
-    for."""
+    send it back to any run that stalled, or said the computer switched to
+    battery power, and that nothing is waiting for."""
     name, agent = event["hook_event_name"], event.get("agent_id")
     if name == "PreToolUse":
         tool = dict(event["tool_input"])
@@ -1346,12 +1532,14 @@ def hook(event: dict) -> dict | None:
     if name == "Stop" and not event.get("stop_hook_active"):
         forgotten = [f"{os.path.basename(rundir)} ({spec['display'][:80]})"
                      for rundir, spec, state in mine
-                     if not spec.get("agent") and state.get("stalls")
+                     if not spec.get("agent")
+                     and (state.get("stalls") or state.get("battery"))
                      and not state.get("waiting")]
         if forgotten:
             return {"decision": "block", "reason": (
-                "These runs reported a stall and nothing is waiting for "
-                "them: " + "; ".join(forgotten) + ". Before you finish, run "
+                "These runs reported a stall, or that the computer switched "
+                "to battery power, and nothing is waiting for them: "
+                + "; ".join(forgotten) + ". Before you finish, run "
                 "`longrun wait RUN` to keep waiting for each, or "
                 "`longrun stop RUN` to end it.")}
     return None
@@ -1395,10 +1583,15 @@ def main() -> int:
     run.add_argument("--keep", action="store_true",
                      help="leave running what the command leaves running "
                           "when it exits by itself")
+    wait = commands.add_parser("wait", help="wait for a run that stalled")
+    for waits in (run, wait):
+        waits.add_argument("--freeze-on-battery", action="store_true",
+                           help="stop the command's processes while the "
+                                "computer runs on battery power")
     run.add_argument("command", nargs=argparse.REMAINDER)
-    for name, text in [("wait", "wait for a run that stalled"),
-                       ("stop", "end a run and wait for it to finish")]:
-        commands.add_parser(name, help=text).add_argument("run")
+    wait.add_argument("run")
+    commands.add_parser("stop", help="end a run and wait for it to "
+                                     "finish").add_argument("run")
     commands.add_parser("list", help="list this session's runs")
     commands.add_parser("hook", help="handle a Claude Code hook event")
     supervise = commands.add_parser("supervise")
@@ -1406,7 +1599,8 @@ def main() -> int:
     supervise.add_argument("fd", type=int)
     args = parser.parse_args()
     if args.action == "run":
-        return start(args.command, args.quiet, args.owner, args.keep)
+        return start(args.command, args.quiet, args.owner, args.keep,
+                     args.freeze_on_battery)
     if args.action == "supervise":
         supervisor = Supervisor(args.rundir, socket.socket(fileno=args.fd))
         try:
@@ -1428,8 +1622,13 @@ def main() -> int:
             json.dump(reply, sys.stdout)
         return 0
     rundir = resolve(args.run)
-    return attach(rundir, connect(rundir),
-                  b"stop\n" if args.action == "stop" else b"")
+    request = b"stop\n" if args.action == "stop" else b""
+    if args.action == "wait" and args.freeze_on_battery:
+        # The file makes a later switch to battery freeze the run, and
+        # the request freezes it now if the computer is on battery.
+        open(os.path.join(rundir, FREEZE), "w").close()
+        request = b"freeze\n"
+    return attach(rundir, connect(rundir), request)
 
 
 if __name__ == "__main__":
