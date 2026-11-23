@@ -50,8 +50,10 @@ let settingGroups: [(title: String, help: String, settings: [Setting])] = [
     ("Power source", "Optionally, github-hookbar can run a command whenever the computer "
         + "switches between battery and wall power.", [
         Setting(name: "power.run", label: "Command:", placeholder: "none",
-                help: "A command line for your login shell, which gets battery or wall as its "
-                    + "last argument. Leave it empty to run none."),
+                help: "A command line for /bin/sh, which reads no startup files, so name "
+                    + "programs outside /usr/bin, /bin, /usr/sbin and /sbin by their full "
+                    + "paths, or set PATH at its start. It gets battery or wall as its last "
+                    + "argument. Leave it empty to run none."),
     ]),
 ]
 

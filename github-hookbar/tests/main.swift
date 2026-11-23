@@ -471,6 +471,89 @@ do {
            "the current power source is the one pmset reports: \(PowerSource.current)")
 }
 
+// MARK: - Running commands
+
+/// Runs a command line with an argument as runCommand does, and returns the
+/// exit status and output it calls back with.
+func ran(_ command: String, with argument: String, in shell: Shell = .plain) -> (Int32, String) {
+    var result: (Int32, String) = (-1, "")
+    waitForMain { done in
+        runCommand(command, with: argument, in: shell) { status, output in
+            dispatchPrecondition(condition: .onQueue(.main))
+            result = (status, output)
+            done()
+        }
+    }
+    return result
+}
+
+let (failedStatus, failedOutput) = ran("sh -c 'echo out; echo err >&2; exit 3' sh", with: "x")
+expect(failedStatus == 3 && failedOutput == "out\nerr\n",
+       "the command's exit status and its output, both streams together: "
+       + "\(failedStatus) \(failedOutput)")
+let (longStatus, longOutput) = ran("printf '%s'", with: String(repeating: "x", count: 500)
+                                   + String(repeating: "y", count: keptOutputLength))
+expect(longStatus == 0 && longOutput == String(repeating: "y", count: keptOutputLength),
+       "only the end of a long output is kept: \(longOutput.prefix(10))")
+var missing: (Int32, String) = (0, "")
+var missingReturned = false
+waitForMain { done in
+    runProgram("/nonexistent/program", []) { status, output in
+        dispatchPrecondition(condition: .onQueue(.main))
+        expect(missingReturned, "a program that cannot start is reported after runProgram returns")
+        missing = (status, output)
+        done()
+    }
+    missingReturned = true
+}
+expect(missing.0 == -1 && missing.1.hasPrefix("could not start /nonexistent/program"),
+       "a program that cannot start says so: \(missing)")
+
+// In a home directory whose shell startup files note that they were read
+// and set a variable, each shell gets the command line's argument as one
+// word. The plain shell sees the environment it was started with and reads
+// no startup files, and the login shell reads its own.
+do {
+    let home = temporaryDirectory()
+    for name in [".profile", ".bash_profile", ".bashrc", ".zshenv", ".zprofile", ".zshrc"] {
+        FileManager.default.createFile(atPath: home + "/" + name,
+                                       contents: Data("""
+                                           echo \(name) >> "$HOME/read"
+                                           export HOOKBAR_MARKER=set
+
+                                           """.utf8))
+    }
+    let saved = ["HOME", "ZDOTDIR"].map { ($0, ProcessInfo.processInfo.environment[$0]) }
+    setenv("HOME", home, 1)
+    unsetenv("ZDOTDIR")
+    defer {
+        for (name, value) in saved {
+            if let value {
+                setenv(name, value, 1)
+            } else {
+                unsetenv(name)
+            }
+        }
+    }
+    let awkwardArgument = "-a \"b\" 'c' $HOME *\nd"
+    let marker = "printf '%s|' \"$HOME\" \"${HOOKBAR_MARKER-unset}\""
+    let (environmentStatus, environmentOutput) = ran(marker, with: "x")
+    expect(environmentStatus == 0 && environmentOutput == home + "|unset|x|",
+           "the plain shell sees the environment it was started with: \(environmentOutput)")
+    let (plainStatus, plainOutput) = ran("printf '%s|'", with: awkwardArgument)
+    expect(plainStatus == 0 && plainOutput == awkwardArgument + "|",
+           "the plain shell gets the argument as one word: \(plainStatus) \(plainOutput)")
+    expect(contents(home + "/read") == nil,
+           "the plain shell reads no startup files: " + String(describing: contents(home + "/read")))
+    let (loginStatus, loginOutput) = ran("printf '%s|'", with: awkwardArgument, in: .login)
+    expect(loginStatus == 0 && loginOutput == awkwardArgument + "|",
+           "the login shell gets the argument as one word: \(loginStatus) \(loginOutput)")
+    expect(contents(home + "/read")?.isEmpty == false, "the login shell reads its startup files")
+    let (_, loginEnvironment) = ran(marker, with: "x", in: .login)
+    expect(loginEnvironment == home + "|set|x|",
+           "the login shell sees what its startup files set: \(loginEnvironment)")
+}
+
 /// What setting a setting does to INI text.
 func setting(_ name: String, to value: String, in text: String) -> String? {
     guard var file = try? INIFile(text) else { return nil }

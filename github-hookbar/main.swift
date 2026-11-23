@@ -20,9 +20,6 @@ let recentLength = 10
 /// few kilobytes of headers.
 let maximumRequestLength = 32 * 1024 * 1024
 
-/// How much of a command's output the menu keeps, from the end.
-let keptOutputLength = 2000
-
 let logTimeFormatter = ISO8601DateFormatter()
 
 /// The system log keeps every line, however github-hookbar was started;
@@ -226,73 +223,6 @@ func showOutcome(_ outcome: Outcome?, on item: NSMenuItem) {
     }
 }
 
-func loginShellPath() -> String {
-    if let entry = getpwuid(getuid()), let shell = entry.pointee.pw_shell {
-        let path = String(cString: shell)
-        if !path.isEmpty {
-            return path
-        }
-    }
-    return "/bin/sh"
-}
-
-/// Runs a script in the user's shell, as an interactive login shell so that
-/// it sees the environment a terminal sees, with the given arguments as $1,
-/// $2, and so on. Calls back on the main thread with the exit status and the
-/// end of the output, standard output and standard error together.
-///
-/// The output goes to a file whose name is removed as soon as it is made, so
-/// a background process that the script leaves running, still holding the
-/// file, does not keep the run from finishing.
-func runInLoginShell(_ script: String, arguments: [String],
-                     completion: @escaping (Int32, String) -> Void) {
-    let output: FileHandle
-    do {
-        let (file, path) = try makeTemporaryFile()
-        unlink(path)
-        output = file
-    } catch {
-        completion(-1, "\(error)")
-        return
-    }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: loginShellPath())
-    process.arguments = ["-ilc", script, "github-hookbar"] + arguments
-    process.standardInput = FileHandle.nullDevice
-    process.standardOutput = output
-    process.standardError = output
-    process.terminationHandler = { process in
-        let text = (try? output.seek(toOffset: 0)).flatMap { try? output.readToEnd() }
-            .map { String(decoding: $0, as: UTF8.self) } ?? ""
-        DispatchQueue.main.async {
-            completion(process.terminationStatus, String(text.suffix(keptOutputLength)))
-        }
-    }
-    do {
-        try process.run()
-    } catch {
-        completion(-1, "could not start \(loginShellPath()): \(error.localizedDescription)")
-    }
-}
-
-/// Runs a command line in the user's shell, as runInLoginShell does, with
-/// an argument added at its end.
-func runCommand(_ command: String, with argument: String,
-                completion: @escaping (Int32, String) -> Void) {
-    runInLoginShell(command + " \"$1\"", arguments: [argument], completion: completion)
-}
-
-/// Makes a new, empty file that only this user can read, and opens it.
-func makeTemporaryFile() throws -> (FileHandle, String) {
-    var template = Array("\(NSTemporaryDirectory())github-hookbar.XXXXXX".utf8CString)
-    let descriptor = mkstemp(&template)
-    guard descriptor >= 0 else {
-        throw Problem(description: "could not make a temporary file: "
-                      + String(cString: strerror(errno)))
-    }
-    return (FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), String(cString: template))
-}
-
 /// Runs a script that asks GitHub something with the gh command, and reads
 /// what it found with `read`. The login shell can print to standard output
 /// as it starts, so the script writes what it found to the file named by its
@@ -304,10 +234,10 @@ func askGitHub<Found>(_ script: String, _ arguments: [String],
     do {
         path = try makeTemporaryFile().1
     } catch {
-        completion(.failure(error))
+        DispatchQueue.main.async { completion(.failure(error)) }
         return
     }
-    runInLoginShell(script, arguments: [path] + arguments) { status, output in
+    runScript(script, in: .login, arguments: [path] + arguments) { status, output in
         defer { unlink(path) }
         completion(Result {
             guard status == 0 else {
@@ -587,7 +517,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
         log("\(described): running the command")
         recent = Array(([item] + recent).prefix(recentLength))
         updateMenu()
-        runCommand(configuration.command, with: url.absoluteString) { [weak self] status, output in
+        runCommand(configuration.command, with: url.absoluteString, in: .login) {
+            [weak self] status, output in
             item.outcome = (status, output)
             logFinished("the command for \(url.absoluteString)", status, output)
             self?.updateMenu()
@@ -601,7 +532,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSView
         log("running the power command for \(source) power")
         powerRun = (source, nil)
         updateMenu()
-        runCommand(command, with: source.rawValue) { [weak self] status, output in
+        runCommand(command, with: source.rawValue, in: .plain) { [weak self] status, output in
             logFinished("the power command for \(source) power", status, output)
             self?.powerRun = (source, (status, output))
             self?.updateMenu()

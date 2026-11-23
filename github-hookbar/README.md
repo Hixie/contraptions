@@ -248,15 +248,23 @@ change, the menu goes on saying when the file was last written.
 github-hookbar asks macOS to say whenever the computer switches between a
 limited power source, such as its battery, and an unlimited one, such as a
 wall outlet. Each time it does, github-hookbar runs the power command from
-the settings, if they name one, in your login shell in the same way as the
-pull request command, with `battery` or `wall` as its last argument. It
-also runs the command once when it starts, and when saved settings change
-the command, with the power source at that moment, and checks the power
-source when the computer wakes, in case it switched while the computer
-slept. It runs the power command once at a time: a switch while the
-command runs waits until it finishes, and only the latest such switch
-runs the command then, so each run finishes before the next starts and
-the last run is for the latest power source.
+the settings, if they name one, with `battery` or `wall` as its last
+argument. It runs the command line with `/bin/sh`, which reads no startup
+files, rather than in your login shell like the pull request command, so
+that the command starts quickly even when the computer is busy, as it can
+be when work paused on battery resumes. The command, and every program it
+starts, sees only the environment github-hookbar was started with. Started
+as a login item, that gives it a `PATH` of
+`/usr/bin:/bin:/usr/sbin:/sbin`. Name programs outside those folders by
+their full paths, or set `PATH` at the start of the command line. The end
+of the command's output is kept for the menu, as for the pull request
+command. It also runs the command once when it starts, and when saved
+settings change the command, with the power source at that moment, and
+checks the power source when the computer wakes, in case it switched while
+the computer slept. It runs the power command once at a time: a switch
+while the command runs waits until it finishes, and only the latest such
+switch runs the command then, so each run finishes before the next starts
+and the last run is for the latest power source.
 
 ## The freight train
 
@@ -369,12 +377,12 @@ bar.
 
 Requires the Xcode command line tools, for `swiftc`. Catching up after
 reconnecting, and the tests, also need `jq`, which macOS includes from macOS
-15 on. There is no Xcode project; the app is ten Swift files: `main.swift`
+15 on. There is no Xcode project; the app is eleven Swift files: `main.swift`
 and `settingswindow.swift`, which hold the menu bar app and its settings
 window, and `timing.swift`, `configuration.swift`, `prlist.swift`,
-`lockedfile.swift`, `connection.swift`, `stream.swift`, `train.swift`, and
-`power.swift`, which hold what the tests cover, apart from the train's
-window.
+`lockedfile.swift`, `connection.swift`, `stream.swift`, `train.swift`,
+`power.swift`, and `run.swift`, which hold what the tests cover, apart from
+the train's window.
 
 ```sh
 make              # builds ./github-hookbar
