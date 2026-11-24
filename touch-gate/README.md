@@ -234,8 +234,13 @@ that key waits for a touch.
 ## Adding a token
 
 On GitHub, create a fine-grained personal access token with read and write
-access to the "Pull requests" and "Contents" permissions of the
-repositories it should act on.
+access to the "Pull requests", "Contents" and "Workflows" permissions of
+the repositories it should act on. Merging a pull request writes its
+changes to the base branch. GitHub requires the "Workflows" permission,
+not just "Contents", for any write to a file in `.github/workflows/`. So
+without "Workflows", the token cannot merge pull requests that change
+those files. GitHub then reports only "Resource not accessible by personal
+access token".
 
 On the server machine, choose a name for the token, for example `alice`,
 and save the token's text in the file `~/touch-gate/state/tokens/alice`,
