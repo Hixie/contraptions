@@ -64,6 +64,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var tokenLookup: Task<String?, Never>?
     /// Why cibar could not last read from GitHub's API.
     private var refreshProblem: String?
+    /// The self-hosted runners of each owner, as GitHub's API last listed
+    /// them, whether cibar is reading them, and why it last could not.
+    private var runners: [String: [Runner]] = [:]
+    private var largerRunners: [String: [LargerRunner]] = [:]
+    private var readingRunners = false
+    private var readRunnersAgain = false
+    private var runnersProblem: String?
     private let flyby = FlybyController()
     /// How long after GitHub made them the latest deliveries on this
     /// connection arrived, when their delivery IDs say when that was.
@@ -86,6 +93,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var includesPullRequests: Bool {
         get { UserDefaults.standard.bool(forKey: "includesPullRequests") }
         set { UserDefaults.standard.set(newValue, forKey: "includesPullRequests") }
+    }
+
+    private var showsRunners: Bool {
+        get { UserDefaults.standard.bool(forKey: "showsRunners") }
+        set { UserDefaults.standard.set(newValue, forKey: "showsRunners") }
     }
 
     private var startsSessions: Bool {
@@ -149,17 +161,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.includesPullRequests = $0
                 self?.changed()
             },
+            setShowsRunners: { [weak self] in
+                self?.showsRunners = $0
+                if $0 {
+                    self?.readRunners()
+                }
+                self?.changed()
+            },
             open: { [weak self] in
                 self?.closeDashboard()
                 NSWorkspace.shared.open($0)
             },
-            close: { [weak self] in self?.closeDashboard() }))
+            close: { [weak self] in self?.panel.cancelOperation(nil) }))
         // The dashboard closes when the indicator is clicked again, when
         // Escape is pressed, and when anything else is clicked, which takes
         // the keyboard from it.
-        panel = DashboardPanel(showing: makeDashboard(dashboard, width: dashboardSize(screenHeight: 0).width))
+        let content = makeDashboard(dashboard, width: dashboardSize(screenHeight: 0).width)
+        panel = DashboardPanel(showing: content)
+        panel.onTitleBar = { content.titleBar = $0 }
         panel.delegate = self
         panel.onEscape = { [weak self] in self?.closeDashboard() }
+        panel.onTearOff = { [weak self] in self?.statusItem.button?.highlight(false) }
         statusItem.button?.target = self
         statusItem.button?.action = #selector(toggleDashboard)
         // On release, as other panels in the menu bar open, so that the
@@ -380,11 +402,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: The dashboard
 
     @objc private func toggleDashboard() {
+        // A torn-off dashboard comes to the front rather than closing.
+        if panel.isTornOff {
+            panel.orderFrontRegardless()
+            panel.makeKey()
+            return
+        }
         if panel.isVisible {
             closeDashboard()
             return
         }
         guard let button = statusItem.button, let bar = button.window, let screen = bar.screen else { return }
+        if showsRunners {
+            readRunners()
+        }
         showDashboardState()
         // Placed once, as it opens, so that the indicator changing width
         // while it shows does not move it.
@@ -398,7 +429,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         button.highlight(true)
     }
 
+    /// Closes the dashboard, unless it has been torn off into a window of its
+    /// own, which stays until it is closed.
     @objc private func closeDashboard() {
+        guard !panel.isTornOff else { return }
         panel.orderOut(nil)
         statusItem.button?.highlight(false)
     }
@@ -406,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Closes the dashboard when anything else is clicked, which takes the
     /// keyboard from it, unless that is the indicator, whose click closes it.
     func windowDidResignKey(_ notification: Notification) {
-        guard let button = statusItem.button, let bar = button.window,
+        guard !panel.isTornOff, let button = statusItem.button, let bar = button.window,
               !bar.convertToScreen(button.convert(button.bounds, to: nil)).contains(NSEvent.mouseLocation) else {
             return
         }
@@ -421,7 +455,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             deliveryProblem: deliveryProblem, refreshing: refreshing, refreshProgress: refreshProgress,
             refreshProblem: awaitingToken ? "Waiting for the login shell to give a GitHub token" : refreshProblem,
             sessions: configuration?.codex == nil ? nil : startsSessions, records: records,
-            includesPullRequests: includesPullRequests)
+            includesPullRequests: includesPullRequests, showsRunners: showsRunners,
+            runners: runners.filter { watch.owners.isEmpty || watch.owners.contains($0.key) }
+                .sorted { $0.key < $1.key }.flatMap(\.value),
+            larger: largerRunners.filter { watch.owners.isEmpty || watch.owners.contains($0.key) }
+                .sorted { $0.key < $1.key }.flatMap(\.value),
+            runnersProblem: runnersProblem)
     }
 
     /// Brings the dashboard up to date.
@@ -458,12 +497,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshing = true
         awaitingToken = true
         changed()
-        let owners = configuration.owners.isEmpty ? Set(watch.defaultBranches.keys.map(ownerOf)) : configuration.owners
+        let owners = owners(of: configuration)
         // Quiet repositories are read when they are red, so that what made
         // them so can be found to be gone.
         let red = Set(watch.redWorkflowBranches.map(\.repository))
-        let lookup = tokenLookup ?? Task.detached { gitHubToken() }
-        tokenLookup = lookup
+        let lookup = token()
         Task { @MainActor [weak self] in
             // The token is found before deliveries are set aside, so that
             // they do not pile up while the login shell runs.
@@ -518,6 +556,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if case .connected = relay.state {} else {
                 watch.forgetActiveJobs()
             }
+            if showsRunners {
+                readRunners()
+            }
             log("read \(read.primed.count) runs and jobs of \(read.repositories.count) repositories from GitHub, "
                 + "and \(deliveries.count) deliveries again")
             // What was read starts nothing, since sessions and planes are
@@ -532,6 +573,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             refresh()
         }
         changed()
+    }
+
+    /// The owners whose repositories cibar reads: those the settings name,
+    /// or, with none, those of the repositories it knows.
+    private func owners(of configuration: Configuration) -> Set<String> {
+        configuration.owners.isEmpty ? Set(watch.defaultBranches.keys.map(ownerOf)) : configuration.owners
+    }
+
+    /// The token for GitHub's API, looked up once, until a read fails.
+    private func token() -> Task<String?, Never> {
+        let lookup = tokenLookup ?? Task.detached { gitHubToken() }
+        tokenLookup = lookup
+        return lookup
+    }
+
+    /// Reads the owners' self-hosted runners from GitHub's API, for the
+    /// runners board, as it opens, and after each read of the rest while it
+    /// shows, since no delivery says when a runner comes, goes, or loses its
+    /// connection. Asked to read again while reading, it reads again after.
+    private func readRunners() {
+        guard !readingRunners else {
+            readRunnersAgain = true
+            return
+        }
+        guard let configuration else { return }
+        readingRunners = true
+        let owners = owners(of: configuration)
+        let lookup = token()
+        Task { @MainActor [weak self] in
+            guard let token = await lookup.value else {
+                self?.readingRunners = false
+                self?.readRunnersAgain = false
+                return
+            }
+            let result = await Result { try await GitHubAPI(token: token).runners(of: Array(owners)) }
+            guard let self else { return }
+            readingRunners = false
+            switch result {
+            case .success(let read):
+                runners.merge(read.runners) { $1 }
+                largerRunners.merge(read.larger) { $1 }
+                runnersProblem = read.problems.isEmpty ? nil
+                    : "Could not read all the runners: " + read.problems.joined(separator: "; ")
+            case .failure(let error):
+                runnersProblem = "Could not read the runners: \(error)"
+                log("could not read the runners from GitHub: \(error)")
+                // The token may have changed.
+                tokenLookup = nil
+            }
+            if readRunnersAgain {
+                readRunnersAgain = false
+                readRunners()
+            }
+            changed()
+        }
     }
 
     private func flyBanners() {

@@ -1619,6 +1619,39 @@ do {
     panel.onEscape = { escaped = true }
     panel.cancelOperation(nil)
     expect(escaped, "Escape closes the dashboard")
+    var tornOff = 0
+    panel.onTearOff = { tornOff += 1 }
+    var titleBars: [TitleBar] = []
+    panel.onTitleBar = { titleBars.append($0) }
+    panel.setFrame(CGRect(x: 100, y: 100, width: 780, height: 640), display: false)
+    panel.setFrame(CGRect(x: 200, y: 100, width: 780, height: 600), display: false)
+    expect(!panel.isTornOff && tornOff == 0, "moving the dashboard other than by dragging it does not tear it off")
+    panel.tearOff()
+    panel.tearOff()
+    expect(panel.isTornOff && panel.level == .normal && !panel.styleMask.contains(.resizable) && tornOff == 1
+           && panel.frame == CGRect(x: 200, y: 100, width: 780, height: 600),
+           "a torn-off dashboard is a window like any other, where it was, the size it was")
+    panel.contentView?.layoutSubtreeIfNeeded()
+    let shown = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].filter {
+        panel.standardWindowButton($0).map { !$0.isHidden } ?? false
+    }
+    let titleBar = panel.frame.height - panel.contentLayoutRect.height
+    let grip = panel.contentView?.subviews.first { $0 is TearOffHandle }
+    expect(shown == [.closeButton] && panel.styleMask.contains(.utilityWindow) && panel.titlebarAppearsTransparent
+           && titleBar > 0 && titleBars.map(\.height) == [titleBar] && grip?.isHidden == true
+           && titleBars.first.map { $0.middle > 0 && $0.middle < titleBar } == true,
+           "a torn-off dashboard has a palette's slim title bar with just a small button to close it, whose height "
+           + "and button's middle its content is told, and no grip")
+    escaped = false
+    panel.standardWindowButton(.closeButton)?.performClick(nil)
+    expect(!panel.isTornOff && panel.level == .popUpMenu && !panel.styleMask.contains(.resizable)
+           && !panel.styleMask.contains(.titled) && panel.standardWindowButton(.closeButton) == nil && !escaped,
+           "its close button closes a torn-off dashboard, which then opens as a popup again")
+    expect(titleBars.last == TitleBar.none && titleBars.count == 2 && grip?.isHidden == false,
+           "a popup's content is told it has no title bar, and its grip shows again")
+    panel.tearOff()
+    panel.cancelOperation(nil)
+    expect(!panel.isTornOff && !panel.styleMask.contains(.titled), "and so does Escape")
     for state in [state, disconnected, crowded] {
         let model = DashboardModel(state: state, actions: DashboardActions())
         let fitted = NSHostingController(rootView: DashboardView(model: model)).sizeThatFits(in: size)
@@ -2077,6 +2110,1069 @@ do {
            "the same run run again after its branch was forgotten counts, with its jobs delivered first")
 } catch {
     expect(false, "deliveries are read: \(error)")
+}
+
+// MARK: - The runners jobs run on
+
+do {
+    // Deliveries say what runner a job asks for, which one takes it, and how
+    // it ended.
+    let watch = Watch()
+    func runnerJob(_ id: Int64, status: String, conclusion: String? = nil, runner: String? = nil,
+                   group: String? = nil) -> Data {
+        var body = try! JSONSerialization.jsonObject(with: job(id, run: 10, name: "test \(id)", status: status,
+                                                               conclusion: conclusion,
+                                                               created: "2026-01-01T00:00:00Z")) as! [String: Any]
+        var job = body["workflow_job"] as! [String: Any]
+        job["labels"] = ["self-hosted", "macOS", "cf-mac"]
+        job["runner_name"] = runner ?? NSNull()
+        job["runner_group_name"] = group ?? NSNull()
+        job["started_at"] = "2026-01-01T00:05:00Z"
+        body["workflow_job"] = job
+        return json(body)
+    }
+    let iso = ISO8601DateFormatter()
+    _ = try watch.handle(event: "workflow_run", body: run(10, status: "in_progress"))
+    _ = try watch.handle(event: "workflow_job", body: runnerJob(1, status: "queued"))
+    expect(watch.active[1]?.labels == ["self-hosted", "macOS", "cf-mac"] && watch.active[1]?.runner == nil
+           && watch.active[1]?.since == iso.date(from: "2026-01-01T00:00:00Z") && watch.active[1]?.sha == "abc123",
+           "a queued job has the labels it asks for, no runner, its run's commit, and has waited since it was made")
+    _ = try watch.handle(event: "workflow_job", body: runnerJob(1, status: "in_progress", runner: "ci-mac-01-2",
+                                                                group: "cf-mac"))
+    expect(watch.active[1]?.runner == "ci-mac-01-2" && watch.active[1]?.runnerGroup == "cf-mac"
+           && watch.active[1]?.since == iso.date(from: "2026-01-01T00:05:00Z"),
+           "a running job has its runner, and has run since it started")
+    for (id, conclusion, outcome) in [(Int64(2), "success", Outcome.passed), (3, "failure", .failed),
+                                      (4, "cancelled", .neither)] {
+        _ = try watch.handle(event: "workflow_job", body: runnerJob(id, status: "in_progress", runner: "r"))
+        _ = try watch.handle(event: "workflow_job", body: runnerJob(id, status: "completed", conclusion: conclusion))
+        expect(watch.active[id] == nil && watch.outcomes[id] == outcome,
+               "a job that \(conclusion == "success" ? "passed" : conclusion) leaves, saying how it ended")
+    }
+    expect(watch.outcomes[1] == nil, "a job still running has no outcome")
+    // A run that ends with jobs still queued or running ends them too, as
+    // when it is cancelled before they start: all passed if it passed, and
+    // otherwise neither passed nor failed, as far as is known.
+    let ending = Watch()
+    _ = try ending.handle(event: "workflow_run", body: run(10, status: "in_progress"))
+    _ = try ending.handle(event: "workflow_job", body: runnerJob(7, status: "queued"))
+    _ = try ending.handle(event: "workflow_job", body: runnerJob(8, status: "in_progress", runner: "r"))
+    _ = try ending.handle(event: "workflow_job", body: runnerJob(9, status: "in_progress", runner: "r"))
+    _ = try ending.handle(event: "workflow_job", body: runnerJob(9, status: "completed", conclusion: "failure"))
+    _ = try ending.handle(event: "workflow_run", body: run(10, status: "completed", conclusion: "cancelled"))
+    _ = try ending.handle(event: "workflow_job", body: runnerJob(7, status: "queued"))
+    expect(ending.active.isEmpty && ending.outcomes[7] == .neither && ending.outcomes[8] == .neither
+           && ending.outcomes[9] == .failed,
+           "a run cancelled with jobs queued and running ends them as neither passing nor failing, and keeps "
+           + "how those that had ended ended")
+    let passingRun = Watch()
+    _ = try passingRun.handle(event: "workflow_run", body: run(10, status: "in_progress"))
+    _ = try passingRun.handle(event: "workflow_job", body: runnerJob(7, status: "in_progress", runner: "r"))
+    _ = try passingRun.handle(event: "workflow_run", body: run(10, status: "completed", conclusion: "success"))
+    expect(passingRun.active.isEmpty && passingRun.outcomes[7] == .passed,
+           "a run that passed with a job still running ends it as passed")
+    _ = try watch.handle(event: "workflow_job", body: runnerJob(5, status: "in_progress", runner: "", group: ""))
+    expect(watch.active[5]?.runner == nil && watch.active[5]?.runnerGroup == nil,
+           "a job just started, whose runner GitHub names as nothing yet, runs on no runner known")
+
+    // How runners and jobs are pooled.
+    func active(_ name: String, workflow: String = "CI", labels: [String], runner: String? = nil,
+                group: String? = nil, since: Double = 0) -> ActiveJob {
+        // A run of its own for each workflow.
+        ActiveJob(workflowBranch: on(workflow), name: name,
+                  order: RunOrder(run: Int64(stableHash(workflow) % 1_000_000), attempt: 1),
+                  running: runner != nil || group != nil, runURL: "https://example.com/run",
+                  url: "https://example.com/\(name)", labels: labels, runner: runner, runnerGroup: group,
+                  since: Date(timeIntervalSince1970: since))
+    }
+    let mac = ["self-hosted", "macOS", "ARM64", "cf-mac"]
+    let spot = ["self-hosted", "Linux", "X64", "cf-spot"]
+    let runners = [
+        Runner(owner: "octo", name: "ci-mac-01-2", labels: mac + ["ci-mac-01"], online: true),
+        Runner(owner: "octo", name: "ci-mac-01-1", labels: mac + ["ci-mac-01"], online: true),
+        Runner(owner: "octo", name: "ci-mac-01-builder", labels: ["self-hosted", "macOS", "ci-mac-01", "cf-mac-builder"], online: true),
+        Runner(owner: "octo", name: "ci-mac-02-1", labels: mac + ["ci-mac-02"], online: false),
+        Runner(owner: "octo", name: "spot-a", labels: spot, online: true),
+        Runner(owner: "octo", name: "spot-b", labels: spot, online: false),
+    ]
+    let jobs: [Int64: ActiveJob] = [
+        1: active("mac running", labels: mac, runner: "ci-mac-01-2", group: "cf-mac"),
+        2: active("mac queued late", labels: mac, since: 20),
+        3: active("mac queued early", labels: ["self-hosted", "cf-mac", "ci-mac-02"], since: 10),
+        4: active("hosted running", workflow: "Lint", labels: ["ubuntu-latest"], runner: "GitHub Actions 7",
+                  group: gitHubHostedGroup),
+        5: active("hosted queued", workflow: "Lint", labels: ["ubuntu-latest"]),
+        6: active("nowhere", labels: ["self-hosted", "macOS", "apple-container"]),
+        7: active("spot running", labels: spot.map { $0.lowercased() }, runner: "spot-z", group: "cf-spot"),
+        8: active("spot queued", labels: ["self-hosted", "cf-spot"]),
+        9: active("any", labels: []),
+    ]
+    let board = RunnerBoard(jobs: jobs, runners: runners, outcomes: [3: .failed])
+    expect(board.pools.map(\.title) == ["ci-mac", "apple-container", "cf-spot", "GitHub-hosted"],
+           "machines come first, then other self-hosted runners, then GitHub's: \(board.pools.map(\.title))")
+    let macs = board.pools[0]
+    expect(macs.boxes.map(\.id) == ["ci-mac-01", "ci-mac-02"]
+           && macs.boxes[0].slots?.map(\.label) == ["1", "2", "builder"]
+           && macs.boxes[0].slots?[1].job?.id == 1 && macs.boxes[0].slots?[0].job == nil
+           && macs.boxes[1].slots?.map(\.online) == [false],
+           "a runner whose name starts with one of its labels has a slot on that machine, in order, with the job it "
+           + "runs: \(macs.boxes)")
+    expect(macs.detail == "self-hosted macOS ARM64 · cf-mac, cf-mac-builder" && macs.queue.map(\.id) == [3, 2],
+           "a pool of machines says what runs on them, and its queue has every job a runner of it can take, the "
+           + "oldest first: \(macs.detail) \(macs.queue.map(\.id))")
+    expect(board.pools[1].queue.map(\.id) == [6] && board.pools[1].running == 0
+           && board.pools[1].detail == "self-hosted macOS",
+           "a job no runner can take waits in a pool of its own")
+    let spots = board.pools[2]
+    expect(spots.boxes.count == 1 && spots.boxes[0].slots == nil && spots.boxes[0].jobs.map(\.id) == [7]
+           && spots.boxes[0].idle == 1 && spots.queue.map(\.id) == [8],
+           "runners that are not on a machine are pooled by their labels, with the jobs on them, however their "
+           + "labels are spelt, those online and idle, and those queued for them: \(spots)")
+    let hosted = board.pools[3]
+    expect(hosted.boxes.map(\.title) == ["any runner", "ubuntu-latest"] && hosted.boxes[1].jobs.map(\.id) == [4]
+           && Set(hosted.queue.map(\.id)) == [5, 9],
+           "GitHub's runners have a box for each set of labels asked for: \(hosted.boxes.map(\.title))")
+    expect(board.running == 3 && board.queued == 6 && board.slots == 4 && board.idleSlots == 2
+           && board.offlineSlots == 1 && board.tokens.count == jobs.count,
+           "the board counts every job and runner once: \(board.running) \(board.queued) \(board.idleSlots)")
+    expect(board.runs.map(\.jobs) == [7, 2],
+           "the board knows each run on it, those with the most jobs first, which choose colours first")
+    var pr1 = active("test", labels: ["ubuntu-latest"], group: gitHubHostedGroup)
+    pr1.workflowBranch = on("CI", "one")
+    var pr2 = pr1
+    pr2.workflowBranch = on("CI", "two")
+    pr2.order = RunOrder(run: 99, attempt: 1)
+    let prs = RunnerBoard(jobs: [1: pr1, 2: pr2, 3: pr2], runners: [], outcomes: [:], pullRequests: {
+        $0.branch == "one" ? PullRequestInfo(number: 12, author: "ada") : nil
+    })
+    var firstRun = active("test", labels: ["ubuntu-latest"], group: gitHubHostedGroup)
+    firstRun.sha = "1a2b3c4d5e"
+    var secondRun = firstRun
+    secondRun.order = RunOrder(run: 98, attempt: 1)
+    secondRun.sha = "9f8e7d6c5b"
+    let twoRuns = RunnerBoard(jobs: [1: firstRun, 2: secondRun, 3: secondRun], runners: [], outcomes: [:])
+    expect(Set(twoRuns.tokens.map(\.runID)).count == 2
+           && Set(twoRuns.tokens.map { RunnerBoardView.describe($0, at: Date()).split(separator: "\n")[0] })
+               == ["repo · CI on main @ 9f8e7d6", "repo · CI on main @ 1a2b3c4"],
+           "two runs of a workflow on a branch at once are two colours, named apart by their commits")
+    expect(Set(prs.tokens.map(\.workflowTitle)) == ["repo · CI on two", "repo PR #12 · CI"]
+           && Set(prs.tokens.map(\.runID)).count == 2,
+           "the same workflow on two branches is two runs, named by pull request or branch")
+    expect(RunnerBoard.title(["ci-mac-01", "ci-mac-02"]) == "ci-mac" && RunnerBoard.title(["solo"]) == "solo"
+           && RunnerBoard.title(["alpha", "beta"]) == "alpha, beta" && RunnerBoard.title(["m1", "m2"]) == "m",
+           "machines are named by what their names start with, without what tells them apart")
+    let unlisted = RunnerBoard(jobs: [1: jobs[1]!, 2: jobs[2]!], runners: [], outcomes: [:])
+    expect(unlisted.pools.map(\.title) == ["cf-mac"] && unlisted.pools[0].boxes[0].jobs.map(\.id) == [1]
+           && unlisted.pools[0].queue.map(\.id) == [2],
+           "without a list of runners, those jobs run on are learnt from the jobs: \(unlisted.pools)")
+    let autoscaled = RunnerBoard(jobs: [:], runners: [
+        Runner(owner: "octo", name: "arc-linux-x7k2p-runner-abcde", labels: ["arc-linux", "big"], online: true),
+        Runner(owner: "octo", name: "cf-spot-x7k2", labels: ["self-hosted", "cf-spot"], online: true),
+        Runner(owner: "octo", name: "alpha-1", labels: ["self-hosted", "alpha", "ios"], online: true),
+        Runner(owner: "octo", name: "beta-1", labels: ["self-hosted", "beta", "android"], online: true),
+    ], outcomes: [:])
+    expect(autoscaled.pools.map(\.title) == ["alpha", "beta", "arc-linux, big", "cf-spot"]
+           && autoscaled.pools.map { $0.boxes[0].slots == nil } == [false, false, true, true]
+           && autoscaled.pools[3].boxes[0].idle == 1,
+           "a runner named with more than a word after its label, or with no other label to say what it is for, "
+           + "is not on a machine, and machines that share no label are pools of their own: "
+           + "\(autoscaled.pools.map(\.title))")
+    let doubled = RunnerBoard(jobs: [
+        1: active("finished, not yet said", labels: mac, runner: "ci-mac-01-1", group: "cf-mac"),
+        2: active("next", labels: mac, runner: "ci-mac-01-1", group: "cf-mac"),
+    ], runners: runners, outcomes: [:])
+    expect(doubled.tokens.map(\.id).sorted() == [1, 2] && doubled.running == 2
+           && doubled.pools[0].boxes[0].jobs.map(\.id) == [2]
+           && BoardLayout(board: doubled, size: CGSize(width: 780, height: 588)).tokens.count == 2,
+           "two jobs that say they run on one runner, as deliveries out of order can, are both shown")
+    let spelt = RunnerBoard(jobs: [
+        1: active("upper", labels: ["self-hosted", "CF-Spot"], runner: "spot-z", group: "cf-spot"),
+        2: active("bare", labels: []),
+    ], runners: runners + [Runner(owner: "octo", name: "vm-abc-def", labels: ["self-hosted", "Linux"], online: true)],
+       outcomes: [:])
+    expect(spelt.pools.filter { $0.title.lowercased() == "cf-spot" }.count == 1
+           && spelt.pools.first { $0.kind == .gitHubHosted }?.queue.map(\.id) == [2],
+           "labels are the same however they are spelt, and a job that asks for none waits for GitHub's runners: "
+           + "\(spelt.pools.map(\.title))")
+    let twoOwners = RunnerBoard(jobs: [1: active("mac running", labels: mac, runner: "ci-mac-01-2", group: "cf-mac")],
+                                runners: runners + [Runner(owner: "other", name: "ci-mac-01-2",
+                                                           labels: mac + ["ci-mac-01"], online: true)],
+                                outcomes: [:])
+    let twoSlots = twoOwners.pools[0].boxes[0].slots?.filter { $0.name == "ci-mac-01-2" }
+    expect(twoSlots?.map(\.id) == ["octo/ci-mac-01-2", "other/ci-mac-01-2"]
+           && twoSlots?.map { $0.job?.id } == [1, nil],
+           "runners of the same name of two owners are two runners, and a job runs on its own owner's")
+    let linux = ["self-hosted", "Linux"]
+    let choices = [Runner(owner: "octo", name: "m-1", labels: linux + ["m"], online: false),
+                   Runner(owner: "octo", name: "x-1", labels: linux + ["x"], online: true)]
+    let waiting: [Int64: ActiveJob] = [1: active("any linux", labels: linux)]
+    expect(RunnerBoard(jobs: waiting, runners: choices, outcomes: [:]).pools.first { !$0.queue.isEmpty }?.title == "x",
+           "a queued job waits for a runner that is online rather than one that is not")
+    var allOffline = choices
+    allOffline[1].online = false
+    expect(RunnerBoard(jobs: waiting, runners: allOffline, outcomes: [:]).pools.first { !$0.queue.isEmpty }?.title
+           == "m", "with every runner that could take it offline, a queued job waits for the first of them")
+    let unplaced = RunnerBoard(jobs: [
+        1: active("just started", labels: ["ubuntu-24.04"], runner: nil, group: nil, since: 1),
+        2: active("named", labels: ["ubuntu-24.04"], runner: "GitHub Actions 1001438681", group: nil, since: 2),
+        3: active("grouped", labels: ["ubuntu-24.04"], runner: "GitHub Actions 7", group: gitHubHostedGroup, since: 3),
+    ].mapValues { job in
+        var job = job
+        job.running = true
+        return job
+    }, runners: [], outcomes: [:])
+    expect(unplaced.pools.map(\.title) == ["GitHub-hosted"] && unplaced.pools[0].boxes.map(\.title) == ["ubuntu-24.04"]
+           && unplaced.pools[0].boxes[0].jobs.count == 3,
+           "jobs on GitHub's runners are together, whether GitHub has said yet where they run, names their runner "
+           + "after its own, or gives its group: \(unplaced.pools.map(\.title))")
+    let larger = RunnerBoard(jobs: [
+        1: active("bench", labels: ["ubuntu-24.04-32-core"], runner: "ubuntu-24.04-32-core_7f3a", group: "labs"),
+        2: active("bench next", labels: ["ubuntu-24.04-32-core"]),
+        3: active("lint", labels: ["ubuntu-latest"]),
+    ], runners: [], outcomes: [:])
+    let largeRunners = [LargerRunner(owner: "octo", name: "ubuntu-24.04-32-core", maximum: 3, cores: 32, memory: 128),
+                        LargerRunner(owner: "octo", name: "ubuntu-24.04-32-core-internal", maximum: 2, cores: 32,
+                                     memory: 128)]
+    var large: [Int64: ActiveJob] = [
+        1: active("bench 1", labels: [], runner: "ubuntu-24.04-32-core-1001427100", group: "labs", since: 1),
+        2: active("bench 2", labels: [], runner: "ubuntu-24.04-32-core-1001427101", group: "labs", since: 2),
+        3: active("internal", labels: [], runner: "Ubuntu-24.04-32-core-internal-5", group: "internal", since: 3),
+        4: active("asks", labels: ["ubuntu-24.04-32-core"], since: 4),
+    ]
+    let largeBoard = RunnerBoard(jobs: large, runners: [], larger: largeRunners, outcomes: [:])
+    expect(largeBoard.pools.map(\.title) == ["ubuntu-24.04-32-core", "ubuntu-24.04-32-core-internal"]
+           && largeBoard.pools[0].boxes[0].capacity == 3 && largeBoard.pools[0].boxes[0].jobs.map(\.id) == [1, 2]
+           && largeBoard.pools[0].queue.map(\.id) == [4] && largeBoard.pools[1].boxes[0].jobs.map(\.id) == [3]
+           && largeBoard.pools[0].detail == "GitHub-hosted · 32 cores, 128 GB",
+           "a job on, or asking for, a larger runner is in its pool, the runner with the longest name it matches: "
+           + "\(largeBoard.pools.map(\.title))")
+    var steadiness = RunnerBoard.Steadiness()
+    let seatedBoard = largeBoard.steadied(&steadiness)
+    expect(seatedBoard.pools[0].boxes[0].slots?.map { $0.job?.id } == [1, 2, nil]
+           && BoardLayout(board: seatedBoard, size: CGSize(width: 780, height: 588)).texts
+               .contains { $0.string == "1 queued · 2 of 3 running" },
+           "a larger runner has a place for each job it can run at once, and says how many it runs")
+    expect(!BoardLayout(board: seatedBoard, size: CGSize(width: 780, height: 588)).texts
+               .contains { $0.string.contains("runners idle") },
+           "places for jobs on runners known only by their number are not counted as runners")
+    let huge = RunnerBoard(jobs: [1: large[1]!], runners: [],
+                           larger: [LargerRunner(owner: "octo", name: "ubuntu-24.04-32-core", maximum: 500, cores: nil,
+                                                 memory: nil),
+                                    LargerRunner(owner: "octo", name: "unbounded", maximum: nil, cores: nil,
+                                                 memory: nil)],
+                           outcomes: [:]).steadied(&steadiness)
+    expect(huge.pools.first { $0.title == "ubuntu-24.04-32-core" }?.boxes[0].slots?.map { $0.job?.id } == [1]
+           && BoardLayout(board: huge, size: CGSize(width: 780, height: 588)).texts
+               .contains { $0.string == "0 queued · 1 of 500 running" },
+           "a larger runner that can run more jobs at once than there is room for grows with its jobs")
+    let gpu = RunnerBoard(jobs: [1: active("render", labels: ["self-hosted", "gpu"], runner: "gpu-1", group: "Default")],
+                          runners: [Runner(owner: "octo", name: "gpu-1", labels: ["self-hosted", "gpu", "cuda"],
+                                           online: true)],
+                          larger: [LargerRunner(owner: "octo", name: "gpu", maximum: 4, cores: nil, memory: nil)],
+                          outcomes: [:])
+    expect(gpu.pools.map(\.title) == ["gpu"] && gpu.pools[0].kind == .machines
+           && gpu.pools[0].boxes[0].slots?.first?.job?.id == 1,
+           "a job on a listed self-hosted runner is on it, whatever larger runner its runner's name starts with")
+    steadiness = RunnerBoard.Steadiness()
+    _ = largeBoard.steadied(&steadiness)
+    large[1] = nil
+    large[5] = active("bench 3", labels: [], runner: "ubuntu-24.04-32-core-1001427102", group: "labs", since: 5)
+    large[6] = active("bench 4", labels: [], runner: "ubuntu-24.04-32-core-1001427103", group: "labs", since: 6)
+    large[7] = active("bench 5", labels: [], runner: "ubuntu-24.04-32-core-1001427104", group: "labs", since: 7)
+    let reseated = RunnerBoard(jobs: large, runners: [], larger: largeRunners, outcomes: [:]).steadied(&steadiness)
+    expect(reseated.pools[0].boxes[0].slots?.map { $0.job?.id } == [5, 2, 6]
+           && reseated.pools[0].boxes[0].jobs.map(\.id) == [7],
+           "a job keeps its place while others come and go, a new one takes the first free place, and one that "
+           + "does not fit is beside them: \(String(describing: reseated.pools[0].boxes[0].slots?.map { $0.job?.id }))")
+    // A job's place in its queue says nothing of its place in its box.
+    var memory = RunnerBoard.Steadiness()
+    var moving: [Int64: ActiveJob] = [
+        1: active("a", labels: ["ubuntu-latest"], runner: "GitHub Actions 1", group: gitHubHostedGroup, since: 1),
+        2: active("b", labels: ["ubuntu-latest"], runner: "GitHub Actions 2", group: gitHubHostedGroup, since: 2),
+        3: active("c", labels: ["ubuntu-latest"], runner: "GitHub Actions 3", group: gitHubHostedGroup, since: 3),
+        4: active("d", labels: ["ubuntu-latest"], since: 4),
+        5: active("e", labels: ["ubuntu-latest"], since: 5),
+        6: active("f", labels: ["ubuntu-latest"], since: 6),
+    ]
+    _ = RunnerBoard(jobs: moving, runners: [], outcomes: [:]).steadied(&memory)
+    moving[2] = nil
+    moving[6] = active("f", labels: ["ubuntu-latest"], runner: "GitHub Actions 6", group: gitHubHostedGroup, since: 7)
+    let moved = RunnerBoard(jobs: moving, runners: [], outcomes: [:]).steadied(&memory)
+    expect(moved.pools[0].boxes[0].slots?.map { $0.job?.id } == [1, 6, 3]
+           && moved.pools[0].queue.map(\.id) == [4, 5],
+           "a job that starts takes the first empty place in its box, whatever its place in the queue")
+    let grouped = RunnerBoard(jobs: [
+        1: active("bench", labels: [], runner: "ubuntu-24.04-32-core-1001427100", group: "labs"),
+    ], runners: [], outcomes: [:])
+    expect(grouped.pools.map(\.title) == ["runner group labs"] && grouped.pools[0].boxes[0].jobs.map(\.id) == [1],
+           "a job that asked for a runner group rather than labels is pooled by the group")
+    expect(larger.pools.map(\.title) == ["ubuntu-24.04-32-core", "GitHub-hosted"]
+           && larger.pools[0].boxes[0].jobs.map(\.id) == [1] && larger.pools[0].queue.map(\.id) == [2]
+           && larger.pools[1].queue.map(\.id) == [3],
+           "a job on a runner outside GitHub's own group is pooled by its labels, with the jobs queued for them, "
+           + "and only jobs with nowhere else to go wait for GitHub's runners: \(larger.pools.map(\.title))")
+
+    // The circles are as big as lets everything fit, and nothing overlaps.
+    let size = CGSize(width: 780, height: 588)
+    let roomy = BoardLayout(board: board, size: size)
+    expect(roomy.size == BoardLayout.sizes[0] && roomy.tokens.count == board.running
+           && roomy.heaps.reduce(0, { $0 + $1.jobs.count }) == board.queued
+           && roomy.slots.count == 4 && roomy.pools.count == 4,
+           "a board with room to spare has the biggest circles, a place for each running job, a heap for each "
+           + "queue, and a slot for each runner")
+    var crowdedJobs: [Int64: ActiveJob] = [:]
+    for id in 1...900 {
+        crowdedJobs[Int64(id)] = id <= 700 ? active("r\(id)", labels: spot, runner: "spot-\(id)", group: "cf-spot")
+            : active("q\(id)", labels: id % 2 == 0 ? spot : ["ubuntu-latest"])
+    }
+    let crowded = BoardLayout(board: RunnerBoard(jobs: crowdedJobs, runners: runners, outcomes: [:]), size: size)
+    let frames = Array(crowded.tokens.values)
+    let bounds = CGRect(origin: .zero, size: size)
+    expect(crowded.size < roomy.size && (1...700).allSatisfy { crowded.tokens[Int64($0)] != nil }
+           && frames.allSatisfy { bounds.contains($0) },
+           "a crowded board has smaller circles, every running job's on it: \(crowded.size)")
+    expect(!frames.enumerated().contains { index, frame in
+               frames[(index + 1)...].contains { $0.intersects(frame) }
+           },
+           "no two circles overlap")
+    var manyPools: [Int64: ActiveJob] = [:]
+    for id in 1...30 {
+        manyPools[Int64(id)] = active("j\(id)", labels: ["self-hosted", "pool-\(id)"], since: Double(id))
+    }
+    let overflowing = BoardLayout(board: RunnerBoard(jobs: manyPools, runners: [], outcomes: [:]),
+                                  size: CGSize(width: 780, height: 400))
+    let note = overflowing.texts.first { $0.string.hasSuffix("not shown") }
+    expect(note.map { $0.string == "\(30 - overflowing.pools.count) more pools not shown" } == true
+           && overflowing.pools.count < 30
+           && overflowing.tokens.values.allSatisfy { $0.maxY <= note!.frame.minY },
+           "pools that do not fit even with the smallest circles are counted instead: \(String(describing: note))")
+    var longQueue: [Int64: ActiveJob] = [1: active("lint", labels: ["ubuntu-latest"], group: gitHubHostedGroup)]
+    for id in 2...1500 {
+        longQueue[Int64(id)] = active("matrix \(id)", labels: mac, since: Double(id))
+    }
+    let long = BoardLayout(board: RunnerBoard(jobs: longQueue, runners: runners, outcomes: [:]), size: size)
+    let longHeap = long.heaps.first { !$0.jobs.isEmpty }
+    expect(long.pools.count == 3 && long.tokens[1] != nil && longHeap?.jobs.count == 1499
+           && long.texts.contains { $0.string == "1499 queued · 0 running" }
+           && longHeap.map { heap in long.boxes.contains { $0.maxY >= heap.frame.maxY } } == true,
+           "one long queue is a heap no taller than its runners, crowding out nothing")
+    let queuedHere = BoardLayout(board: board, size: size)
+    let heading = queuedHere.texts.first { $0.string == "2 queued · 1 running" }
+    let title = queuedHere.texts.first { $0.string == "ci-mac" }
+    let firstHeap = queuedHere.heaps.first?.frame
+    expect(heading != nil && title != nil && firstHeap != nil && title!.frame.minX <= firstHeap!.minX
+           && firstHeap!.minY == queuedHere.pools.first?.minY && firstHeap!.minY < title!.frame.minY
+           && heading!.frame.maxY > firstHeap!.minY,
+           "a pool's name is at its top left, over its queue, which reaches up to the pool's top, and how many "
+           + "wait and run at its top right")
+    // Under a title bar, the board's heading goes in it, past its close
+    // button, and the pools start just below it.
+    let underTitleBar = BoardLayout(board: board, size: size, titleBar: TitleBar(height: 24, middle: 13))
+    let summaryHere = queuedHere.texts.first { $0.style == .heading }
+    let summaryThere = underTitleBar.texts.first { $0.style == .heading }
+    expect(summaryHere.map { $0.frame.minX == BoardLayout.inset && $0.frame.minY > 10 } == true
+           && summaryThere.map { abs($0.frame.midY - 13) < 0.01 && $0.frame.minX >= BoardLayout.besideClose } == true
+           && (underTitleBar.pools.first?.minY ?? 0) >= 24
+           && (underTitleBar.pools.first?.minY ?? 0) < (queuedHere.pools.first?.minY ?? 0),
+           "under a title bar, the board's heading goes in it, past and level with its close button, and its pools "
+           + "move up to it")
+    expect(BoardLayout(board: RunnerBoard(), size: size).texts.map(\.string).contains(
+               "Nothing is queued or running, and no runners are known."),
+           "an empty board says why it is empty")
+    expect(roomy.token(at: CGPoint(x: roomy.tokens[1]!.midX, y: roomy.tokens[1]!.midY)) == 1
+           && roomy.slot(at: CGPoint(x: roomy.slots[0].frame.midX, y: roomy.slots[0].frame.midY))?.id
+               == "octo/ci-mac-01-1"
+           && roomy.token(at: .zero) == nil,
+           "what is pointed at is found")
+
+    // Thousands of balls heap as a few do: in their space, bearing their own
+    // weight without being squeezed into each other, and coming to rest.
+    let crowdSize = CGSize(width: 173, height: 68)
+    let crowdD = Heap.diameter(for: 3000, in: crowdSize, largest: 16)
+    let crowdAcross = Int(crowdSize.width / (crowdD * 1.1))
+    let crowd = (0..<3000).map { (i: Int) -> Heap.Ball in
+        let x: CGFloat = crowdD / 2 + CGFloat(i % crowdAcross) * crowdD * 1.1
+        let y: CGFloat = -crowdD - CGFloat(i / crowdAcross) * crowdD * 1.2
+        return Heap.Ball(id: Int64(i), position: CGPoint(x: x, y: y))
+    }
+    let crowdPaths = Heap.paths(of: crowd, in: crowdSize, diameter: crowdD)
+    let crowdRests = crowdPaths.values.map { $0[$0.count - 1] }
+    let crowdInside = crowdRests.allSatisfy {
+        $0.x >= crowdD / 2 - 0.01 && $0.x <= crowdSize.width - crowdD / 2 + 0.01 && $0.y >= crowdD / 2 - 0.5
+            && $0.y <= crowdSize.height - crowdD / 2 + 0.01
+    }
+    var crowdGrid: [Int: [CGPoint]] = [:]
+    for rest in crowdRests {
+        crowdGrid[Int(rest.x / crowdD) * 1000 + Int(rest.y / crowdD), default: []].append(rest)
+    }
+    let crowdSquashed = crowdRests.contains { rest in
+        (-1...1).contains { dx in
+            (-1...1).contains { dy in
+                (crowdGrid[(Int(rest.x / crowdD) + dx) * 1000 + Int(rest.y / crowdD) + dy] ?? []).contains {
+                    $0 != rest && hypot($0.x - rest.x, $0.y - rest.y) < crowdD * 0.85
+                }
+            }
+        }
+    }
+    let crowdLongest = crowdPaths.values.map(\.count).max() ?? 0
+    expect(crowdRests.count == 3000 && crowdD < 2 && crowdInside && !crowdSquashed
+           && crowdLongest < Int(Heap.longest * Heap.rate),
+           "three thousand balls, smaller than two points, heap in their space, none squeezed into another, and "
+           + "come to rest: \(crowdD), \(crowdLongest) samples")
+
+    // Balls that grow, as when most jobs leave a queue at once, part from
+    // each other without being flung out of their space.
+    let growSize = CGSize(width: 173, height: 68)
+    let smallBalls = Heap.diameter(for: 200, in: growSize, largest: 16)
+    let pouredBalls = (0..<200).map { (i: Int) -> Heap.Ball in
+        let x: CGFloat = smallBalls / 2 + CGFloat((i * 37) % 160)
+        let y: CGFloat = -smallBalls * 1.2 * CGFloat(i / 6 + 1)
+        return Heap.Ball(id: Int64(i), position: CGPoint(x: x, y: y))
+    }
+    let restedBalls = Heap.paths(of: pouredBalls, in: growSize, diameter: smallBalls)
+        .map { Heap.Ball(id: $0.key, position: $0.value[$0.value.count - 1]) }.sorted { $0.id < $1.id }
+    let grownSize = Heap.diameter(for: 60, in: growSize, largest: 16)
+    // Whichever sixty stay: those at the bottom, those at the top, or some of
+    // each.
+    let highest = [Array(restedBalls.prefix(60)), Array(restedBalls.suffix(60)),
+                   restedBalls.enumerated().filter { $0.offset % 3 == 0 }.prefix(60).map(\.element)].map { stay in
+        Heap.paths(of: stay, in: growSize, diameter: grownSize, grownFrom: smallBalls).values
+            .flatMap { $0 }.map { (point: CGPoint) -> CGFloat in point.y }.min() ?? 0
+    }
+    expect(highest.allSatisfy { $0 > 0 } && grownSize > smallBalls,
+           "balls that grow into each other part without flying up out of their heap: \(highest)")
+
+    expect(runTitle(repository: "loom", workflow: "Tests", pullRequest: 1234) == "loom PR #1234 · Tests"
+           && runTitle(repository: "labs", workflow: "CI", pullRequest: nil) == "labs · CI",
+           "a run for a pull request is named by its repository, then the pull request, then its workflow")
+
+    // Balls moving on their own are moved by forces alone: none changes speed
+    // all at once, so each starts off moving as it was.
+    func smooth(_ path: [CGPoint], from state: Flight.State) -> Bool {
+        path.count > 1 && abs(path[1].x - path[0].x - state.velocity.dx / Flight.rate) < 2
+            && abs(path[1].y - path[0].y - state.velocity.dy / Flight.rate) < 2
+    }
+    let falling = Flight.State(position: CGPoint(x: 100, y: 100), velocity: CGVector(dx: 0, dy: 400))
+    let steered = Flight.steer(from: falling, to: CGPoint(x: 400, y: 40), supported: false)
+    let resting = Flight.steer(from: Flight.State(position: CGPoint(x: 100, y: 100)), to: CGPoint(x: 400, y: 40),
+                               supported: true)
+    expect(smooth(steered, from: falling) && (steered.map(\.y).max() ?? 0) > 110 && steered.last == CGPoint(x: 400, y: 40)
+           && steered.allSatisfy { $0.x <= 400.5 } && steered.count < Int(1.5 * Flight.rate)
+           && (resting.map(\.y).max() ?? 0) <= 100.5 && resting.last == CGPoint(x: 400, y: 40),
+           "a falling ball drawn to a runner goes on falling a moment, then curves round to it and stops there, "
+           + "and one at rest goes straight up to it")
+
+    // A job that fails pauses, slowing to a stop, then is thrown against the
+    // right side, bounces off it onto the line along the bottom, bounces
+    // there, slides left at a steady speed, and falls past the line's end.
+    let floorBoard = Flight.Board(width: 780, floor: 500, line: 18...762)
+    let pause = 0.45, paused = Int(pause * Flight.rate)
+    let thrown = Flight.State(position: CGPoint(x: 100, y: 300), velocity: CGVector(dx: 120, dy: -60))
+    let tumbling = Flight.leaving(from: thrown, diameter: 12, outcome: .failed, pause: pause, board: floorBoard)
+    let held = tumbling[paused]
+    let atWall = tumbling.indices.max { tumbling[$0].x < tumbling[$1].x } ?? tumbling.count
+    // Where a path comes down on the line and goes back up again.
+    func bounces(_ path: [CGPoint]) -> [Int] {
+        path.indices.dropFirst().dropLast().filter { k in
+            path[k].y > 490 && path[k].x >= 18 && path[k].y >= path[k - 1].y && path[k].y > path[k + 1].y
+        }
+    }
+    let onLine = bounces(tumbling)
+    let landed = onLine.first ?? 0
+    let overLine = tumbling.indices.filter { tumbling[$0].x >= 18 }
+    let across = (landed..<(overLine.last ?? landed)).map { tumbling[$0 + 1].x - tumbling[$0].x }
+    let stopped = hypot(held.x - tumbling[paused - 1].x, held.y - tumbling[paused - 1].y) < 0.1
+        && hypot(held.x - 100, held.y - 300) < 20
+    let bounced = tumbling[atWall].x > 765 && atWall < landed && onLine.count >= 2
+        && tumbling.allSatisfy { (point: CGPoint) -> Bool in point.x <= 774 && (point.y <= 494 || point.x < 18) }
+    let steady = Set(across.map { (step: CGFloat) -> CGFloat in (step * 100).rounded() }).count == 1
+        && (across.first ?? 0) < 0 && (tumbling.last?.x ?? 0) < 18
+    expect(smooth(tumbling, from: thrown) && stopped && bounced && steady,
+           "a failed job's ball slows to a stop, is thrown up and right, bounces off the right side before it "
+           + "lands, and bounces along the line, going left at a steady speed, off its end: \(onLine.count) bounces")
+    let later = Flight.leaving(from: Flight.State(position: CGPoint(x: 600, y: 300), velocity: CGVector(dx: 120, dy: -60)),
+                               diameter: 12, outcome: .failed, pause: pause, board: floorBoard)
+    expect(later.contains { $0.x < 18 && $0.y > 494 },
+           "past the line's left end, nothing holds the ball up, and it falls")
+    let nearWall = Flight.leaving(from: Flight.State(position: CGPoint(x: 740, y: 480)), diameter: 12, outcome: .failed,
+                                  pause: pause, board: floorBoard)
+    let nearest = nearWall.indices.max { nearWall[$0].x < nearWall[$1].x } ?? nearWall.count
+    expect(nearWall[nearest].x > 765 && nearest < (bounces(nearWall).first ?? 0) && (nearWall.last?.x ?? 0) < 18,
+           "even from near the right side and the bottom, it reaches the side before it lands")
+    let wide = Flight.leaving(from: Flight.State(position: CGPoint(x: 1560, y: 480)), diameter: 12, outcome: .failed,
+                              pause: pause, board: Flight.Board(width: 1600, floor: 500, line: 18...1582))
+    expect((wide.last?.x ?? 1600) < 18, "however wide the board, it goes all the way off before its path ends")
+    let passing = Flight.leaving(from: thrown, diameter: 12, outcome: .passed, pause: pause, board: floorBoard)
+    let leftAt = passing.last ?? .zero
+    expect(smooth(passing, from: thrown) && leftAt.x > 792 && abs(leftAt.y - held.y - 60) < 25
+           && (passing.map { (point: CGPoint) -> CGFloat in point.y }.min() ?? 0) < held.y - 10,
+           "a passed job's ball is thrown up, over and off the right side, a little lower than it was: \(leftAt)")
+    let smoke = Flight.leaving(from: thrown, diameter: 12, outcome: .neither, pause: pause, board: floorBoard)
+    let rising = Array(smoke[paused...])
+    let climbs = zip(rising, rising.dropFirst()).map { $0.y - $1.y }
+    expect(smooth(smoke, from: thrown) && (smoke.last?.y ?? 0) < -24
+           && rising.allSatisfy { abs($0.x - (rising.first?.x ?? 0)) < 3 }
+           && (climbs.dropFirst().first ?? 0) < (climbs.dropFirst(20).first ?? 0),
+           "a cancelled job's ball rises straight up, ever faster, off the top")
+
+    // However many balls, and from whatever size they shrink, they are never
+    // smaller than a point; and two balls in one spot part, however small.
+    expect(Heap.diameter(for: 1_000_000, in: CGSize(width: 50, height: 20), largest: 13.7) == 1
+           && Heap.diameter(for: 3, in: CGSize(width: 50, height: 20), largest: 13.7) == 13.7
+           && Heap.diameter(for: 3, in: CGSize(width: 50, height: 20), largest: 0) == 1,
+           "balls shrink to fit, to a point across and no smaller")
+    let together = Heap.paths(of: [Heap.Ball(id: 1, position: CGPoint(x: 10, y: 19.5)),
+                                   Heap.Ball(id: 2, position: CGPoint(x: 10, y: 19.5))],
+                              in: CGSize(width: 50, height: 20), diameter: 1)
+    let apart = together[1].flatMap { a in together[2].map { b in hypot(a[a.count - 1].x - b[b.count - 1].x,
+                                                                         a[a.count - 1].y - b[b.count - 1].y) } } ?? 0
+    expect(apart > 0.85, "two balls a point across in one spot part: \(apart)")
+
+    // Balls dropped far off to the left land on the slope that leads up and
+    // away from the box's top left corner, and roll down it into the box,
+    // whose right side goes on above it; one dropped over the box never
+    // goes left of it.
+    let box = CGSize(width: 173, height: 68)
+    let offLeft = (0..<6).map { (i: Int) -> Heap.Ball in
+        Heap.Ball(id: Int64(i), position: CGPoint(x: -346 + CGFloat(i) * 12, y: -600))
+    }
+    let rolled = Heap.paths(of: offLeft, in: box, diameter: 10)
+    let onSlope = rolled.values.allSatisfy { path in
+        path.contains { $0.x < -20 && abs(($0.x - $0.y) / 2.squareRoot() - 5) < 0.5 }
+    }
+    let landedIn = rolled.values.allSatisfy { path in
+        let rest = path[path.count - 1]
+        return rest.x >= 5 - 0.01 && rest.x <= 168.01 && abs(rest.y - 63) < 12
+    }
+    let overBox = Heap.paths(of: [Heap.Ball(id: 9, position: CGPoint(x: 160, y: -200), velocity: CGVector(dx: 400, dy: 0))],
+                             in: box, diameter: 10)[9] ?? []
+    let wallward = Heap.paths(of: [Heap.Ball(id: 3, position: CGPoint(x: 16, y: 21), velocity: CGVector(dx: -540, dy: 0))],
+                              in: box, diameter: 4)[3] ?? []
+    expect(wallward.allSatisfy { $0.y < 0 || $0.x >= 2 - 0.01 } && (wallward.last?.x ?? 0) >= 2 - 0.01,
+           "a ball thrown hard at the box's left side stays in the box")
+    expect(onSlope && landedIn && overBox.allSatisfy { $0.x >= 0 && $0.x <= 168.01 },
+           "balls dropped far to the left roll down the slope into the box, and one over the box stays over it")
+
+    // A heap that, poured, lies less flat than it might, with balls left
+    // sticking out of the top, is made of smaller balls, that all fit.
+    let shallow = CGSize(width: 140, height: 18)
+    let lumpy = (0..<10).map { (i: Int) -> Heap.Ball in
+        let x: CGFloat = 7 + CGFloat(i % 3) * 15.4, dx: CGFloat = 90 + 14 * CGFloat(i)
+        return Heap.Ball(id: Int64(i), position: CGPoint(x: x, y: -14 - CGFloat(i / 3) * 18),
+                         velocity: CGVector(dx: dx, dy: 150))
+    }
+    func rests(_ paths: [Int64: [CGPoint]]) -> [CGFloat] { paths.values.map { $0[$0.count - 1].y } }
+    let tooBig = rests(Heap.paths(of: lumpy, in: shallow, diameter: 14)).min() ?? 0
+    let fitted = Heap.fit(lumpy, in: shallow, diameter: 14)
+    let fittedTop = (rests(fitted.paths).min() ?? 0) - fitted.diameter / 2
+    let flat = Heap.fit(Array(lumpy.prefix(3)), in: shallow, diameter: 14)
+    expect(tooBig < 6.5 && fitted.diameter < 14 && fittedTop >= -0.5 && flat.diameter == 14,
+           "a poured heap with balls sticking out of the top is made of smaller balls, which fit, and one that "
+           + "fits keeps its size: \(fitted.diameter)")
+
+    // Runs on the board at once have colours of their own, which they keep.
+    var palette = RunPalette()
+    let many = (0..<runColours.count).map { RunnerBoard.Run(id: "\($0 + 1000)", jobs: 1) }
+    palette.update(for: many)
+    expect(Set(palette.colours.values).count == runColours.count,
+           "as many runs as there are colours each have one of their own, whatever their hashes")
+    let kept = palette.colours[many[3].id]
+    palette.update(for: Array(many[3...]) + [RunnerBoard.Run(id: "new", jobs: 9)])
+    expect(palette.colours[many[3].id] == kept && palette.colours[many[0].id] == nil
+           && Set(palette.colours.values).count == palette.colours.count,
+           "a run keeps its colour while it is on the board, and one that comes on takes a free one")
+
+    // The view puts a layer for each job, moves a job that starts running
+    // along an arc, and takes off those that leave.
+    _ = NSApplication.shared
+    let view = RunnerBoardView()
+    view.frame = NSRect(origin: .zero, size: size)
+    view.show(board, animated: false)
+    expect(view.tokenCount == jobs.count && view.tokenLayer(2)?.animationKeys() ?? [] == [],
+           "the board has a layer for each job, still when not animated")
+    var started = jobs
+    started[2] = active("mac queued late", labels: mac, runner: "ci-mac-01-1", group: "cf-mac", since: 30)
+    started[1] = nil
+    view.show(RunnerBoard(jobs: started, runners: runners, outcomes: [1: .passed]), animated: true)
+    let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    expect(view.tokenCount == jobs.count - 1, "a job that finishes leaves the board")
+    expect(reduced || view.tokenLayer(2)?.animation(forKey: "position") is CAKeyframeAnimation,
+           "a job that starts running moves from its queue to its runner")
+    expect(view.tokenLayer(3)?.backgroundColor != nil && view.tokenLayer(3)?.borderWidth == 0,
+           "a queued job is a circle, filled as a running one is")
+    view.show(RunnerBoard(jobs: started, runners: runners, outcomes: [1: .passed]), animated: true)
+    expect(reduced || view.tokenLayer(2)?.animation(forKey: "position") is CAKeyframeAnimation,
+           "a job on its way to its runner keeps going when the board is shown again")
+    var shifted = RunnerBoard(jobs: started, runners: runners, outcomes: [1: .passed])
+    shifted.problems = ["Not connected to the relay: refused"]
+    view.show(shifted, animated: true)
+    let slide = (view.tokenLayer(2)?.animation(forKey: "position") as? CAKeyframeAnimation)?.values?
+        .compactMap { $0 as? CGPoint } ?? []
+    expect(reduced || (slide.count > 2 && slide.last == view.tokenLayer(2)?.position && slide.first != slide.last),
+           "a job whose place moves goes there from where it is")
+    view.show(RunnerBoard(jobs: started, runners: runners, outcomes: [1: .passed]), animated: false)
+
+    // A job that ends frees its place at once, and flies off the board in
+    // its run's colour, with a mark of how it ended.
+    let spotJobs: [Int64: ActiveJob] = [
+        41: active("a", labels: spot, runner: "spot-x", group: "cf-spot", since: 1),
+        42: active("b", labels: spot, runner: "spot-y", group: "cf-spot", since: 2),
+        43: active("c", labels: spot, runner: "spot-z", group: "cf-spot", since: 3),
+        44: active("lone", labels: ["ubuntu-latest"], group: gitHubHostedGroup),
+    ]
+    let leaving = RunnerBoardView()
+    leaving.frame = NSRect(origin: .zero, size: size)
+    leaving.show(RunnerBoard(jobs: spotJobs, runners: [], outcomes: [:]), animated: false)
+    let before = leaving.placement.tokens
+    let firstLayer = leaving.tokenLayer(41)
+    let failedLayer = leaving.tokenLayer(44)
+    expect(firstLayer.map { $0.cornerRadius == $0.bounds.width / 2 } == true, "jobs are circles")
+    var ended = spotJobs
+    ended[41] = nil
+    ended[44] = nil
+    leaving.show(RunnerBoard(jobs: ended, runners: [], outcomes: [41: .passed, 44: .failed]), animated: true)
+    if !reduced {
+        expect(leaving.placement.tokens[41] == nil && leaving.placement.tokens[44] == nil
+               && leaving.placement.tokens[42] == before[42] && leaving.placement.tokens[43] == before[43]
+               && leaving.placement.pools.count == 2,
+               "a job that ends frees its place at once, nothing else moves, and its box stays")
+        expect(leaving.placement.texts.contains { $0.string == "0 queued · 2 running" }
+               && firstLayer?.superlayer != nil && firstLayer?.animation(forKey: "leave") != nil
+               && (firstLayer?.sublayers?.first as? CATextLayer).map { "\($0.string ?? "")".contains("✓") } == true,
+               "a job that ends is not counted, and leaves the board with a mark of how it ended")
+        func flight(_ layer: CALayer?) -> CAKeyframeAnimation? {
+            (layer?.animation(forKey: "leave") as? CAAnimationGroup)?.animations?
+                .first { ($0 as? CAKeyframeAnimation)?.keyPath == "position" } as? CAKeyframeAnimation
+        }
+        let tumbled = flight(failedLayer)?.values?.compactMap { $0 as? CGPoint } ?? []
+        let onLine = size.height - (failedLayer?.bounds.width ?? 0) / 2
+        let landedOnLine = tumbled.contains { $0.y > onLine - 3 && $0.x > BoardLayout.inset }
+            && tumbled.allSatisfy { $0.x < BoardLayout.inset || $0.y <= onLine + 0.01 }
+        let thrownOff = flight(firstLayer)?.values?.compactMap { $0 as? CGPoint } ?? []
+        // Paths worked out ahead of time play at their own pace, eased at
+        // neither end.
+        func linear(_ animation: CAAnimation?) -> Bool {
+            guard let timing = animation?.timingFunction else { return false }
+            var first = [Float](repeating: 0, count: 2), second = [Float](repeating: 0, count: 2)
+            timing.getControlPoint(at: 1, values: &first)
+            timing.getControlPoint(at: 2, values: &second)
+            return first == [0, 0] && second == [1, 1]
+        }
+        expect(linear(failedLayer?.animation(forKey: "leave")) && linear(firstLayer?.animation(forKey: "leave")),
+               "a job leaves along its path at the path's own pace, slowing at neither end")
+        expect(tumbled.count > 30 && landedOnLine && (tumbled.last?.x ?? 0) < BoardLayout.inset
+               && (thrownOff.last?.x ?? 0) > size.width,
+               "a job that fails lands on the line along the bottom and goes off past its left end, and one that "
+               + "passes is thrown off")
+        let smoky = RunnerBoardView()
+        smoky.frame = NSRect(origin: .zero, size: size)
+        smoky.show(RunnerBoard(jobs: spotJobs, runners: [], outcomes: [:]), animated: false)
+        let smokeLayer = smoky.tokenLayer(42)
+        var cancelled = spotJobs
+        cancelled[42] = nil
+        smoky.show(RunnerBoard(jobs: cancelled, runners: [], outcomes: [42: .neither]), animated: true)
+        let puff = flight(smokeLayer)?.values?.compactMap { $0 as? CGPoint } ?? []
+        let fades = ((smokeLayer?.animation(forKey: "leave") as? CAAnimationGroup)?.animations ?? [])
+            .compactMap { $0 as? CAKeyframeAnimation }.first { $0.keyPath == "opacity" }
+        expect(puff.count > 2 && abs((puff.first?.x ?? 0) - (puff.last?.x ?? 1)) < 1 && (puff.last?.y ?? 0) < 0
+               && (fades?.values?.last as? Int) == 0
+               && (smokeLayer?.animation(forKey: "leave") as? CAAnimationGroup)?.animations?.count == 3
+               && ((leaving.tokenLayer(41) ?? firstLayer)?.animation(forKey: "leave") as? CAAnimationGroup)?
+                   .animations?.count == 2,
+               "a job that was cancelled floats straight up off the board, fading, and one that passed does not fade")
+        var swapped = ended
+        swapped[47] = active("next", labels: spot, runner: "spot-u", group: "cf-spot", since: 9)
+        let swapping = RunnerBoardView()
+        swapping.frame = NSRect(origin: .zero, size: size)
+        swapping.show(RunnerBoard(jobs: spotJobs, runners: [], outcomes: [:]), animated: false)
+        swapping.show(RunnerBoard(jobs: swapped, runners: [], outcomes: [41: .passed, 44: .failed]), animated: true)
+        var crowd = spotJobs
+        crowd[41] = nil
+        for id in 0..<(runColours.count - 1) {
+            var job = active("new \(id)", labels: spot, runner: "spot-n\(id)", group: "cf-spot", since: 20)
+            job.order = RunOrder(run: Int64(500 + id), attempt: 1)
+            crowd[Int64(500 + id)] = job
+        }
+        let colours = RunnerBoardView()
+        colours.frame = NSRect(origin: .zero, size: size)
+        var lone = spotJobs[41]!
+        lone.order = RunOrder(run: 777, attempt: 1)
+        var startWith = spotJobs
+        startWith[41] = lone
+        colours.show(RunnerBoard(jobs: startWith, runners: [], outcomes: [:]), animated: false)
+        let leavingColour = colours.palette.colours["777"]
+        colours.show(RunnerBoard(jobs: crowd, runners: [], outcomes: [41: .passed]), animated: true)
+        expect(leavingColour != nil && !(500..<(500 + runColours.count - 1)).contains { colours.palette.colours["\($0)"] == leavingColour },
+               "no run takes the colour of a run whose last job is on its way off the board")
+        expect(swapping.placement.tokens[47] == before[41],
+               "a job that starts as another ends takes its place at once, while the other is still on its way off")
+        // A queue is a heap of balls, as small as lets them all fit, which
+        // pours in from above and settles as jobs leave it.
+        var longWait: [Int64: ActiveJob] = [:]
+        for id in 100..<200 {
+            longWait[Int64(id)] = active("wait \(id)", labels: ["ubuntu-latest"], since: Double(id))
+        }
+        let heaped = RunnerBoardView()
+        heaped.frame = NSRect(origin: .zero, size: size)
+        heaped.show(RunnerBoard(jobs: longWait, runners: [], outcomes: [:]), animated: false)
+        func settledInside(_ view: RunnerBoardView, _ ids: [Int64]) -> Bool {
+            guard let heap = view.placement.heaps.first(where: { !$0.jobs.isEmpty }) else { return false }
+            let frames = ids.compactMap { view.placement.tokens[$0] }
+            let d = frames.first?.width ?? 0
+            let overlapping = frames.enumerated().contains { i, a in
+                frames[(i + 1)...].contains { b in hypot(a.midX - b.midX, a.midY - b.midY) < d * 0.85 }
+            }
+            return frames.count == ids.count && d < view.placement.size && !overlapping
+                && frames.allSatisfy { heap.frame.insetBy(dx: -1, dy: -1).contains($0) }
+        }
+        expect(settledInside(heaped, Array(longWait.keys)) && heaped.tokenLayer(100)?.animation(forKey: "position") == nil,
+               "every queued job is a ball in its queue's heap, smaller to fit them all, barely overlapping, still "
+               + "when the board is shown afresh")
+        // A queue's balls are clipped to its pool's rounded box, where they
+        // are on the board.
+        let queuedBall = heaped.tokenLayer(100)
+        let clip = queuedBall?.superlayer
+        let queuePool = heaped.placement.pools.first { box in
+            heaped.placement.heaps.first { !$0.jobs.isEmpty }.map { box.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) } == true
+        }
+        expect(clip?.masksToBounds == true && clip?.cornerRadius == 10 && queuePool.map { clip?.frame == $0 } == true
+               && queuedBall.map { ball in clip?.convert(ball.position, to: clip?.superlayer) == ball.position } == true,
+               "a queue's balls are clipped to its pool's rounded box, and are where they are on the board")
+        var poured = longWait
+        poured[300] = active("new", labels: ["ubuntu-latest"], since: 300)
+        heaped.show(RunnerBoard(jobs: poured, runners: [], outcomes: [:]), animated: true)
+        let pour = heaped.tokenLayer(300)?.animation(forKey: "position") as? CAKeyframeAnimation
+        let heapTop = heaped.placement.heaps.first { !$0.jobs.isEmpty }!.frame.minY
+        let pourPoints = pour?.values?.compactMap { $0 as? CGPoint } ?? []
+        let entry = Int(((heaped.tokenLayer(300)?.animation(forKey: "wait") as? CABasicAnimation)?.duration ?? 0)
+                        * Heap.rate)
+        expect(reduced || (entry > 0 && pourPoints.count > entry + 1 && (pourPoints.first?.y ?? 0) < heapTop - 30
+                           && pourPoints[entry].y - pourPoints[entry - 1].y > 4 && pourPoints[entry].x >= pourPoints[entry - 1].x),
+               "a job just queued falls, out of sight, from well above its heap, and comes in moving fast, down and "
+               + "a little to the right, as if down a chute")
+        expect(reduced || ((pour?.values?.first as? CGPoint).map { $0.y < heapTop } == true
+                           && settledInside(heaped, Array(poured.keys))),
+               "a job just queued pours into the heap from above, and comes to rest in it")
+        var started = poured
+        for id in 100..<130 {
+            started[Int64(id)] = active("wait \(id)", labels: ["ubuntu-latest"], group: gitHubHostedGroup, since: 400)
+        }
+        heaped.show(RunnerBoard(jobs: started, runners: [], outcomes: [:]), animated: true)
+        let stillQueued = started.filter { !$0.value.running }.map(\.key)
+        expect(reduced || (settledInside(heaped, stillQueued)
+                           && heaped.tokenLayer(150)?.animation(forKey: "position") is CAKeyframeAnimation),
+               "when jobs leave the heap, the rest fall into the holes they leave")
+        let restingBall = heaped.tokenLayer(150)
+        heaped.show(RunnerBoard(jobs: started, runners: [], outcomes: [:]), animated: true)
+        expect(heaped.tokenLayer(150) === restingBall && settledInside(heaped, stillQueued),
+               "a heap that has not changed is not worked out again, and its balls go on as they were")
+        // Many jobs queued at once stream in, one after another, each out of
+        // sight until its turn; those queued while others wait follow
+        // them; and one that starts while waiting comes into sight as it goes.
+        let streaming = RunnerBoardView()
+        streaming.frame = NSRect(origin: .zero, size: size)
+        // As if no time passed between one show and the next, however long
+        // working out the heaps takes.
+        streaming.clock = { 1000 }
+        streaming.show(RunnerBoard(jobs: [:], runners: [], outcomes: [:]), animated: false)
+        var flood: [Int64: ActiveJob] = [:]
+        for id in 600..<640 {
+            flood[Int64(id)] = active("flood \(id)", labels: ["ubuntu-latest"], since: Double(id))
+        }
+        streaming.show(RunnerBoard(jobs: flood, runners: [], outcomes: [:]), animated: true)
+        func waits(_ id: Int64) -> Double {
+            (streaming.tokenLayer(id)?.animation(forKey: "wait") as? CABasicAnimation)?.duration ?? 0
+        }
+        let floodWaits = (600..<640).map { waits(Int64($0)) }
+        let longestWait = floodWaits.max() ?? 0
+        let oldestFirst = (floodWaits.first ?? 0) < (floodWaits.last ?? 0)
+        expect(reduced || (floodWaits.allSatisfy { $0 > 0 } && oldestFirst && longestWait - (floodWaits.min() ?? 0) > 0.05
+                           && (streaming.tokenLayer(639)?.animation(forKey: "wait") as? CABasicAnimation)?.toValue as? Int == 0),
+               "many jobs queued at once come in one after another, each out of sight until its turn: \(floodWaits)")
+        var more = flood
+        more[700] = active("late", labels: ["ubuntu-latest"], since: 700)
+        streaming.show(RunnerBoard(jobs: more, runners: [], outcomes: [:]), animated: true)
+        func starts(_ id: Int64) -> CGPoint? {
+            (streaming.tokenLayer(id)?.animation(forKey: "position") as? CAKeyframeAnimation)?.values?.first as? CGPoint
+        }
+        let highestBefore = (600..<640).compactMap { starts(Int64($0))?.y }.min() ?? 0
+        let lateHeap = streaming.placement.heaps.first { !$0.jobs.isEmpty }?.frame ?? .zero
+        let lateRest = streaming.placement.tokens[700] ?? .zero
+        expect(reduced || (waits(700) > 0 && (starts(700)?.y ?? 0) < highestBefore
+                           && lateHeap.insetBy(dx: -1, dy: -1).contains(lateRest)),
+               "a job queued while others are on their way in starts out of sight above them, and comes in too")
+        let waiter = (600..<640).map { Int64($0) }.max { waits($0) < waits($1) } ?? 639
+        let streamTop = streaming.placement.heaps.first { !$0.jobs.isEmpty }?.frame.minY ?? 0
+        more[waiter] = active("flood \(waiter)", labels: ["ubuntu-latest"], group: gitHubHostedGroup, since: 800)
+        streaming.show(RunnerBoard(jobs: more, runners: [], outcomes: [:]), animated: true)
+        let emerged = ((streaming.tokenLayer(waiter)?.animation(forKey: "position") as? CAKeyframeAnimation)?.values?
+            .first as? CGPoint)?.y ?? 0
+        expect(reduced || (streaming.tokenLayer(waiter) != nil && waits(waiter) == 0 && emerged >= streamTop - 0.01),
+               "a job that starts while waiting its turn comes into sight out of its heap's top as it goes to its "
+               + "runner: \(emerged) \(streamTop)")
+
+        // A job whose ball is falling into its queue when it starts goes on
+        // falling a moment, then curves round to its runner.
+        var now: CFTimeInterval = 2000
+        let dropping = RunnerBoardView()
+        dropping.frame = NSRect(origin: .zero, size: size)
+        dropping.clock = { now }
+        dropping.show(RunnerBoard(jobs: [:], runners: [], outcomes: [:]), animated: false)
+        var one = [Int64(900): active("drop", labels: ["ubuntu-latest"], since: 900)]
+        dropping.show(RunnerBoard(jobs: one, runners: [], outcomes: [:]), animated: true)
+        now += 0.25
+        one[900] = active("drop", labels: ["ubuntu-latest"], group: gitHubHostedGroup, since: 901)
+        dropping.show(RunnerBoard(jobs: one, runners: [], outcomes: [:]), animated: true)
+        let steering = dropping.tokenLayer(900)?.animation(forKey: "position") as? CAKeyframeAnimation
+        let curve = steering?.values?.compactMap { $0 as? CGPoint } ?? []
+        let eased = steering?.timingFunction.map { timing -> Bool in
+            var point = [Float](repeating: 0, count: 2)
+            timing.getControlPoint(at: 1, values: &point)
+            return point != [0, 0]
+        } ?? true
+        expect(reduced || (curve.count > 3 && curve[1].y - curve[0].y > 3 && curve.last == dropping.tokenLayer(900)?.position
+                           && !eased && dropping.tokenLayer(900)?.superlayer?.masksToBounds == false),
+               "a job that starts while its ball is falling goes on falling, then goes to its runner")
+
+        let afresh = RunnerBoardView()
+        afresh.frame = NSRect(origin: .zero, size: size)
+        afresh.show(RunnerBoard(jobs: longWait, runners: [], outcomes: [:]), animated: false)
+        let restingAt = afresh.placement.tokens[120]
+        var oneMore = longWait
+        oneMore[101] = active("wait 101", labels: ["ubuntu-latest"], group: gitHubHostedGroup, since: 500)
+        afresh.show(RunnerBoard(jobs: oneMore, runners: [], outcomes: [:]), animated: true)
+        let firstStep = (afresh.tokenLayer(120)?.animation(forKey: "position") as? CAKeyframeAnimation)?.values?.first as? CGPoint
+        expect(restingAt != nil && firstStep.map { hypot($0.x - restingAt!.midX, $0.y - restingAt!.midY) < 0.5 } ?? true,
+               "a ball resting since the board was shown afresh moves on from where it rests")
+        // A problem line above moves every heap down; a heap that moves keeps
+        // its balls in it, rather than flinging them off.
+        var moved = RunnerBoard(jobs: oneMore, runners: [], outcomes: [:])
+        moved.problems = ["Not connected to the relay: refused", "And another thing"]
+        afresh.show(moved, animated: true)
+        let ids = oneMore.filter { !$0.value.running }.map(\.key)
+        expect(settledInside(afresh, ids), "a heap that moves keeps every ball in it")
+        afresh.show(RunnerBoard(jobs: oneMore, runners: [], outcomes: [:]), animated: true)
+        expect(settledInside(afresh, ids), "and so does one that moves back up")
+
+        // Boxes sharing a pool are as wide as a few places, so that one
+        // filling up does not move another.
+        let shared: [Int64: ActiveJob] = [
+            71: active("a", labels: ["alpha"], runner: "GitHub Actions 1", group: gitHubHostedGroup),
+            72: active("b", labels: ["beta"], runner: "GitHub Actions 2", group: gitHubHostedGroup),
+        ]
+        let sharing = RunnerBoardView()
+        sharing.frame = NSRect(origin: .zero, size: size)
+        sharing.show(RunnerBoard(jobs: shared, runners: [], outcomes: [:]), animated: false)
+        let beta = sharing.placement.tokens[72]
+        var fuller = shared
+        for id in 73..<79 {
+            fuller[Int64(id)] = active("a\(id)", labels: ["alpha"], runner: "GitHub Actions \(id)", group: gitHubHostedGroup)
+        }
+        sharing.show(RunnerBoard(jobs: fuller, runners: [], outcomes: [:]), animated: true)
+        expect(beta != nil && sharing.placement.tokens[72] == beta,
+               "a box filling up does not move the jobs of the box beside it")
+        var three = fuller
+        three[79] = active("g", labels: ["gamma"], runner: "GitHub Actions 79", group: gitHubHostedGroup)
+        sharing.show(RunnerBoard(jobs: three, runners: [], outcomes: [:]), animated: true)
+        let boxFrames = Array(sharing.placement.boxes.suffix(3))
+        expect(boxFrames[0].minY == boxFrames[1].minY && boxFrames[1].minX > boxFrames[0].maxX
+               && boxFrames[2].minX == boxFrames[0].minX && boxFrames[2].minY == boxFrames[0].maxY + BoardLayout.spacing
+               && Set(boxFrames.map(\.width)).count == 1 && sharing.placement.tokens[72] == beta,
+               "boxes of places that share a pool sit in columns of one width, each taking the next column, and one "
+               + "that comes after the last column sits right under the first: \(boxFrames)")
+        expect(BoardLayout.sizes.allSatisfy { size in
+               size + 2 * BoardLayout.rim(size) + BoardLayout.gap(size) == size * 1.5
+           },
+           "a place is half as big again as its circle at every size, so smaller circles sit no further apart")
+    let shrunk = BoardLayout(board: RunnerBoard(jobs: three, runners: [], outcomes: [:]), size: size, largest: 6)
+        let shrunkBoxes = Array(shrunk.boxes.suffix(3))
+        expect(shrunk.size == 6 && shrunkBoxes.map(\.width) == boxFrames.map(\.width),
+               "smaller circles fit more to a line in a box, rather than more columns of narrower boxes")
+        let narrow = RunnerBoardView()
+        narrow.frame = NSRect(x: 0, y: 0, width: 420, height: 588)
+        narrow.show(RunnerBoard(jobs: three, runners: [], outcomes: [:]), animated: false)
+        let stacked = Array(narrow.placement.boxes.suffix(3))
+        expect(Set(stacked.map(\.minX)).count == 1 && stacked[1].minY == stacked[0].maxY + BoardLayout.spacing,
+               "on a narrow board, boxes that share a pool are one column, one under another: \(stacked)")
+        var titled = three
+        titled[80] = active("long", labels: ["ubuntu-24.04-arm", "macos-15-xlarge", "windows-2025-large"],
+                            runner: "GitHub Actions 80", group: gitHubHostedGroup)
+        let wide = BoardLayout(board: RunnerBoard(jobs: titled, runners: [], outcomes: [:]), size: size)
+        let longTitle = wide.texts.first { $0.string.hasPrefix("ubuntu-24.04-arm") }
+        expect(longTitle.map { $0.frame.width >= BoardLayout.width($0.string, .detail) } == true,
+               "a box's name is not cut short to fit a column")
+
+        // Pools kept empty give way when the board runs out of room.
+        var roomy: [Int64: ActiveJob] = [81: active("lone", labels: ["self-hosted", "rare"])]
+        for id in 82..<86 {
+            roomy[Int64(id)] = active("s\(id)", labels: spot, runner: "spot-\(id)", group: "cf-spot")
+        }
+        let giving = RunnerBoardView()
+        giving.frame = NSRect(origin: .zero, size: CGSize(width: 780, height: 300))
+        giving.show(RunnerBoard(jobs: roomy, runners: [], outcomes: [:]), animated: false)
+        roomy[81] = nil
+        giving.show(RunnerBoard(jobs: roomy, runners: [], outcomes: [:]), animated: true)
+        expect(giving.placement.pools.count == 2, "a pool whose jobs have gone stays, empty, while there is room")
+        for id in 86..<600 {
+            roomy[Int64(id)] = active("s\(id)", labels: spot, runner: "spot-\(id)", group: "cf-spot")
+        }
+        giving.show(RunnerBoard(jobs: roomy, runners: [], outcomes: [:]), animated: true)
+        expect(giving.placement.pools.count == 1, "an empty pool gives way once there is no room for it")
+
+        var refilled = ended
+        refilled[45] = active("d", labels: spot, runner: "spot-w", group: "cf-spot", since: 4)
+        refilled[46] = active("e", labels: spot, runner: "spot-v", group: "cf-spot", since: 5)
+        leaving.show(RunnerBoard(jobs: refilled, runners: [], outcomes: [:]), animated: true)
+        expect(leaving.placement.tokens[45] == before[41] && leaving.placement.tokens[42] == before[42]
+               && leaving.placement.tokens[43] == before[43] && leaving.placement.tokens[46].map { $0.minX > before[43]!.minX } == true
+               && leaving.words(at: CGPoint(x: before[44]!.midX, y: before[44]!.midY), now: Date())?.hasSuffix(": free") == true,
+               "a new job takes the first empty place, and another, with none left, one after the rest")
+    }
+    let learnt = active("on a machine learnt from its job", labels: ["self-hosted", "mybox", "build"], runner: "mybox-1",
+                        group: "Default")
+    leaving.show(RunnerBoard(jobs: [50: learnt], runners: [], outcomes: [:]), animated: false)
+    let learntSlot = leaving.placement.slots.first?.frame
+    leaving.show(RunnerBoard(jobs: [:], runners: [], outcomes: [50: .passed]), animated: true)
+    expect(reduced || (leaving.placement.slots.first?.frame == learntSlot && learntSlot != nil
+                       && leaving.placement.tokens[50] == nil),
+           "a machine learnt from a job stays where it was, empty, once the job ends")
+    leaving.show(RunnerBoard(jobs: spotJobs, runners: [], outcomes: [:]), animated: false)
+    let again = leaving.tokenLayer(41)
+    leaving.show(RunnerBoard(jobs: ended, runners: [], outcomes: [41: .passed, 44: .failed]), animated: true)
+    expect(reduced || again?.superlayer != nil, "a job on its way off is on the board")
+    leaving.show(RunnerBoard(jobs: ended, runners: [], outcomes: [41: .passed, 44: .failed]), animated: false)
+    expect(again?.superlayer == nil,
+           "shown as things are, as when the dashboard opens, the board has no jobs leaving")
+    let quietly = leaving.tokenLayer(42)
+    leaving.show(RunnerBoard(jobs: [:], runners: [], outcomes: [:]), animated: true)
+    expect(leaving.tokenCount == 0 && quietly?.superlayer == nil,
+           "a job that goes without its end being delivered simply goes")
+
+    // The legend says what each run's colour is, one line for each.
+    let legendView = RunnerBoardView()
+    legendView.frame = NSRect(origin: .zero, size: size)
+    legendView.show(board, animated: false)
+    expect(Set(legendView.legendEntries.map(\.id)) == Set(board.runs.map(\.id))
+           && legendView.legendEntries.allSatisfy { entry in entry.colour == legendView.palette.colour(entry.id) }
+           && legendView.legendEntries.map(\.title) == ["repo · CI on main", "repo · Lint on main"]
+           && legendView.legendEntries.map(\.jobs) == [7, 2],
+           "the legend has a line for each run, in its colour, in alphabetical order, saying what it is and how "
+           + "many of its jobs show")
+    let screen = CGRect(x: 0, y: 0, width: 1600, height: 1000)
+    let legendSize = CGSize(width: 340, height: 200)
+    expect(legendFrame(beside: CGRect(x: 400, y: 300, width: 780, height: 640), size: legendSize, within: screen)
+               == CGRect(x: 1188, y: 740, width: 340, height: 200)
+           && legendFrame(beside: CGRect(x: 800, y: 300, width: 780, height: 640), size: legendSize, within: screen)
+               == CGRect(x: 452, y: 740, width: 340, height: 200)
+           && legendFrame(beside: CGRect(x: 200, y: 300, width: 1300, height: 640), size: legendSize, within: screen)
+               .maxX == 1600,
+           "the legend opens beside the dashboard, to its right or else its left, its tops level, and only "
+           + "over it when there is no room on either side")
+    legendView.toggleLegend()
+    expect(legendView.legend == nil, "a board in no window has no legend to show")
+
+    // What a job says when pointed at.
+    let now = Date(timeIntervalSince1970: 1000)
+    expect(RunnerBoardView.describe(board.pools[0].queue[0], at: now)
+           == "repo · CI on main\nmac queued early\nQueued for 16m\nfor a runner labelled self-hosted, cf-mac, ci-mac-02",
+           "a queued job says how long it has waited, and for what: \(RunnerBoardView.describe(board.pools[0].queue[0], at: now))")
+    expect(RunnerBoardView.describe(board.pools[0].boxes[0].slots![1].job!, at: now)
+           == "repo · CI on main\nmac running\nRunning on ci-mac-01-2 for 16m",
+           "a running job says where, and for how long")
+    func middle(_ frame: CGRect) -> CGPoint { CGPoint(x: frame.midX, y: frame.midY) }
+    let slots = view.placement.slots.filter { !$0.slot.place }
+    expect(slots.map(\.slot.name) == ["ci-mac-01-1", "ci-mac-01-2", "ci-mac-01-builder", "ci-mac-02-1"]
+           && view.words(at: middle(slots[1].frame), now: now) == "ci-mac-01-2: idle"
+           && view.words(at: middle(slots[3].frame), now: now) == "ci-mac-02-1: offline"
+           && view.words(at: middle(slots[0].frame), now: now)?.contains("\nmac queued late\n") == true
+           && view.words(at: .zero, now: now) == nil,
+           "pointing at a slot names its runner and what it is doing, or the job on it, and pointing at nothing "
+           + "says nothing")
+    let unfinished = view.tokenLayer(2)
+    view.show(RunnerBoard(jobs: [:], runners: runners, outcomes: [1: .passed]), animated: true)
+    expect(view.tokenCount == 0 && unfinished?.superlayer == nil,
+           "a job that goes without its end being delivered, as when cibar loses its connection, simply goes")
+    expect([0, 59, 60, 3599, 3600, 90000].map { RunnerBoardView.duration($0) } == ["0s", "59s", "1m", "59m", "1h", "1d"],
+           "a length of time is told in its largest unit")
+
+    // The dashboard shows the board in place of everything above its bottom
+    // row when asked to, and the board shows nothing running unless
+    // connected.
+    let shown = DashboardState(watch: watch, at: Date(), connection: .connected, sessions: nil,
+                               includesPullRequests: false, showsRunners: true,
+                               runners: runners, runnersProblem: "Could not read the runners: offline")
+    expect(shown.board.tokens.count == watch.active.count && shown.board.slots == 4
+           && shown.problems.last == "Could not read the runners: offline" && shown.board.problems == shown.problems,
+           "the board has every job, whatever its branch, every runner, and what is wrong")
+    let hidden = DashboardState(watch: watch, at: Date(), connection: .connected, sessions: nil,
+                                includesPullRequests: false, showsRunners: false, runners: runners)
+    expect(hidden.board == RunnerBoard(), "while the board does not show, it is not worked out")
+    let offline = DashboardState(watch: watch, at: Date(), connection: .connecting, sessions: nil,
+                                 includesPullRequests: false, showsRunners: true, runners: runners)
+    expect(offline.board.tokens.isEmpty && offline.board.slots == 4,
+           "while not connected, no job is known to be queued or running")
+    let model = DashboardModel(state: offline, actions: DashboardActions())
+    let dashboard = makeDashboard(model, width: 780)
+    let boardView = dashboard.subviews.first { $0 is RunnerBoardView }
+    expect(boardView?.isHidden == false && dashboard.subviews.filter(\.isHidden).count == 2,
+           "the board shows in place of the numbers and the lists")
+    var lists = offline
+    lists.showsRunners = false
+    model.state = lists
+    expect(boardView?.isHidden == true && dashboard.subviews.filter(\.isHidden).count == 1,
+           "the lists show in place of the board")
+} catch {
+    expect(false, "the runners board is worked out: \(error)")
+}
+
+// Reading the runners from GitHub's API.
+do {
+    typealias Page = StandInGitHub.Page
+    StandInGitHub.pages = [
+        "/orgs/octo/actions/runners?per_page=100": Page(
+            body: ["runners": [["name": "m-1", "status": "online", "labels": [["name": "self-hosted"], ["name": "m"]]]]],
+            link: "<https://api.github.com/orgs/octo/actions/runners?per_page=100&page=2>; rel=\"next\""),
+        "/orgs/octo/actions/runners?per_page=100&page=2": Page(
+            body: ["runners": [["name": "m-2", "status": "offline", "labels": [["name": "m"]]]]]),
+        "/orgs/locked/actions/runners?per_page=100": Page(
+            body: ["message": "Resource not accessible by personal access token"], status: 403),
+        "/orgs/broken/actions/runners?per_page=100": Page(body: ["message": "Server Error"], status: 502),
+        "/orgs/locked/actions/hosted-runners?per_page=100": Page(
+            body: ["message": "Resource not accessible by personal access token"], status: 403),
+        "/orgs/octo/actions/hosted-runners?per_page=100": Page(body: ["runners": [
+            ["name": "big", "maximum_runners": 20, "machine_size_details": ["cpu_cores": 32, "memory_gb": 128]],
+            ["name": "plain", "maximum_runners": 5],
+            ["name": "unbounded"],
+        ]]),
+    ]
+    var result: Result<(runners: [String: [Runner]], larger: [String: [LargerRunner]], problems: [String]), Error>?
+    Task {
+        result = await Result {
+            try await GitHubAPI(token: "t", session: standInSession).runners(of: ["octo", "user", "locked", "broken"])
+        }
+    }
+    waitUntil { result != nil }
+    let read = try result!.get()
+    expect(read.runners["octo"] == [Runner(owner: "octo", name: "m-1", labels: ["self-hosted", "m"], online: true),
+                                    Runner(owner: "octo", name: "m-2", labels: ["m"], online: false)],
+           "an organization's runners are read, every page of them: \(read.runners)")
+    expect(read.larger["octo"] == [LargerRunner(owner: "octo", name: "big", maximum: 20, cores: 32, memory: 128),
+                                   LargerRunner(owner: "octo", name: "plain", maximum: 5, cores: nil, memory: nil),
+                                   LargerRunner(owner: "octo", name: "unbounded", maximum: nil, cores: nil, memory: nil)]
+           && read.larger["user"] == [],
+           "an organization's larger runners are read, with how many jobs each can run at once: \(read.larger)")
+    expect(read.runners["user"] == [] && read.runners["locked"] == nil && read.runners["broken"] == nil
+           && read.problems == [
+               "broken's runners: GitHub answered 502 for /orgs/broken/actions/runners: Server Error",
+               "locked's runners: GitHub answered 403 for /orgs/locked/actions/runners: Resource not accessible by "
+                   + "personal access token",
+               "locked's larger runners: GitHub answered 403 for /orgs/locked/actions/hosted-runners: Resource not "
+                   + "accessible by personal access token",
+           ],
+           "an owner that is not an organization has no runners, and runners that cannot be read are a problem: "
+           + "\(read.problems)")
+} catch {
+    expect(false, "the runners are read: \(error)")
 }
 
 for folder in temporaryFolders {

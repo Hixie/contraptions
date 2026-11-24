@@ -74,6 +74,17 @@ macOS does not make an app active just because it asks to be. Clicking the
 indicator again, pressing Escape, or clicking anything else closes it at
 once, and hands the keyboard back to the app that had it.
 
+Dragging the dashboard, by the handle along its top or by any empty part
+of the runners board, tears it off: it becomes a window like any other,
+which stays where it is put, in front of other windows or behind them,
+until it is closed, the size it was, as the runners board is laid out for
+that size. Like a torn-off palette, it then has a slim title bar with a
+small button that closes it, as Escape does; the runners board puts its
+heading, how many jobs run and wait, and its legend's button in the title
+bar beside it, and the numbers and columns sit below it. Clicking the
+indicator brings it to the front. Once closed, the dashboard opens below
+the indicator again, as before. Nothing but a drag tears it off.
+
 **Include PRs**, at the top of the Running column, says whether what runs on
 branches other than default ones, such as pull requests', is shown and
 counted in that column, in the Running and Queued numbers, and in the
@@ -114,8 +125,9 @@ on a default branch starts a Codex session, and turns that on or off; cibar
 remembers it from one run to the next.
 
 On the right, **Running**: every run with jobs queued or running, the newest
-first, each with, at the end of its line, the number of its branch's open
-pull request, which opens the pull request, and who opened it, or else its
+first, each named by its repository, its branch's open pull request if it
+has one, and its workflow, as `loom PR #1234 · Tests`, and with, at the end
+of its line, who opened the pull request, which opens it, or else its
 branch. cibar learns of open pull requests from GitHub's API and from
 deliveries about them. Beneath each run, in red, the jobs of it that have
 already failed, each opening its page; then its jobs still to finish, in the
@@ -144,8 +156,223 @@ computer's clock may be wrong. Core Animation scrolls the bars and fades the
 latency, as smoothly as the screen can show, without cibar drawing anything
 between deliveries. Then **Refresh**, described below, which, while cibar
 reads, gives way to a bar of how many of how many repositories it has read;
-**Settings…**, which opens the settings window, described below, or, with
+**Show Runners**, which shows the runners board, described below, in place
+of everything above the bottom row, and, while it shows, becomes **Show
+Branches**, which shows the numbers and columns again; cibar remembers
+which from one run to the next; **Settings…**, which opens the settings window, described below, or, with
 Option held, sends a red plane and a green plane round; and **Quit cibar**.
+
+## The runners board
+
+The runners board shows what every runner is doing, and what is waiting
+for one, as circles, one for each job queued or running on any branch,
+coloured by run, so that the jobs of the same workflow for two pull
+requests, or for two commits on one branch, have two colours. A circle
+looks the same queued or running; where it is says which. Runs on the
+board at the same time have colours of their own, while there are enough
+colours to go round, and a run keeps its colour while it has jobs on the
+board. There are twenty-four colours: twelve strong ones, which runs take
+first, and twelve paler ones, each a lighter shade of one of the strong
+ones, taken only when the strong ones are all in use.
+
+The board is split into pools, each a set of runners that the same jobs can
+run on. Each pool is a band across the board, headed at its top left by
+its name and what its runners are, and at its top right by how many of its
+jobs are queued and how many running, or, for a larger runner, how many of
+how many it can run at once. Under the heading, the jobs queued for it are
+on the left, and its runners on the right, in boxes. A queue is a heap of
+balls, one for each queued job, in a space as tall as the pool's runners
+and its heading, up to the pool's top, its balls drawn over the heading
+and clipped to the pool's rounded box, so that however long it grows,
+nothing below it moves; a ball leaves the clip when its job starts or
+ends, so as not to be cut off on its way to its runner or off the board; its balls are as
+small as lets them all fit, heaped as loosely as poured balls heap, down
+to one point across, beyond which the heap rises above its space. A heap
+that, poured, lies less flat than that, so that balls stick out of the
+top, is made of balls half a point smaller, and smaller again, until they
+all fit. Jobs just queued are set out, out of sight, in a pile of rows as
+wide as the heap, the oldest at the bottom nearest the heap, centred two
+heaps' widths to the left of the heap and two widths and three heights
+above its floor. From there the pile falls onto a slope, at forty-five
+degrees, that leads down to the heap's top left corner, slides down it,
+and pours into the heap off the corner, a ball at a time, each out of
+sight until it is half past the heap's left side. A heap wide and shallow
+enough that the slope would cut through the pile has its pile raised just
+clear of it, and a pile poured while another is still on its way in is
+raised clear above it; as the balls tumble down the slope, they come in
+roughly, not strictly, in the order they were queued. A wide, shallow
+heap fills its left end first, balls coming in perching on the corner at
+the top of the slope, and so is made of smaller balls than a heap poured
+evenly would be. When the board is shown afresh, they drop in all at once
+from just above. When a job leaves, for a runner or because it
+was cancelled, the balls above it fall into its place.
+
+Gravity and the balls knocking against each other, the sides and the
+slope are worked out ahead of time, whenever a heap's jobs or space change, or its
+balls are bigger than they may now be, from where each ball is and how it
+is moving, and Core Animation moves the balls along the paths that gives.
+The simulation (`heap.swift`) takes small steps, more of them the smaller
+the balls, so that no ball moves much further than its own width in one
+and so passes through another; each step moves every ball, then pushes
+apart those that overlap, twice, finding them by a grid of squares a ball
+across, from the floor up, the ball below giving way less than the one on
+top of it, so that a deep heap bears its weight rather than squeezing its
+bottom out sideways; a ball balanced right on top of another rolls off it,
+away from the nearer side, and of two squeezed together side by side, one
+rides up over the other. The heap's right side and floor go on for ever,
+its left side is only as tall as the heap's space, and the slope runs up
+and away to the left from the top of it, the corner between them a point
+that balls roll over. It keeps the balls in the order of the squares they
+are in, sorted again each step, so that neighbours are neighbours in
+memory too. A ball is never flung upward: one pushed up by those under it
+creeps up, at six of its widths a second at most. The heap is at rest once
+no ball moves a quarter of a point, or a twelfth of its width if that is
+less, between samples for a tenth of a second, and the simulation stops
+then, or after five seconds, once the balls have grown, if all have come
+into the heap by then, or else once they have, or at ten seconds at most.
+Balls that grow,
+as when most of a queue leaves at once, grow over half a second, as their circles
+do, rather than at once, so that they part gently rather than burst apart.
+A heap of a thousand balls shown afresh takes about fifteen milliseconds
+to work out, three thousand between a tenth and a fifth of a second, and
+six thousand, a point across, about half a second, all on the main thread;
+pouring forty balls down the slope into a heap of a few hundred takes
+about fifty milliseconds.
+
+A runner, and the jobs that run on it, belong to the organization or user
+that lists it, so runners of the same name of two owners are two runners.
+
+- A runner whose name is one of its labels, or one of its labels, a dash
+  and a word, as `ci-mac-01-3` is `ci-mac-01`, a dash and `3`, and that has
+  another label, other than those for its system, to say what it is for, as
+  `cf-mac` does, is on the machine the first label names. Each machine is a
+  box, with a slot for each of
+  its runners, named by that word, in order. A slot holds the circle of the
+  job running on it; an offline runner's slot is red and crossed out.
+  Machines that share a label other than their names, and every machine
+  that shares one with them, are one pool, named after what their names
+  start with, as `ci-mac`. Runners that an autoscaler makes for each job are
+  usually named with more than one word after their labels, or have no
+  other label, so they are not taken for machines. Should two jobs say they
+  run on one runner, as deliveries that arrive out of order can, the second
+  is shown beside the slots.
+- Other runners, such as virtual machines that are made for a job and
+  deleted after it, are pooled by their labels, other than those GitHub
+  gives every self-hosted runner for its system, unless they are in
+  GitHub's own runner group. A job that asks for a runner group rather than
+  labels, as `runs-on: group: labs` does, has its runner pooled by that
+  group, as `runner group labs`. Such a pool's box has a place for each job
+  running on its runners, as described below. It says how many of its
+  runners are idle when none has ever been busy while the board shows.
+- Each of the organization's larger runners, such as
+  `ubuntu-24.04-32-core`, which GitHub starts for each job up to a most it
+  can run at once, is a pool of its own while it has jobs on the board,
+  with a place for each job it can run at once, up to 64; one that can run
+  more has places as described below. A job is on it when its runner, not
+  a self-hosted runner cibar knows of, is named after it, as
+  `ubuntu-24.04-32-core-1001427100` is, or asks for it by name.
+- Runners in GitHub's own runner group, or named after it, as `GitHub
+  Actions 1001438681` is, which GitHub starts for each job, are one pool,
+  with any job running that GitHub has not yet said the runner of, as for
+  a moment after it starts, unless it asked for a self-hosted runner, with a box for each set of labels that jobs ask for, as
+  `ubuntu-latest`. How many of them may run at once depends on the
+  organization's plan, which GitHub's API does not say.
+
+So that running jobs never move while the board shows, every box of
+runners other than a machine's has numbered places. A job takes the first empty place, or, with
+none empty, a new one after the rest, and keeps its place while it stays.
+A job that finishes leaves its place empty at once, for the next job to
+take, even while its circle is still on its way off the board. A box never has fewer places than it has needed, and grows only
+by lines. Boxes of places that share a pool are set out in as many
+columns as fit at least eight places each, at the biggest circles, and
+the longest of their names, so that smaller circles fit more to a line
+rather than more columns, each box taking the next
+column in turn, one under another, so that a box that grows moves only
+the boxes under it. Pools and boxes stay where they are, empty if their
+jobs have all gone, until keeping them would make the circles smaller or
+leave a pool off the board, and those that come onto the board go after
+them. The board starts afresh, in order, each time the dashboard opens or
+changes size. These places are not counted as runners at the top of the board.
+
+A queued job waits in the pool of the first online runner that has every
+label it asks for, or, when all those runners are offline, of the first of
+them. When no runner cibar knows of has those labels, the job waits in the
+pool of runners with the labels it asks for, if there is one; else, if it
+asks for a self-hosted runner, in a pool made for those labels, so that a
+job that may never be taken can be seen; and else for one of GitHub's
+runners.
+
+Every circle that moves on its own moves only as forces move it, from
+where it is, moving as it moves, so that none ever changes speed or
+direction all at once (`motion.swift`). When a job starts running, its
+circle is drawn to its runner's place, by a pull that comes on over a
+quarter of a second, against gravity if it was falling, as one dropping
+into its queue is, so that it goes on falling a moment and then curves
+round to its place, where it comes to rest in about a second, the last of
+it too slow to see; a job whose place moves goes there the same way. When
+a job finishes, its circle, still in its run's colour, gains an outline
+and a mark, a green ✓ if it passed, a red ✕ if it failed, or a grey – if
+it was cancelled or skipped, swells for a moment while it slows to a stop,
+and goes, over everything else, the dashboard's bottom row included. One
+that passed is thrown, by a push lasting a tenth of a second, up, over and
+off the board to the right, a little lower than it was. One that failed
+leaves a red ring behind, and is thrown up and to the right, hard enough
+to reach the right side of the board while still in the air, the push
+ending as it hits; it bounces off the side at a fifth of the speed it hit
+it at, falls to the line along the bottom of the board, and bounces along
+it, each bounce back up at half the speed it came down at, going left at a
+steady speed, as if the line were very bouncy and very slippery, and
+sliding once its bounces have died away, until, past the line's left end,
+nothing holds it up, and it falls. One that comes down between the line's
+right end and the side falls through the gap there. One that was cancelled
+or skipped rises like a puff of smoke, lifted by buoyancy and held back by
+the air, so that it rises slowly at first and then ever faster, to a
+steady speed, straight up and off the top of the board, growing and fading
+as it goes. A job that goes for another reason, as when cibar loses its
+connection, simply goes, and so do jobs on their way off when the board is
+shown afresh, as when the dashboard opens. Core Animation moves the
+circles along paths worked out ahead of time, without cibar drawing
+anything between deliveries. While macOS is set to reduce motion, the
+board changes without moving anything.
+
+Across the top, how many jobs are running and queued, how many runners on
+machines, which have slots of their own, are idle, and how many of those
+are offline; under that, anything that is wrong, as under the dashboard's
+numbers. A board with nothing on it says so. Each box of a machine says
+how many of its runners are busy. The button at the top right opens a
+legend beside the dashboard, to its right, or, with no room there, to its
+left, which can be dragged anywhere, with a line for each run on the
+board, in alphabetical order: its colour, its name, as in the Running
+list, with its branch when it has no pull request, its commit, and how
+many of its jobs show. The legend goes when the button is clicked again,
+or when the board does, as when the lists show in its place or the
+dashboard closes.
+
+Pointing at a circle says its run's name, as in the Running list, with its
+branch when it has no pull request, and its commit, as `@ 1a2b3c4`; then
+which job
+it is, and how long it has been running, and where, or how long it has
+waited, and for what labels. Pointing at a slot names its runner and says
+what it is doing, and pointing at an empty place says it is free.
+Clicking a circle opens its job's page on GitHub.
+
+The circles are as big as lets everything fit, so the board never scrolls;
+pools that do not fit even with the smallest circles are left off, and
+counted at the bottom. While the board shows, the circles only ever get
+smaller, and the board only moves things when it runs out of room: a box
+that needs another line pushes what is below it down, and smaller circles
+move everything.
+While cibar is not connected to the relay, it does not know which jobs are
+queued or running, so the board shows none.
+
+cibar reads which runners, and which larger runners, each owner has from
+GitHub's API when it shows the board, as the dashboard opens or as
+**Show Runners** is chosen, and, while it shows, after each read described
+below, since no delivery says when a runner comes, goes, or loses its
+connection. Runners that jobs run on that GitHub did not list
+are taken from the jobs. A user, unlike an organization, has no runners
+listed; runners that cannot be read are named under the numbers at the top,
+with why.
 
 ## Reading from GitHub's API
 
@@ -198,7 +425,8 @@ terminal would, the first time it reads, and again after a read fails, in
 case it has changed: `GH_TOKEN`, then `GITHUB_TOKEN`, then what `gh auth
 token` prints. The dashboard says while it waits for the shell. Without a
 token, cibar reads nothing. The token needs read access to the repositories'
-Actions and pull requests.
+Actions and pull requests, and, for the runners board to list runners that
+are idle or offline, to the organizations' self-hosted runners.
 
 ## The planes
 
@@ -370,7 +598,9 @@ the connection to the relay open is in `connection.swift`, reading
 deliveries from it is in `relay.swift`, following jobs and runs is in
 `watch.swift`, deciding what a failure or a workflow turning calls for and
 running Codex sessions is in `codex.swift`, and saving what cibar knows is
-in `state.swift`. The dashboard is `dashboard.swift`, and the plane is
+in `state.swift`. The dashboard is `dashboard.swift`, its runners board
+`runners.swift`, the heaps of its queues `heap.swift`, the paths of its
+circles that move on their own `motion.swift`, and the plane is
 `flyby.swift`.
 
 ```sh

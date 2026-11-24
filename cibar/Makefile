@@ -7,6 +7,7 @@ AGENT_PLIST = $(AGENT_DIR)/$(AGENT_LABEL).plist
 # Everything the tests exercise, which leaves out the menu bar and its
 # indicator.
 LIBRARY = configuration.swift connection.swift relay.swift watch.swift codex.swift state.swift dashboard.swift github.swift \
+  runners.swift heap.swift motion.swift \
   flyby.swift settingswindow.swift
 SOURCES = main.swift indicator.swift $(LIBRARY)
 TEST_SOURCES = $(LIBRARY) tests/main.swift

@@ -134,6 +134,69 @@ struct GitHubAPI {
         let login: String
     }
 
+    private struct RunnersPage: Decodable {
+        struct Runner: Decodable {
+            struct Label: Decodable { let name: String }
+            let name: String
+            let status: String
+            let labels: [Label]
+        }
+        let runners: [Runner]
+    }
+
+    private struct LargerRunnersPage: Decodable {
+        struct Runner: Decodable {
+            struct Size: Decodable {
+                let cpuCores: Int?
+                let memoryGb: Int?
+            }
+            let name: String
+            let maximumRunners: Int?
+            let machineSizeDetails: Size?
+        }
+        let runners: [Runner]
+    }
+
+    /// What GitHub lists of each of `owners`' runners: its self-hosted
+    /// runners, and its larger runners, each by owner. An owner that is not
+    /// an organization has none; any other answer that cannot be read, as
+    /// when the token cannot see an organization's runners, is a problem.
+    func runners(of owners: [String]) async throws
+        -> (runners: [String: [Runner]], larger: [String: [LargerRunner]], problems: [String]) {
+        var runners: [String: [Runner]] = [:]
+        var larger: [String: [LargerRunner]] = [:]
+        var problems: [String] = []
+        /// What `read` lists, none for an owner that is not an organization,
+        /// or nothing, when it cannot be read.
+        func list<Item>(_ what: String, of owner: String, _ read: () async throws -> [Item]) async throws -> [Item]? {
+            do {
+                return try await read()
+            } catch let error as RateLimited {
+                throw error
+            } catch is NotFound {
+                return []
+            } catch {
+                problems.append("\(owner)'s \(what): \(error)")
+                return nil
+            }
+        }
+        for owner in owners.sorted() {
+            runners[owner] = try await list("runners", of: owner) {
+                try await all(RunnersPage.self, "/orgs/\(owner)/actions/runners?per_page=100", \.runners).map {
+                    Runner(owner: owner, name: $0.name, labels: $0.labels.map(\.name), online: $0.status == "online")
+                }
+            }
+            larger[owner] = try await list("larger runners", of: owner) {
+                try await all(LargerRunnersPage.self, "/orgs/\(owner)/actions/hosted-runners?per_page=100",
+                              \.runners).map {
+                    LargerRunner(owner: owner, name: $0.name, maximum: $0.maximumRunners,
+                                 cores: $0.machineSizeDetails?.cpuCores, memory: $0.machineSizeDetails?.memoryGb)
+                }
+            }
+        }
+        return (runners, larger, problems)
+    }
+
     private struct Refusal: Decodable {
         let message: String
     }

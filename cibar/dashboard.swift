@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// A count and the noun it counts, such as "1 job" or "2 jobs".
@@ -77,6 +78,8 @@ struct DashboardState: Equatable {
     /// How late the latest deliveries on this connection arrived.
     var lateness = Lateness()
     var deliveryProblem: String?
+    /// Why cibar could not last read the runners from GitHub's API.
+    var runnersProblem: String?
     /// Whether cibar is reading from GitHub's API, how many of how many
     /// repositories it has read, once it knows, and why it last could not.
     var refreshing = false
@@ -87,6 +90,10 @@ struct DashboardState: Equatable {
     /// Whether what runs on branches other than default ones, such as pull
     /// requests', is shown and counted. What fails on them never is.
     var includesPullRequests = false
+    /// Whether the runners board shows, in place of everything above the
+    /// bottom row.
+    var showsRunners = false
+    var board = RunnerBoard()
     var branches: [Branch]
     var failing: [Failing]
     /// The newest first.
@@ -116,6 +123,9 @@ struct DashboardState: Equatable {
         }
         if let refreshProblem {
             problems.append(refreshProblem)
+        }
+        if let runnersProblem {
+            problems.append(runnersProblem)
         }
         return problems
     }
@@ -159,8 +169,33 @@ extension String {
     /// hexadecimal digits standing alone, shortened to its first seven, as
     /// git shortens them.
     var abbreviatingHashes: String {
-        replacing(#/\b(?:[0-9a-f]{64}|[0-9a-f]{40})\b/#) { String($0.output.prefix(7)) }
+        // Too short to hold a hash, as most are, is left as it is at once,
+        // since the expression is slow to try.
+        utf8.count < 40 ? self : replacing(#/\b(?:[0-9a-f]{64}|[0-9a-f]{40})\b/#) { String($0.output.prefix(7)) }
     }
+}
+
+nonisolated(unsafe) private var textWidths: [String: CGFloat] = [:]
+
+/// How wide `text` is in `font`, remembered for the next time it is asked,
+/// until so many are remembered that they are all forgotten.
+func textWidth(_ text: String, _ font: NSFont) -> CGFloat {
+    let key = "\(font.fontName) \(font.pointSize) \(text)"
+    if let width = textWidths[key] {
+        return width
+    }
+    let width = NSAttributedString(string: text, attributes: [.font: font]).size().width
+    if textWidths.count >= 5000 {
+        textWidths = [:]
+    }
+    textWidths[key] = width
+    return width
+}
+
+/// What a run is called: its repository, its branch's pull request if it
+/// has one, and its workflow, as `loom PR #1234 · Tests` or `labs · CI`.
+func runTitle(repository: String, workflow: String, pullRequest: Int?) -> String {
+    pullRequest.map { "\(repository) PR #\($0) · \(workflow)" } ?? "\(repository) · \(workflow)"
 }
 
 /// "job" or "jobs", as many as there are.
@@ -172,7 +207,9 @@ extension DashboardState {
     init(watch: Watch, at now: Date, connection: Connection, lateness: Lateness = Lateness(),
          deliveryProblem: String? = nil,
          refreshing: Bool = false, refreshProgress: RefreshProgress? = nil, refreshProblem: String? = nil,
-         sessions: Bool?, records: [CodexRecord] = [], includesPullRequests: Bool) {
+         sessions: Bool?, records: [CodexRecord] = [], includesPullRequests: Bool,
+         showsRunners: Bool = false, runners: [Runner] = [], larger: [LargerRunner] = [],
+         runnersProblem: String? = nil) {
         self.connection = connection
         self.lateness = lateness
         self.deliveryProblem = deliveryProblem
@@ -181,6 +218,8 @@ extension DashboardState {
         self.refreshProblem = refreshProblem
         self.sessions = sessions
         self.includesPullRequests = includesPullRequests
+        self.showsRunners = showsRunners
+        self.runnersProblem = runnersProblem
         branches = watch.listedDefaultBranches(at: now).map {
             var runs = URLComponents(string: "https://github.com/\($0.repository)/actions")
             runs?.queryItems = [URLQueryItem(name: "query", value: "branch:\($0.branch)")]
@@ -220,6 +259,14 @@ extension DashboardState {
         runningWorkflows = Set(runs.filter { $0.running > 0 }.map(\.workflowBranch)).count
         queuedJobs = runs.reduce(0) { $0 + $1.queued }
         failingJobs = failing.reduce(0) { $0 + $1.jobs.count }
+        // Every job, whatever its branch, since every job takes a runner;
+        // while not connected, which are queued or running is not known.
+        if showsRunners {
+            board = RunnerBoard(jobs: isConnected ? watch.active : [:], runners: runners, larger: larger,
+                                outcomes: watch.outcomes,
+                                pullRequests: watch.pullRequest(for:))
+            board.problems = problems
+        }
     }
 }
 
@@ -237,6 +284,7 @@ struct DashboardActions {
     var quit: () -> Void = {}
     var refresh: () -> Void = {}
     var setIncludesPullRequests: (Bool) -> Void = { _ in }
+    var setShowsRunners: (Bool) -> Void = { _ in }
     var open: (URL) -> Void = { _ in }
     var close: () -> Void = {}
 }
@@ -245,6 +293,8 @@ struct DashboardActions {
 final class DashboardModel: ObservableObject {
     @Published var state: DashboardState
     let actions: DashboardActions
+    /// What keeps the views that are not SwiftUI's up to date.
+    var subscriptions: [AnyCancellable] = []
 
     init(state: DashboardState, actions: DashboardActions) {
         self.state = state
@@ -254,22 +304,62 @@ final class DashboardModel: ObservableObject {
 
 // MARK: - The view
 
+/// A title bar over the dashboard's content, once torn off: how tall it is,
+/// and how far down the middle of its close button is, which what goes
+/// beside the button lines up with; or none.
+struct TitleBar: Equatable {
+    var height: CGFloat = 0
+    var middle: CGFloat = 0
+
+    static let none = TitleBar()
+}
+
+/// The dashboard's content: told of a title bar over it, it keeps
+/// the numbers and the rest below it, and has the runners board put its
+/// heading in it.
+final class DashboardContent: NSView {
+    let board: RunnerBoardView
+    /// What puts the numbers' top at the content's.
+    var tilesTop: NSLayoutConstraint?
+
+    var titleBar = TitleBar.none {
+        didSet {
+            tilesTop?.constant = titleBar.height
+            board.titleBar = titleBar
+        }
+    }
+
+    init(board: RunnerBoardView) {
+        self.board = board
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+}
+
 /// The dashboard: its big numbers, the rest, and its bottom row, each drawn
 /// by a view of its own, so that what moves in one, many times a second,
 /// does not have the others drawn afresh with it. The rest fills what the
-/// numbers and the bottom row leave of the view, which is `width` wide.
-func makeDashboard(_ model: DashboardModel, width: CGFloat) -> NSView {
+/// numbers and the bottom row leave of the view, which is `width` wide. The
+/// runners board, when it shows, takes the place of the numbers and the
+/// rest.
+func makeDashboard(_ model: DashboardModel, width: CGFloat) -> DashboardContent {
     let tiles = NSHostingView(rootView: DashboardTiles(model: model))
     let rest = NSHostingView(rootView: DashboardView(model: model))
     let footer = NSHostingView(rootView: DashboardFooter(model: model))
+    let board = RunnerBoardView()
+    board.open = model.actions.open
     // Each is as tall as it is at first, and does not say it would be
     // otherwise, since its saying so as it changes, many times a second,
     // would have the whole window laid out again each time.
     tiles.sizingOptions = []
     rest.sizingOptions = []
     footer.sizingOptions = []
-    let view = NSView()
-    for part in [tiles, rest, footer] {
+    let view = DashboardContent(board: board)
+    let tilesTop = tiles.topAnchor.constraint(equalTo: view.topAnchor)
+    view.tilesTop = tilesTop
+    for part in [tiles, rest, footer, board] {
         part.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(part)
         NSLayoutConstraint.activate([
@@ -280,11 +370,25 @@ func makeDashboard(_ model: DashboardModel, width: CGFloat) -> NSView {
     NSLayoutConstraint.activate([
         tiles.heightAnchor.constraint(equalToConstant: height(of: DashboardTiles(model: model), width: width)),
         footer.heightAnchor.constraint(equalToConstant: height(of: DashboardFooter(model: model), width: width)),
-        tiles.topAnchor.constraint(equalTo: view.topAnchor),
+        tilesTop,
         rest.topAnchor.constraint(equalTo: tiles.bottomAnchor),
         footer.topAnchor.constraint(equalTo: rest.bottomAnchor),
         footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        board.topAnchor.constraint(equalTo: view.topAnchor),
+        board.bottomAnchor.constraint(equalTo: footer.topAnchor),
     ])
+    // The board moves what changed while it shows, and shows how things are
+    // when it opens.
+    model.subscriptions.append(model.$state.sink { [weak tiles, weak rest, weak board] state in
+        tiles?.isHidden = state.showsRunners
+        rest?.isHidden = state.showsRunners
+        guard let board else { return }
+        let wasShowing = !board.isHidden && board.window?.isVisible == true
+        board.isHidden = !state.showsRunners
+        if state.showsRunners && (state.board != board.board || !wasShowing) {
+            board.show(state.board, animated: wasShowing)
+        }
+    })
     return view
 }
 
@@ -348,7 +452,9 @@ struct DashboardFooter: View {
             Divider()
             footer
         }
-        .padding([.horizontal, .bottom], 18)
+        // The divider, on which a failed job's ball lands, ends where the
+        // runners board's pools do.
+        .padding([.horizontal, .bottom], BoardLayout.inset)
     }
 
     private var footer: some View {
@@ -379,6 +485,21 @@ struct DashboardFooter: View {
                 .help("Read everything afresh from GitHub, forgetting what cibar knew: workflows that will "
                     + "never run again, and jobs whose ends were missed.")
             }
+            // The switch between the two views, named for the view it shows,
+            // after Refresh, so that the bar Refresh gives way to as cibar
+            // reads is not between buttons.
+            Button {
+                actions.setShowsRunners(!state.showsRunners)
+            } label: {
+                if state.showsRunners {
+                    Label("Show Branches", systemImage: "arrow.triangle.branch")
+                } else {
+                    Label("Show Runners", systemImage: "server.rack")
+                }
+            }
+            .help(state.showsRunners
+                ? "Show the default branches, what fails on them, and what runs, in place of the runners."
+                : "Show the runners, and the jobs queued for them and running on them, in place of the lists.")
             Button("Settings…") {
                 if NSEvent.modifierFlags.contains(.option) {
                     actions.flyBanners()
@@ -853,17 +974,9 @@ struct JobColumns: Equatable {
         jobs > Self.rows * count + 1 ? Self.rows * count : jobs
     }
 
-    private static let font = NSFont.systemFont(ofSize: 10)
-    nonisolated(unsafe) private static var widths: [String: CGFloat] = [:]
-
     /// How wide a job's name is in the caption it is written in.
     static func width(_ name: String) -> CGFloat {
-        if let width = widths[name] {
-            return width
-        }
-        let width = NSAttributedString(string: name, attributes: [.font: font]).size().width
-        widths[name] = width
-        return width
+        textWidth(name, .systemFont(ofSize: 10))
     }
 }
 
@@ -884,15 +997,12 @@ private struct RunRow: View, Equatable {
         a.run == b.run
     }
 
-    /// The number of a run's pull request, which opens it, and who opened
-    /// it. The number is written as it is, not as a quantity, with a
-    /// thousands separator.
+    /// Who opened a run's pull request, which opens it.
     private func pullRequestLine(_ pullRequest: PullRequestInfo) -> AttributedString {
-        var number = AttributedString("#\(pullRequest.number)")
-        number.link = URL(string: "https://github.com/\(run.workflowBranch.repository)/pull/\(pullRequest.number)")
-        var author = AttributedString(" · \(pullRequest.author)")
+        var author = AttributedString(pullRequest.author)
+        author.link = URL(string: "https://github.com/\(run.workflowBranch.repository)/pull/\(pullRequest.number)")
         author.foregroundColor = .secondary
-        return number + author
+        return author
     }
 
     var body: some View {
@@ -901,7 +1011,9 @@ private struct RunRow: View, Equatable {
                 // Text that opens the run, rather than a button, which would
                 // not say where its words' baseline is, for the branch beside
                 // it to stand on.
-                Text("\(run.workflowBranch.repositoryName) · \(run.workflowBranch.workflow.abbreviatingHashes)")
+                Text(runTitle(repository: run.workflowBranch.repositoryName,
+                              workflow: run.workflowBranch.workflow.abbreviatingHashes,
+                              pullRequest: run.pullRequest?.number))
                     .font(.callout.weight(.semibold))
                     .lineLimit(1)
                     .onTapGesture { run.url.map(actions.open) }
@@ -1185,8 +1297,18 @@ private struct OdometerWheel: View, Animatable {
 /// once while the app in use stays so. macOS does not make an app the
 /// active one just because it asks.
 final class DashboardPanel: NSPanel {
-    /// What Escape does.
+    /// What Escape does to the popup, and what tearing the panel off does.
     var onEscape: () -> Void = {}
+    var onTearOff: () -> Void = {}
+    /// Whether the panel has been dragged away from the indicator, which
+    /// makes it a window like any other, which stays until it is closed.
+    private(set) var isTornOff = false
+    private let handle = TearOffHandle()
+    /// What the content is told of the title bar a torn-off panel has over
+    /// it, or that it has none once the panel is a popup again.
+    var onTitleBar: (TitleBar) -> Void = { _ in }
+    private static let popupBehavior: NSWindow.CollectionBehavior =
+        [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
 
     init(showing content: NSView) {
         super.init(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless], backing: .buffered,
@@ -1199,27 +1321,98 @@ final class DashboardPanel: NSPanel {
         backgroundColor = .clear
         hasShadow = true
         isReleasedWhenClosed = false
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        collectionBehavior = Self.popupBehavior
         let background = NSVisualEffectView()
         background.material = .popover
         background.blendingMode = .behindWindow
         background.state = .active
         background.maskImage = Self.roundedCorners(radius: 12)
-        content.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(content)
+        for view in [content, handle] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            background.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            ])
+        }
         NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: background.trailingAnchor),
             content.topAnchor.constraint(equalTo: background.topAnchor),
             content.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            handle.topAnchor.constraint(equalTo: background.topAnchor),
+            handle.heightAnchor.constraint(equalToConstant: TearOffHandle.height),
         ])
         contentView = background
     }
 
     override var canBecomeKey: Bool { true }
 
+    /// Escape closes the dashboard, torn off or not.
     override func cancelOperation(_ sender: Any?) {
-        onEscape()
+        if isTornOff {
+            close()
+        } else {
+            onEscape()
+        }
+    }
+
+    /// Drags the panel with the mouse until its button is let go, as its
+    /// handle and the runners board ask, tearing it off once the mouse has
+    /// moved a few points.
+    override func performDrag(with event: NSEvent) {
+        let start = NSEvent.mouseLocation, origin = frame.origin
+        while let next = nextEvent(matching: [.leftMouseDragged, .leftMouseUp]), next.type == .leftMouseDragged {
+            let mouse = NSEvent.mouseLocation
+            let offset = CGSize(width: mouse.x - start.x, height: mouse.y - start.y)
+            guard isTornOff || hypot(offset.width, offset.height) >= 3 else { continue }
+            tearOff()
+            setFrameOrigin(NSPoint(x: origin.x + offset.width, y: origin.y + offset.height))
+        }
+    }
+
+    /// What a torn-off panel has, as torn-off palettes do: a slim title bar,
+    /// which shows nothing of its own but a small button that closes it, over
+    /// its content, which is told how tall it is, so as to keep clear of it
+    /// or put things in it. It stays the size it was, as the runners board
+    /// is laid out for that size.
+    private static let windowStyle: NSWindow.StyleMask = [.titled, .closable, .utilityWindow, .fullSizeContentView]
+
+    /// Makes the panel a window like any other: it stays where it is put,
+    /// behind other windows or in front of them, until it is closed, which
+    /// its title bar's small button does.
+    func tearOff() {
+        guard !isTornOff else { return }
+        isTornOff = true
+        let kept = frame
+        title = applicationName
+        titleVisibility = .hidden
+        titlebarAppearsTransparent = true
+        styleMask.formUnion(Self.windowStyle)
+        // Not floating over other apps' windows, as a palette would.
+        level = .normal
+        collectionBehavior = [.managed, .participatesInCycle, .fullScreenAuxiliary]
+        setFrame(kept, display: true)
+        for button in [NSWindow.ButtonType.miniaturizeButton, .zoomButton] {
+            standardWindowButton(button)?.isHidden = true
+        }
+        handle.isHidden = true
+        contentView?.superview?.layoutSubtreeIfNeeded()
+        let height = frame.height - contentLayoutRect.height
+        let middle = standardWindowButton(.closeButton).map { frame.height - $0.convert($0.bounds, to: nil).midY }
+        onTitleBar(TitleBar(height: height, middle: middle ?? height / 2))
+        onTearOff()
+    }
+
+    /// Closes the panel, which, if it was torn off, is a popup again the next
+    /// time it opens.
+    override func close() {
+        super.close()
+        guard isTornOff else { return }
+        isTornOff = false
+        level = .popUpMenu
+        collectionBehavior = Self.popupBehavior
+        styleMask.subtract(Self.windowStyle)
+        handle.isHidden = false
+        onTitleBar(.none)
     }
 
     /// A mask with rounded corners, which stretches to any size.
@@ -1233,6 +1426,43 @@ final class DashboardPanel: NSPanel {
         image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
         image.resizingMode = .stretch
         return image
+    }
+}
+
+/// A strip along the top of the dashboard, with a grip, that drags it,
+/// which tears it off into a window of its own; once torn off, the panel
+/// hides it, as the window has a title bar of its own.
+final class TearOffHandle: NSView {
+    static let height: CGFloat = 14
+
+    private let grip = CALayer()
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        grip.cornerRadius = 2
+        layer?.addSublayer(grip)
+        toolTip = "Drag to tear the dashboard off into a window of its own."
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        grip.frame = CGRect(x: bounds.midX - 18, y: bounds.maxY - 8, width: 36, height: 4)
+    }
+
+    override func updateLayer() {
+        grip.backgroundColor = NSColor.tertiaryLabelColor.cgColor
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
     }
 }
 

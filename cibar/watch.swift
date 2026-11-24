@@ -112,6 +112,31 @@ struct ActiveJob: Equatable {
     var runURL: String
     /// The job's page on GitHub.
     var url: String
+    /// The labels a runner must have to take the job, as its workflow asks.
+    var labels: [String] = []
+    /// The runner the job runs on, and that runner's group, once it runs.
+    var runner: String? = nil
+    var runnerGroup: String? = nil
+    /// When the job was queued, or, once it runs, when it started.
+    var since: Date? = nil
+    /// The commit its run runs.
+    var sha = ""
+}
+
+/// How a job that has finished ended: passing, failing, or neither, as one
+/// cancelled or skipped does.
+enum Outcome: Equatable {
+    case passed
+    case failed
+    case neither
+
+    init(_ conclusion: String?) {
+        switch verdict(of: conclusion) {
+        case true?: self = .passed
+        case false?: self = .failed
+        case nil: self = .neither
+        }
+    }
 }
 
 /// A workflow on a branch that turned red or green.
@@ -294,6 +319,8 @@ final class Watch {
     private var pullRequests: [String: [String: PullRequestInfo]] = [:]
     /// The jobs that are queued or running, by job ID.
     private(set) var active: [Int64: ActiveJob] = [:]
+    /// How the latest jobs to finish ended, by job ID.
+    private(set) var outcomes: [Int64: Outcome] = [:]
     private var runs: [Int64: RunInfo] = [:]
     /// Goes up whenever something in `state` changes.
     private(set) var revision = 0
@@ -341,6 +368,8 @@ final class Watch {
     /// late are recognised as late, and how many forgotten branches.
     static let rememberedRuns = 5000
     static let rememberedForgettings = 2000
+    /// How many jobs' outcomes to remember.
+    static let rememberedOutcomes = 500
 
     init(owners: Set<String> = [], restoring state: WatchState = WatchState()) {
         self.owners = owners
@@ -406,7 +435,11 @@ final class Watch {
         let status: String
         let conclusion: String?
         var createdAt: Date? = nil
+        var startedAt: Date? = nil
         var completedAt: Date? = nil
+        var labels: [String]? = nil
+        var runnerName: String? = nil
+        var runnerGroupName: String? = nil
     }
 
     /// A run, as deliveries and GitHub's API describe it.
@@ -637,6 +670,17 @@ final class Watch {
         touched[workflowBranch] = (touched[workflowBranch]?.wasRed ?? isRed(workflowBranch), run)
     }
 
+    /// Notes that job `id` ended `outcome`, forgetting the oldest outcomes
+    /// once there are a fifth more than `rememberedOutcomes`.
+    private func ended(_ id: Int64, _ outcome: Outcome) {
+        outcomes[id] = outcome
+        if outcomes.count > Self.rememberedOutcomes + Self.rememberedOutcomes / 5 {
+            for old in outcomes.keys.sorted().prefix(outcomes.count - Self.rememberedOutcomes) {
+                outcomes[old] = nil
+            }
+        }
+    }
+
     private func job(_ job: Job) {
         let order = RunOrder(run: job.runId, attempt: job.runAttempt ?? 1)
         guard let info = attempt(order) else { return }
@@ -649,6 +693,7 @@ final class Watch {
         if job.status == "completed" {
             runs[order.run]?.finishedJobs.insert(job.id)
             active[job.id] = nil
+            ended(job.id, Outcome(job.conclusion))
             runs[order.run]?.unfinishedJobs.remove(job.id)
             let passed = verdict(of: job.conclusion)
             // GitHub makes a job that needs others only once they have
@@ -696,7 +741,11 @@ final class Watch {
         }
         active[job.id] = ActiveJob(workflowBranch: workflowBranch, name: job.name,
                                    order: order, running: running, runURL: details.url,
-                                   url: job.htmlUrl ?? details.url)
+                                   url: job.htmlUrl ?? details.url, labels: job.labels ?? [],
+                                   runner: running ? job.runnerName.flatMap { $0.isEmpty ? nil : $0 } : nil,
+                                   runnerGroup: running ? job.runnerGroupName.flatMap { $0.isEmpty ? nil : $0 } : nil,
+                                   since: running ? job.startedAt ?? job.createdAt : job.createdAt,
+                                   sha: details.sha)
     }
 
     private func run(_ run: Run, in repository: String) {
@@ -727,6 +776,13 @@ final class Watch {
 
         runs[run.id]?.finished = true
         let unfinished = Set(active.filter { $0.value.order == order }.keys)
+        // Its jobs still queued or running have ended, as it has, though
+        // nothing has said so yet, or ever will, as for those of a run
+        // cancelled while they were queued: all passed if it passed, and
+        // otherwise, as far as is known, neither passed nor failed.
+        for id in active.keys where active[id]?.order.run == run.id {
+            ended(id, verdict(of: run.conclusion) == true ? .passed : .neither)
+        }
         active = active.filter { $0.value.order.run != run.id }
         switch verdict(of: run.conclusion) {
         case true?:
