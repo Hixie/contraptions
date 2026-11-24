@@ -642,7 +642,10 @@ This copies the binary to `~/.local/bin/cibar`, generates a launchd user
 agent at `~/Library/LaunchAgents/local.cibar.plist` from the template in
 this directory, and starts it. The agent starts cibar at login and restarts
 it if it crashes. Running `make install` again rebuilds, reinstalls, and
-restarts it; the Codex sessions it started go on.
+restarts it; the Codex sessions it started go on. The agent's process type
+is Interactive, so launchd does not limit the processor time or disk
+bandwidth of cibar or of the commands it runs to start Codex sessions, as it
+does for a job that names no process type.
 
 ```sh
 make uninstall

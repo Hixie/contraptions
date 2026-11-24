@@ -213,6 +213,7 @@ enum LoginItem {
                 "--instance", String(instance),
                 "--launchd",
             ],
+            "ProcessType": "Interactive",
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
         ]

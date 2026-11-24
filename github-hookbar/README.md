@@ -423,7 +423,10 @@ user agent at `~/Library/LaunchAgents/local.github-hookbar.plist` from the
 template in this directory, and starts it. The agent starts the indicator at
 login and restarts it if it crashes; quitting from the menu (a clean exit)
 does not trigger a restart. Running `make install` again rebuilds, reinstalls,
-and restarts the running indicator.
+and restarts the running indicator. The agent's process type is Interactive,
+so launchd does not limit the processor time or disk bandwidth of
+github-hookbar or of the commands it runs, as it does for a job that names no
+process type.
 
 ```sh
 make uninstall

@@ -187,7 +187,10 @@ responsible for the running indicator immediately, rather than only after the
 next login, so it can start the indicator again after an abnormal exit.
 Several indicators mean several agents, one per number, and every one of them
 starts at login. The agent points at wherever the program was run from, so
-running the copy in `~/.local/bin` is what registers that copy.
+running the copy in `~/.local/bin` is what registers that copy. The agent's
+process type is Interactive, so launchd does not limit the processor time or
+disk bandwidth of ghbar or of the first turn of each Codex session it starts,
+as it does for a job that names no process type.
 
 **Disable and Quit** deletes that indicator's agent, stops its launchd job, and
 exits. The indicator stops coming back at login. Its settings stay behind, so

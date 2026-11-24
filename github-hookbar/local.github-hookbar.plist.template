@@ -8,6 +8,8 @@
 	<array>
 		<string>@BINARY@</string>
 	</array>
+	<key>ProcessType</key>
+	<string>Interactive</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
