@@ -1,2 +1,3 @@
 touch-gate/server/testdata/** test
 touch-gate/server/src/tests.rs test
+claude-account-switch/test-* test
