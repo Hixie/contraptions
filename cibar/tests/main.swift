@@ -564,6 +564,9 @@ do {
 do {
     let watch = Watch()
     _ = try watch.turns(event: "workflow_run", body: run(1, status: "in_progress"))
+    _ = try watch.turns(event: "workflow_run", body: run(0, workflow: "Rare", status: "in_progress"))
+    _ = try watch.turns(event: "workflow_job", body: job(9, run: 0, name: "check", status: "completed",
+                                                         conclusion: "failure"))
     for id in 2...Int64(Watch.rememberedRuns + Watch.rememberedRuns / 5 + 1) {
         _ = try watch.turns(event: "workflow_run", body: run(id, status: "completed", conclusion: "success"))
     }
@@ -573,6 +576,9 @@ do {
     _ = try watch.turns(event: "workflow_run", body: run(last + 1, status: "in_progress"))
     expect(watch.active[1] == nil && watch.active[2] != nil,
            "once there are too many runs, the oldest are forgotten")
+    expect(watch.failure(of: "check", on: on("Rare"))?.context.runURL == "https://github.com/octo/repo/actions/runs/0"
+           && watch.state.failedRuns.map(\.run) == [0],
+           "what a forgotten run that a job last failed in said is kept, and saved")
 } catch {
     expect(false, "deliveries are read: \(error)")
 }
@@ -630,6 +636,34 @@ do {
     expect(changes.failures.map(\.job) == ["status"]
            && changes.failures.first?.failedBefore == ["shard 1/3", "shard 3/3"],
            "a job made once others had failed may need them, which its failure says: \(changes.failures)")
+    _ = try watch.handle(event: "workflow_job", body: job(
+        2, run: 10, name: "shard 2/3", status: "completed", conclusion: "success"))
+    let told = watch.failure(of: "status", on: on("CI"))
+    expect(told?.url == changes.failures.first?.url && told?.failedBefore == ["shard 1/3", "shard 3/3"]
+           && told?.context.run == 10 && told?.context.event == "push" && told?.context.onDefaultBranch == true,
+           "a failing job's failure can be told again as it was delivered: \(String(describing: told))")
+    let saved = try JSONDecoder().decode(WatchState.self, from: JSONEncoder().encode(watch.state))
+    let retold = Watch(restoring: saved).failure(of: "status", on: on("CI"))
+    expect(retold?.url == told?.url && retold?.failedBefore == told?.failedBefore
+           && retold?.context.run == 10 && retold?.context.event == "push" && retold?.context.sha == told?.context.sha
+           && retold?.context.runURL == told?.context.runURL && retold?.context.fromFork == false,
+           "a failure can be told again once what cibar knows has been saved and read back: "
+           + "\(String(describing: retold))")
+    expect(watch.failure(of: "shard 2/3", on: on("CI")) == nil && watch.failure(of: "status", on: on("CI", "x")) == nil
+           && Watch(restoring: WatchState(verdicts: saved.verdicts)).failure(of: "status", on: on("CI")) == nil,
+           "a job that passed or never ran has no failure to tell, and nor has one whose run cibar knows "
+           + "nothing of")
+    let fresh = Watch()
+    _ = try fresh.handle(event: "workflow_run", body: run(10, status: "in_progress"))
+    fresh.keep(watch, where: { _ in true }, activeIn: { _ in true })
+    expect(fresh.failure(of: "status", on: on("CI"))?.failedBefore == ["shard 1/3", "shard 3/3"],
+           "what failed before a job is kept from before a read that saw its run but not its jobs")
+    let restored = Watch(restoring: saved)
+    _ = try restored.handle(event: "workflow_run", body: run(10, status: "completed", conclusion: "failure"))
+    _ = try watch.handle(event: "workflow_run", body: run(10, attempt: 2, status: "in_progress"))
+    expect(restored.failure(of: "status", on: on("CI"))?.failedBefore == ["shard 1/3", "shard 3/3"]
+           && watch.failure(of: "status", on: on("CI"))?.failedBefore == ["shard 1/3", "shard 3/3"],
+           "what failed before a job is still known once its run says more, or is run again")
     _ = try watch.handle(event: "workflow_run", body: run(11, status: "in_progress"))
     changes = try watch.handle(event: "workflow_job", body: job(
         5, run: 11, name: "status", status: "completed", conclusion: "failure",
@@ -1108,6 +1142,38 @@ do {
            && reasons(blank, false) == [.skip("request is empty")],
            "without Codex settings, while sessions are paused, or with an empty request, no session is started, "
            + "and the failure says why")
+    let watch = Watch()
+    _ = try watch.handle(event: "workflow_run", body: run(1, status: "in_progress"))
+    _ = try watch.handle(event: "workflow_job", body: job(10, run: 1, name: "test", status: "completed",
+                                                          conclusion: "failure"))
+    _ = try watch.handle(event: "workflow_run", body: run(2, workflow: "Target", event: "pull_request_target",
+                                                          status: "in_progress"))
+    _ = try watch.handle(event: "workflow_job", body: job(20, run: 2, name: "test", status: "completed",
+                                                          conclusion: "failure"))
+    let test = JobKey(workflowBranch: on("CI"), job: "test")
+    expect(handSentRequest(for: test, in: watch, codex: codex, records: [])
+               == SessionRequest(target: "repo CI on main: test", prompt: "Fix test on main.",
+                                 folder: URL(fileURLWithPath: "/work")),
+           "a failing job sent by hand starts a session, though sessions may be paused")
+    expect(handSentRequest(for: JobKey(workflowBranch: on("Target"), job: "test"), in: watch, codex: codex,
+                           records: []) == nil
+           && handSentRequest(for: test, in: watch, codex: nil, records: []) == nil
+           && handSentRequest(for: JobKey(workflowBranch: on("CI"), job: "lint"), in: watch, codex: codex,
+                              records: []) == nil
+           && handSentRequest(for: test, in: watch, codex: codex,
+                              records: [CodexRecord(job: test, at: Date(), outcome: .sent(thread: "t"))]) == nil,
+           "a failure strangers could word, a job that is not failing, one already sent, or one without Codex "
+           + "settings, cannot be sent by hand")
+    _ = try watch.handle(event: "workflow_run", body: run(3, branch: "feature", status: "in_progress"))
+    _ = try watch.handle(event: "workflow_job", body: job(30, run: 3, name: "test", status: "completed",
+                                                          conclusion: "failure"))
+    expect(watch.failure(of: "test", on: on("CI", "feature")) != nil
+           && handSentRequest(for: JobKey(workflowBranch: on("CI", "feature"), job: "test"), in: watch, codex: codex,
+                              records: []) == nil
+           && !watch.state.failedRuns.map(\.run).contains(3),
+           "a failure off a default branch cannot be sent by hand, and what its run said is not saved")
+} catch {
+    expect(false, "deliveries are read: \(error)")
 }
 
 // MARK: - The settings window
@@ -1462,8 +1528,22 @@ do {
     let rerun = DashboardState(watch: again, at: now, connection: .connected, sessions: true,
                                includesPullRequests: false).failing.first?.jobs ?? []
     expect(rerun.map(\.name) == ["lint", "test"]
-           && rerun.map(\.rerun) == [nil, URL(string: "https://github.com/octo/repo/actions/runs/2/job/20")],
+           && rerun.map(\.rerun) == [nil, DashboardState.Rerun(
+               url: URL(string: "https://github.com/octo/repo/actions/runs/2/job/20")!, running: false)],
            "a failed job queued or running in a later run is running again there, and another is not: \(rerun)")
+    _ = try again.turns(event: "workflow_job", body: job(20, run: 2, name: "test", status: "in_progress"), at: now)
+    let codex = CodexSettings(folder: URL(fileURLWithPath: "/work"), prompt: "Fix {job}.")
+    let unsent = DashboardState(
+        watch: again, at: now, connection: .connected, sessions: false, codex: codex,
+        records: [CodexRecord(job: JobKey(workflowBranch: on("CI"), job: "lint"), at: now,
+                              outcome: .notSent(reason: "Codex paused"))],
+        sending: [JobKey(workflowBranch: on("CI"), job: "test")], includesPullRequests: false).failing.first?.jobs ?? []
+    expect(unsent.map(\.sendable) == [true, true] && unsent.map(\.sending) == [false, true]
+           && unsent.last?.rerun?.running == true,
+           "a failing job not sent to Codex, or that cibar missed, can be sent by hand, and one being sent "
+           + "says so: \(unsent)")
+    expect(state.failing.first?.jobs.map(\.sendable) == [false],
+           "without Codex settings, nothing can be sent by hand")
     let sentWatch = Watch()
     _ = try sentWatch.turns(event: "workflow_run", body: run(1, status: "in_progress"), at: now)
     for (id, name) in [(10, "test"), (11, "build")] {
@@ -1479,10 +1559,12 @@ do {
         CodexRecord(job: JobKey(workflowBranch: on("CI"), job: "lint"), at: now, outcome: .sent(thread: "not failing")),
         CodexRecord(job: JobKey(workflowBranch: on("CI", "feature"), job: "test"), at: now, outcome: .sent(thread: "elsewhere")),
     ]
-    let jobs = DashboardState(watch: sentWatch, at: now, connection: .connected, sessions: true, records: sessions,
-                              includesPullRequests: false).failing.first?.jobs ?? []
-    expect(jobs.map(\.name) == ["build", "test"] && jobs.map(\.codex) == [sessions[1], sessions[0]],
-           "each failing job shows what cibar did about it, and nothing about another: \(jobs)")
+    let jobs = DashboardState(watch: sentWatch, at: now, connection: .connected, sessions: true, codex: codex,
+                              records: sessions, includesPullRequests: false).failing.first?.jobs ?? []
+    expect(jobs.map(\.name) == ["build", "test"] && jobs.map(\.codex) == [sessions[1], sessions[0]]
+           && jobs.allSatisfy { !$0.sendable },
+           "each failing job shows what cibar did about it, and nothing about another, and one already sent "
+           + "cannot be sent again: \(jobs)")
     let sent = jobs.last?.codex
     expect(sent?.url?.absoluteString == "codex://threads/a/b%20c",
            "a session opens in the Codex app at its thread: \(String(describing: sent?.url))")
@@ -1726,13 +1808,14 @@ final class ProgressRecord: @unchecked Sendable {
 }
 
 /// Reads from the stand-in, as cibar reads from GitHub.
-func readStandIn(owners: [String], alsoReading: Set<String> = [], now: Date,
+func readStandIn(owners: [String], alsoReading: Set<String> = [], missing: [String: Set<Int64>] = [:], now: Date,
                  progress: ProgressRecord = ProgressRecord()) -> Result<PrimedState, Error> {
     let api = GitHubAPI(token: "t", session: standInSession)
     var result: Result<PrimedState, Error>?
     Task {
         result = await Result {
-            try await api.prime(owners: owners, alsoReading: alsoReading, now: now, progress: { progress.add($0, $1) })
+            try await api.prime(owners: owners, alsoReading: alsoReading, missing: missing, now: now,
+                                progress: { progress.add($0, $1) })
         }
     }
     waitUntil { result != nil }
@@ -1759,12 +1842,15 @@ do {
         run["conclusion"] = conclusion
         return run
     }
-    func apiJob(_ id: Int, run: Int, _ name: String, status: String, conclusion: String? = nil) -> [String: Any] {
+    func apiJob(_ id: Int, run: Int, _ name: String, status: String, conclusion: String? = nil,
+                created: Double? = nil, completed: Double? = nil) -> [String: Any] {
         var job: [String: Any] = [
             "id": id, "run_id": run, "run_attempt": 1, "name": name, "status": status,
             "html_url": "https://github.com/octo/repo/actions/runs/\(run)/job/\(id)",
         ]
         job["conclusion"] = conclusion
+        job["created_at"] = created.map(stamp)
+        job["completed_at"] = completed.map(stamp)
         return job
     }
     func workflow(_ name: String, _ state: String = "active") -> [String: Any] {
@@ -1864,6 +1950,45 @@ do {
     _ = readStandIn(owners: ["octo"], alsoReading: ["octo/old"], now: now)
     expect(StandInGitHub.asked.contains("/repos/octo/old/actions/workflows?per_page=100"),
            "a quiet repository is read when it is red")
+
+    // A run that a job still failing failed in, which the latest runs do not
+    // include, is read for what it said.
+    var withNightly = pages
+    withNightly["/repos/octo/repo/actions/workflows?per_page=100"] = Page(body: ["workflows": [
+        workflow("CI"), workflow("Lint"), workflow("Nightly"),
+    ]])
+    withNightly["/repos/octo/repo/actions/runs/100"] = Page(
+        body: apiRun(100, "Nightly", status: "completed", conclusion: "failure", hoursAgo: 200))
+    withNightly["/repos/octo/repo/actions/runs/100/jobs?per_page=100"] = Page(body: ["jobs": [
+        apiJob(1001, run: 100, "build", status: "completed", conclusion: "failure", created: 201, completed: 200.5),
+        apiJob(1000, run: 100, "check", status: "completed", conclusion: "failure", created: 200, completed: 199),
+    ]])
+    StandInGitHub.pages = withNightly
+    let nightly = WorkflowBranch(repository: "octo/repo", workflow: "Nightly", path: ".github/workflows/Nightly.yml",
+                                 branch: "main")
+    let saved = Watch(restoring: WatchState(
+        verdicts: [WatchState.Entry(workflowBranch: nightly, job: "check", verdict: Verdict(
+            order: RunOrder(run: 100, attempt: 1), passed: false,
+            url: "https://github.com/octo/repo/actions/runs/100/job/1000"))],
+        defaultBranches: ["octo/repo": "main"]))
+    expect(saved.unknownFailingRuns == ["octo/repo": [100]] && saved.failure(of: "check", on: nightly) == nil,
+           "a failure saved without what its run said cannot be told again: \(saved.unknownFailingRuns)")
+    StandInGitHub.asked = []
+    // Run 2 is among the latest runs, so it is not read again on its own;
+    // run 101 has been deleted.
+    let reread = (try? readStandIn(owners: ["octo"], missing: ["octo/repo": [2, 100, 101]], now: now).get())
+        ?? PrimedState()
+    let known = Watch.refreshed(from: reread, previous: saved, deliveries: []).watch
+    let check = known.failure(of: "check", on: nightly)
+    expect(check?.context.runURL == "https://github.com/octo/repo/actions/runs/100" && check?.failedBefore == ["build"]
+           && known.unknownFailingRuns.isEmpty && reread.problems.isEmpty
+           && StandInGitHub.asked.contains("/repos/octo/repo/actions/runs/101")
+           && !StandInGitHub.asked.contains("/repos/octo/repo/actions/runs/2")
+           && known.state.failedRuns.map(\.run).contains(100),
+           "a run a failure needs is read, with which of its jobs failed before others, when the latest runs do "
+           + "not include it, and only then, and saved; one since deleted is no problem: "
+           + "\(reread.problems) \(StandInGitHub.asked.filter { $0.contains("/runs/") })")
+    StandInGitHub.pages = pages
 
     // What cannot be read is said to be, and the rest is read.
     var broken = pages

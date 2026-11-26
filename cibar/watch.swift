@@ -243,19 +243,35 @@ struct WatchState: Codable, Equatable {
         var at: Date
     }
 
+    /// What a run said: what started it, whether it ran a fork's code, the
+    /// commit it ran, and its page; and, for each of its jobs that failed,
+    /// the jobs of it that had failed before that one was made.
+    struct RunRecord: Codable, Equatable {
+        var run: Int64
+        var event: String
+        var fromFork: Bool
+        var sha: String
+        var url: String
+        var failedBefore: [String: [String]]
+    }
+
     var verdicts: [Entry] = []
     var passes: [Pass] = []
     var forgotten: [Forgetting] = []
     var defaultBranches: [String: String] = [:]
     var defaultBranchRuns: [String: Date] = [:]
     var defaultBranchActivity: [String: Activity] = [:]
+    /// The runs that jobs that last failed on default branches failed in, so
+    /// that their failures can be told again, as when sent to Codex by hand.
+    var failedRuns: [RunRecord] = []
 
     init(verdicts: [Entry] = [], passes: [Pass] = [], forgotten: [Forgetting] = [],
          defaultBranches: [String: String] = [:], defaultBranchRuns: [String: Date] = [:],
-         defaultBranchActivity: [String: Activity] = [:]) {
+         defaultBranchActivity: [String: Activity] = [:], failedRuns: [RunRecord] = []) {
         self.verdicts = verdicts
         self.passes = passes
         self.forgotten = forgotten
+        self.failedRuns = failedRuns
         self.defaultBranches = defaultBranches
         self.defaultBranchRuns = defaultBranchRuns
         self.defaultBranchActivity = defaultBranchActivity
@@ -268,6 +284,7 @@ struct WatchState: Codable, Equatable {
         verdicts = container.decodeEach(Entry.self, forKey: .verdicts)
         passes = container.decodeEach(Pass.self, forKey: .passes)
         forgotten = container.decodeEach(Forgetting.self, forKey: .forgotten)
+        failedRuns = container.decodeEach(RunRecord.self, forKey: .failedRuns)
         defaultBranches = ((try? container.decodeIfPresent([String: Readable<String>].self,
                                                            forKey: .defaultBranches)) ?? nil)?
             .compactMapValues(\.element) ?? [:]
@@ -322,6 +339,9 @@ final class Watch {
     /// How the latest jobs to finish ended, by job ID.
     private(set) var outcomes: [Int64: Outcome] = [:]
     private var runs: [Int64: RunInfo] = [:]
+    /// What runs that jobs failed in said, as saved, or as known when they
+    /// were forgotten.
+    private var savedRuns: [Int64: WatchState.RunRecord] = [:]
     /// Goes up whenever something in `state` changes.
     private(set) var revision = 0
     /// The run whose name each workflow branch is shown by.
@@ -331,7 +351,7 @@ final class Watch {
     /// changed it.
     private var touched: [WorkflowBranch: (wasRed: Bool, run: Int64)] = [:]
     /// The failures the delivery being taken in has recorded.
-    private var recorded: [(workflowBranch: WorkflowBranch, job: String, verdict: Verdict, failedBefore: [String])] = []
+    private var recorded: [(workflowBranch: WorkflowBranch, job: String, verdict: Verdict)] = []
 
     /// What a delivery about a run says about it.
     private struct RunDetails {
@@ -354,6 +374,9 @@ final class Watch {
         /// The jobs of this attempt that failed, and when, of those whose
         /// deliveries said.
         var failures: [(job: String, at: Date)] = []
+        /// For each job of this attempt that failed, the jobs of the attempt
+        /// that had failed before it was made.
+        var failedBefore: [String: [String]] = [:]
         /// The attempt's failure, held back when it failed with jobs still
         /// unfinished, in case one of them says why; and those jobs.
         var heldFailure: Verdict?
@@ -385,6 +408,9 @@ final class Watch {
         for forgetting in state.forgotten {
             forgotten[forgetting.workflowBranch] = forgetting.at
         }
+        for record in state.failedRuns {
+            savedRuns[record.run] = record
+        }
     }
 
     var state: WatchState {
@@ -402,7 +428,8 @@ final class Watch {
             },
             defaultBranches: defaultBranches,
             defaultBranchRuns: defaultBranchRuns,
-            defaultBranchActivity: defaultBranchActivity)
+            defaultBranchActivity: defaultBranchActivity,
+            failedRuns: failingRuns.sorted().compactMap(runRecord(_:)))
     }
 
     // MARK: Reading deliveries
@@ -610,14 +637,9 @@ final class Watch {
         let turns = touched.sorted { $0.key < $1.key }.compactMap { workflowBranch, touch in
             isRed(workflowBranch) == touch.wasRed ? nil : transition(workflowBranch, by: touch.run)
         }
-        let failures = recorded.compactMap { recorded -> Failure? in
-            transition(recorded.workflowBranch, by: recorded.verdict.order.run).map { context in
-                let pass = passes[recorded.workflowBranch].flatMap { $0.sha == context.sha ? $0.order.run : nil }
-                return Failure(job: recorded.job, url: recorded.verdict.url, context: context,
-                               failedBefore: recorded.failedBefore,
-                               passedURL: pass.map { "https://github.com/\(recorded.workflowBranch.repository)/actions/runs/\($0)" })
-            }
-        }
+        // A job allowed to fail, in a run that passed, no longer fails once
+        // the run's news has been taken in, but its failure still counts.
+        let failures = recorded.compactMap { failure(of: $0.job, on: $0.workflowBranch, as: $0.verdict) }
         touched = [:]
         recorded = []
         return Changes(turns: turns, failures: failures)
@@ -647,8 +669,11 @@ final class Watch {
         }
         if order.attempt > info.attempt {
             // Jobs of the new attempt wait for news of it, which says when it
-            // started.
+            // started. Its jobs that last failed in an earlier attempt still
+            // had the same jobs fail before them there.
+            let failedBefore = info.failedBefore
             info = RunInfo(attempt: order.attempt)
+            info.failedBefore = failedBefore
             active = active.filter { $0.value.order.run != order.run }
             runs[order.run] = info
         }
@@ -656,12 +681,56 @@ final class Watch {
     }
 
     /// Forgets the oldest runs once there are a fifth more than
-    /// `rememberedRuns`.
+    /// `rememberedRuns`, keeping what those that jobs last failed in said,
+    /// and only those.
     private func prune() {
         guard runs.count > Self.rememberedRuns + Self.rememberedRuns / 5 else { return }
+        let failing = failingRuns
+        savedRuns = savedRuns.filter { failing.contains($0.key) }
         for run in runs.keys.sorted().prefix(runs.count - Self.rememberedRuns) {
+            if failing.contains(run) {
+                savedRuns[run] = runRecord(run)
+            }
             runs[run] = nil
         }
+    }
+
+    /// The runs that jobs that last failed on default branches failed in.
+    private var failingRuns: Set<Int64> {
+        Set(failingRunsByRepository.values.joined())
+    }
+
+    /// The runs that jobs that last failed on default branches failed in, by
+    /// repository.
+    private var failingRunsByRepository: [String: Set<Int64>] {
+        verdicts.filter { isOnDefaultBranch($0.key) }.reduce(into: [:]) { runs, entry in
+            for verdict in entry.value.values where !verdict.passed {
+                runs[entry.key.repository, default: []].insert(verdict.order.run)
+            }
+        }
+    }
+
+    /// The runs that jobs that last failed on default branches failed in and
+    /// that cibar knows nothing of, by repository, to be read from GitHub.
+    var unknownFailingRuns: [String: Set<Int64>] {
+        failingRunsByRepository.mapValues { $0.filter { runRecord($0) == nil } }.filter { !$0.value.isEmpty }
+    }
+
+    /// Takes what a run said, as read from GitHub. What deliveries say of
+    /// the run comes first.
+    func learn(_ record: WatchState.RunRecord) {
+        savedRuns[record.run] = record
+    }
+
+    /// What `run` and its `jobs` said, as GitHub's API gives them.
+    static func runRecord(of run: Run, jobs: [Job], in repository: Repository, at time: Date)
+        -> WatchState.RunRecord? {
+        let scratch = Watch()
+        _ = scratch.take(.run(run), about: repository, at: time)
+        for job in jobs {
+            _ = scratch.take(.job(job), about: repository, at: time)
+        }
+        return scratch.runRecord(run.id)
     }
 
     /// Notes that the delivery being taken in is about to change a workflow
@@ -700,12 +769,11 @@ final class Watch {
             // finished, so one made after others failed may have failed
             // because of them; jobs made together, such as a matrix's,
             // cannot have, even one that waited for a runner.
-            var failedBefore: [String] = []
             if passed == false {
                 let failures = runs[order.run]?.failures ?? []
-                if let created = job.createdAt {
-                    failedBefore = failures.filter { $0.at <= created && $0.job != job.name }.map(\.job)
-                }
+                runs[order.run]?.failedBefore[job.name] = job.createdAt.map { created in
+                    failures.filter { $0.at <= created && $0.job != job.name }.map(\.job)
+                } ?? []
                 if let completed = job.completedAt, !failures.contains(where: { $0.job == job.name }) {
                     runs[order.run]?.failures.append((job.name, completed))
                 }
@@ -728,7 +796,7 @@ final class Watch {
                 revision += 1
             }
             record(Verdict(order: order, passed: passed, url: job.htmlUrl ?? details.url),
-                   for: job.name, on: workflowBranch, failedBefore: failedBefore)
+                   for: job.name, on: workflowBranch)
             return
         }
         // Deliveries can arrive out of order, so one that says a job is
@@ -843,10 +911,8 @@ final class Watch {
 
     /// Records how a job finished, unless a later attempt has already
     /// finished it, or it failed in a run no later than one that passed, and
-    /// notes a failure it records, with the jobs of its run that had failed
-    /// before it was made.
-    private func record(_ verdict: Verdict, for job: String, on workflowBranch: WorkflowBranch,
-                        failedBefore: [String] = []) {
+    /// notes a failure it records.
+    private func record(_ verdict: Verdict, for job: String, on workflowBranch: WorkflowBranch) {
         if let earlier = verdicts[workflowBranch]?[job], earlier.order > verdict.order {
             return
         }
@@ -858,16 +924,47 @@ final class Watch {
         touch(workflowBranch, by: verdict.order.run)
         verdicts[workflowBranch, default: [:]][job] = verdict
         if !verdict.passed {
-            recorded.append((workflowBranch, job, verdict, failedBefore))
+            recorded.append((workflowBranch, job, verdict))
         }
         revision += 1
     }
 
+    /// The failure of `job` on a workflow branch, as it was delivered, if
+    /// the job last failed and cibar knows what the run it failed in said.
+    func failure(of job: String, on workflowBranch: WorkflowBranch) -> Failure? {
+        guard let verdict = verdicts[workflowBranch]?[job], !verdict.passed else { return nil }
+        return failure(of: job, on: workflowBranch, as: verdict)
+    }
+
+    /// The failure of `job` on a workflow branch that `verdict` says, if
+    /// cibar knows what the run it failed in said.
+    private func failure(of job: String, on workflowBranch: WorkflowBranch, as verdict: Verdict) -> Failure? {
+        guard let record = runRecord(verdict.order.run) else { return nil }
+        let context = transition(workflowBranch, by: record)
+        let pass = passes[workflowBranch].flatMap { $0.sha == context.sha ? $0.order.run : nil }
+        return Failure(job: job, url: verdict.url, context: context, failedBefore: record.failedBefore[job] ?? [],
+                       passedURL: pass.map { "https://github.com/\(workflowBranch.repository)/actions/runs/\($0)" })
+    }
+
+    /// What a run said, as a delivery about it did, or as was saved; and,
+    /// for each of its jobs that failed, the jobs that failed before it, as
+    /// deliveries said or else as was saved.
+    private func runRecord(_ run: Int64) -> WatchState.RunRecord? {
+        let saved = savedRuns[run]
+        guard let info = runs[run], let details = info.details else { return saved }
+        return WatchState.RunRecord(run: run, event: details.event, fromFork: details.fromFork, sha: details.sha,
+                                    url: details.url,
+                                    failedBefore: (saved?.failedBefore ?? [:]).merging(info.failedBefore) { $1 })
+    }
+
     private func transition(_ workflowBranch: WorkflowBranch, by run: Int64) -> Transition? {
-        guard let details = runs[run]?.details else { return nil }
-        return Transition(
-            workflowBranch: workflowBranch, red: isRed(workflowBranch), run: run,
-            event: details.event, fromFork: details.fromFork, sha: details.sha, runURL: details.url,
+        runRecord(run).map { transition(workflowBranch, by: $0) }
+    }
+
+    private func transition(_ workflowBranch: WorkflowBranch, by record: WatchState.RunRecord) -> Transition {
+        Transition(
+            workflowBranch: workflowBranch, red: isRed(workflowBranch), run: record.run,
+            event: record.event, fromFork: record.fromFork, sha: record.sha, runURL: record.url,
             onDefaultBranch: isOnDefaultBranch(workflowBranch),
             failures: failures(on: workflowBranch))
     }
@@ -934,6 +1031,11 @@ final class Watch {
         // when it happened, and a read sees only the latest runs.
         defaultBranchActivity.merge(previous.defaultBranchActivity) { _, previous in previous }
         runs.merge(previous.runs) { mine, _ in mine }
+        // A run read afresh says nothing of which of its jobs failed before
+        // others, when its jobs were not read.
+        for run in previous.failingRuns where savedRuns[run] == nil {
+            savedRuns[run] = previous.runRecord(run)
+        }
         pullRequests.merge(previous.pullRequests) { mine, _ in mine }
         revision += 1
     }

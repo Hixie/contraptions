@@ -23,9 +23,18 @@ struct DashboardState: Equatable {
         var url: URL?
         /// What cibar did about the job, if it failed and cibar did anything.
         var codex: CodexRecord? = nil
-        /// The job's page in a later run, if, having failed, it is queued or
+        /// Whether, having failed and not been sent to Codex, it can be sent
+        /// by hand, and whether it is being sent.
+        var sendable = false
+        var sending = false
+        /// The job in a later run, if, having failed, it is queued or
         /// running again.
-        var rerun: URL? = nil
+        var rerun: Rerun? = nil
+    }
+
+    struct Rerun: Equatable {
+        var url: URL
+        var running: Bool
     }
 
     struct Failing: Equatable, Identifiable {
@@ -207,7 +216,8 @@ extension DashboardState {
     init(watch: Watch, at now: Date, connection: Connection, lateness: Lateness = Lateness(),
          deliveryProblem: String? = nil,
          refreshing: Bool = false, refreshProgress: RefreshProgress? = nil, refreshProblem: String? = nil,
-         sessions: Bool?, records: [CodexRecord] = [], includesPullRequests: Bool,
+         sessions: Bool?, codex: CodexSettings? = nil, records: [CodexRecord] = [], sending: Set<JobKey> = [],
+         includesPullRequests: Bool,
          showsRunners: Bool = false, runners: [Runner] = [], larger: [LargerRunner] = [],
          runnersProblem: String? = nil) {
         self.connection = connection
@@ -229,12 +239,19 @@ extension DashboardState {
             .map { workflowBranch in
                 Failing(workflowBranch: workflowBranch, onDefaultBranch: watch.isOnDefaultBranch(workflowBranch),
                         jobs: watch.failures(on: workflowBranch).map { failure in
-                            Job(id: failure.name,
-                                name: failure.name == wholeWorkflow ? "the run" : failure.name.abbreviatingHashes,
-                                running: false,
-                                url: URL(string: failure.url),
-                                codex: records.last { $0.job == JobKey(workflowBranch: workflowBranch, job: failure.name) },
-                                rerun: watch.rerun(of: failure.name, on: workflowBranch).flatMap { URL(string: $0.url) })
+                            let key = JobKey(workflowBranch: workflowBranch, job: failure.name)
+                            let record = records.last { $0.job == key }
+                            return Job(id: failure.name,
+                                       name: failure.name == wholeWorkflow ? "the run" : failure.name.abbreviatingHashes,
+                                       running: false,
+                                       url: URL(string: failure.url),
+                                       codex: record,
+                                       sendable: handSentRequest(for: key, in: watch, codex: codex,
+                                                                 records: records) != nil,
+                                       sending: sending.contains(key),
+                                       rerun: watch.rerun(of: failure.name, on: workflowBranch).flatMap { job in
+                                           URL(string: job.url).map { Rerun(url: $0, running: job.running) }
+                                       })
                         })
             }
         runs = Dictionary(grouping: watch.active, by: \.value.order.run)
@@ -279,6 +296,7 @@ struct RefreshProgress: Equatable {
 /// What the dashboard's controls do.
 struct DashboardActions {
     var setSessions: (Bool) -> Void = { _ in }
+    var send: (JobKey) -> Void = { _ in }
     var showSettings: () -> Void = {}
     var flyBanners: () -> Void = {}
     var quit: () -> Void = {}
@@ -611,7 +629,7 @@ struct DashboardView: View {
     }
 
     private var sessionsSwitch: some View {
-        Toggle("Send default-branch failures to Codex", isOn: Binding(
+        Toggle("Automatically send main failures to Codex", isOn: Binding(
             get: { state.sessions ?? false },
             set: { actions.setSessions($0) }))
             .toggleStyle(SwitchFirst())
@@ -620,7 +638,8 @@ struct DashboardView: View {
             .help(state.sessions == nil
                   ? "The configuration file has no [codex] section, which says where sessions start and what "
                     + "they are asked, so cibar starts none."
-                  : "Whether each job that fails on a default branch starts a Codex session to fix it.")
+                  : "Whether each job that fails on a default branch starts a Codex session to fix it as it "
+                    + "fails. A failure not sent can be sent by hand from its line.")
     }
 
     /// The Running column's heading, which stays put as the column scrolls.
@@ -832,17 +851,19 @@ private struct FailingCard: View, Equatable {
                     }
                     .buttonStyle(.plain)
                     .help("Open the job on GitHub")
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        CodexLine(record: job.codex, open: actions.open)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        CodexLine(job: job, open: actions.open) {
+                            actions.send(JobKey(workflowBranch: failing.workflowBranch, job: job.id))
+                        }
                         if let rerun = job.rerun {
-                            Text("·")
                             Button {
-                                actions.open(rerun)
+                                actions.open(rerun.url)
                             } label: {
-                                Text("running again").foregroundStyle(.link)
+                                JobSymbol(running: rerun.running)
                             }
                             .buttonStyle(.plain)
-                            .help("Open the later run of this job, which will replace this failure")
+                            .help((rerun.running ? "Running again" : "Queued to run again")
+                                  + ". Open the later run of this job, which will replace this failure.")
                         }
                     }
                     .font(.caption)
@@ -862,15 +883,21 @@ private struct FailingCard: View, Equatable {
     }
 }
 
-/// What cibar did about a job that failed: when it sent the job to Codex,
-/// in words the system keeps up to date without the dashboard being drawn
-/// again, opening the session in the Codex app; or why it did not.
+/// What cibar did about a job that failed: that it is sending it to Codex;
+/// when it sent it, in words the system keeps up to date without the
+/// dashboard being drawn again, opening the session in the Codex app; or a
+/// button that sends it, if it can be sent; or why it was not sent.
 private struct CodexLine: View {
-    var record: CodexRecord?
+    var job: DashboardState.Job
     var open: (URL) -> Void
+    var send: () -> Void
+
+    private var record: CodexRecord? { job.codex }
 
     var body: some View {
-        if let record, let url = record.url {
+        if job.sending {
+            Text("sending to Codex…").font(.caption).foregroundStyle(.secondary)
+        } else if let record, let url = record.url {
             let ago = Text(.currentDate, format: .reference(to: record.at, allowedFields: [.minute, .hour, .day, .week],
                                                             maxFieldCount: 1, thresholdField: .week))
             Button {
@@ -880,6 +907,12 @@ private struct CodexLine: View {
             }
             .buttonStyle(.plain)
             .help("Open the session in Codex")
+        } else if job.sendable {
+            Button(action: send) {
+                Text("send to Codex").font(.caption).foregroundStyle(.link)
+            }
+            .buttonStyle(.plain)
+            .help("Start a Codex session to fix this job, which was not sent: \(reason).")
         } else {
             Text("(not sent to Codex; \(reason))").font(.caption).foregroundStyle(.secondary)
         }

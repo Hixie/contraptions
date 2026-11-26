@@ -37,36 +37,54 @@ enum Response: Equatable {
 
 /// What a delivery calls for, on repositories' default branches alone,
 /// since a pull request's runs are its author's to look after: for each
-/// failure, a session, given `codex` and unless `paused`, whose report names
-/// the sessions already started for the branch's other failures, or a
-/// reason for none; and a plane for each workflow that turned in a run that
-/// a push started, with its banner's text.
+/// failure, its response; and a plane for each workflow that turned in a run
+/// that a push started, with its banner's text.
 func responses(to changes: Changes, codex: CodexSettings?, paused: Bool = false, records: [CodexRecord] = [])
     -> (sessions: [(job: JobKey, response: Response)], planes: [(text: String, red: Bool)]) {
     let sessions = changes.failures.filter(\.context.onDefaultBranch).map { failure in
-        let context = failure.context
-        let response: Response
-        if context.fromFork {
-            response = .skip("from a fork")
-        } else if !trustedEvents.contains(context.event) {
-            // Strangers start runs of these, and could word the request.
-            response = .skip("started by \(context.event)")
-        } else if let codex, !paused {
-            let prompt = expand(codex.prompt, for: failure, records: records)
-            response = prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? .skip("request is empty")
-                : .start(SessionRequest(target: "\(context.workflowBranch.title): \(describe(job: failure.job))",
-                                        prompt: prompt, folder: codex.folder))
-        } else {
-            response = .skip(codex == nil ? "Codex not set up" : "Codex paused")
-        }
-        return (JobKey(workflowBranch: context.workflowBranch, job: failure.job), response)
+        (JobKey(workflowBranch: failure.context.workflowBranch, job: failure.job),
+         response(to: failure, codex: codex, paused: paused, records: records))
     }
     let planes = changes.turns.filter { $0.onDefaultBranch && $0.event == "push" }.map { turn in
         ("\(turn.workflowBranch.repositoryName) \(turn.workflowBranch.workflow)"
             + (turn.red ? " is red" : " is green"), turn.red)
     }
     return (sessions, planes)
+}
+
+/// What a failure calls for: a session, given `codex` and unless `paused`,
+/// whose report names the sessions already started for the branch's other
+/// failures, of the `records`; or a reason for none.
+func response(to failure: Failure, codex: CodexSettings?, paused: Bool = false, records: [CodexRecord] = [])
+    -> Response {
+    let context = failure.context
+    if context.fromFork {
+        return .skip("from a fork")
+    }
+    if !trustedEvents.contains(context.event) {
+        // Strangers start runs of these, and could word the request.
+        return .skip("started by \(context.event)")
+    }
+    guard let codex, !paused else {
+        return .skip(codex == nil ? "Codex not set up" : "Codex paused")
+    }
+    let prompt = expand(codex.prompt, for: failure, records: records)
+    return prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ? .skip("request is empty")
+        : .start(SessionRequest(target: "\(context.workflowBranch.title): \(describe(job: failure.job))",
+                                prompt: prompt, folder: codex.folder))
+}
+
+/// The session that sending `job` to Codex by hand starts, whether or not
+/// sessions are paused, if the job last failed on a default branch, cibar
+/// knows how, no session has been started for it, of the `records`, and the
+/// failure would call for one were sessions not paused.
+func handSentRequest(for job: JobKey, in watch: Watch, codex: CodexSettings?, records: [CodexRecord])
+    -> SessionRequest? {
+    guard records.last(where: { $0.job == job })?.url == nil,
+          let failure = watch.failure(of: job.job, on: job.workflowBranch), failure.context.onDefaultBranch,
+          case .start(let request) = response(to: failure, codex: codex, records: records) else { return nil }
+    return request
 }
 
 /// The name a request gives a job; a run that failed as a whole is not one.

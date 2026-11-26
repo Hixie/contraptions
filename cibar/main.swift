@@ -86,6 +86,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var savedRevision: Int
     private var writer: StateWriter!
     private var records: [CodexRecord] = []
+    /// The jobs whose Codex sessions are being started.
+    private var sending: Set<JobKey> = []
     private var settingsWindow: SettingsWindow!
     /// What the indicator shows, so that it is redrawn only when that changes.
     private var shown: Indicator?
@@ -150,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         dashboard = DashboardModel(state: dashboardState(), actions: DashboardActions(
             setSessions: { [weak self] in self?.setStartsSessions($0) },
+            send: { [weak self] in self?.send($0) },
             showSettings: { [weak self] in
                 self?.closeDashboard()
                 self?.settingsWindow.show()
@@ -336,6 +339,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         changed()
     }
 
+    /// Starts a Codex session for a failing job that someone sent by hand,
+    /// unless one is already starting for it.
+    private func send(_ job: JobKey) {
+        guard !sending.contains(job),
+              let request = handSentRequest(for: job, in: watch, codex: configuration?.codex, records: records) else {
+            return
+        }
+        log("sending \(request.target) to Codex by hand")
+        startSession(request, for: job)
+    }
+
     /// Starts a Codex session for `job`, off the main thread, as that takes
     /// a few seconds, and remembers when, and which thread it is.
     private func startSession(_ request: SessionRequest, for job: JobKey) {
@@ -344,6 +358,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             remember(.notSent(reason: "Codex not installed"), for: job)
             return
         }
+        sending.insert(job)
+        changed()
         Thread { [weak self] in
             let started = Result {
                 try startCodexSession(tool: tool, request) { url in
@@ -355,6 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func sessionStarted(_ request: SessionRequest, for job: JobKey, _ started: Result<String, Error>) {
+        sending.remove(job)
         switch started {
         case .success(let thread):
             log("started the Codex session \(thread) for \(request.target)")
@@ -454,8 +471,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             lateness: lateness,
             deliveryProblem: deliveryProblem, refreshing: refreshing, refreshProgress: refreshProgress,
             refreshProblem: awaitingToken ? "Waiting for the login shell to give a GitHub token" : refreshProblem,
-            sessions: configuration?.codex == nil ? nil : startsSessions, records: records,
-            includesPullRequests: includesPullRequests, showsRunners: showsRunners,
+            sessions: configuration?.codex == nil ? nil : startsSessions, codex: configuration?.codex,
+            records: records, sending: sending, includesPullRequests: includesPullRequests, showsRunners: showsRunners,
             runners: runners.filter { watch.owners.isEmpty || watch.owners.contains($0.key) }
                 .sorted { $0.key < $1.key }.flatMap(\.value),
             larger: largerRunners.filter { watch.owners.isEmpty || watch.owners.contains($0.key) }
@@ -501,6 +518,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Quiet repositories are read when they are red, so that what made
         // them so can be found to be gone.
         let red = Set(watch.redWorkflowBranches.map(\.repository))
+        // So that each failure can be sent to Codex by hand.
+        let missing = watch.unknownFailingRuns
         let lookup = token()
         Task { @MainActor [weak self] in
             // The token is found before deliveries are set aside, so that
@@ -517,7 +536,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             deliveriesWhileRefreshing = recentDeliveries.filter { $0.arrived >= since }.map(\.delivery)
             changed()
             let result = await Result {
-                try await GitHubAPI(token: token).prime(owners: Array(owners), alsoReading: red, now: Date()) {
+                try await GitHubAPI(token: token).prime(owners: Array(owners), alsoReading: red, missing: missing,
+                                                        now: Date()) {
                     [weak self] done, total in
                     Task { @MainActor in self?.advanceRefresh(RefreshProgress(done: done, total: total)) }
                 }

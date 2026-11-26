@@ -35,6 +35,8 @@ struct PrimedState {
     }
 
     var primed: [Primed] = []
+    /// What the runs read because jobs that failed in them still fail said.
+    var runs: [WatchState.RunRecord] = []
     var coverage: [String: Coverage] = [:]
     var problems: [String] = []
 
@@ -77,6 +79,7 @@ extension Watch {
             _ = watch.take(item.payload, about: item.repository, at: item.time)
         }
         watch.keep(previous, where: read.keeps, activeIn: { read.coverage[$0] == nil })
+        read.runs.forEach(watch.learn)
         var failures: [Failure] = []
         for delivery in deliveries {
             let changes = (try? watch.handle(event: delivery.event, body: delivery.body,
@@ -206,10 +209,12 @@ struct GitHubAPI {
     /// time: the latest runs of their workflows, on their default branches
     /// and on the branches of their open pull requests, and on any branch
     /// while under way, and the jobs of those under way and of the latest to
-    /// fail of each workflow on each branch. Stops when GitHub will answer no
-    /// more. Tells `progress` how many of how many repositories it has read,
-    /// once it knows how many there are, and as each is read.
-    func prime(owners: [String], alsoReading: Set<String> = [], now: Date,
+    /// fail of each workflow on each branch; and, with their jobs, the runs
+    /// `missing` names of each repository that those do not include. Stops
+    /// when GitHub will answer no more. Tells `progress` how many of how
+    /// many repositories it has read, once it knows how many there are, and
+    /// as each is read.
+    func prime(owners: [String], alsoReading: Set<String> = [], missing: [String: Set<Int64>] = [:], now: Date,
                progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in }) async throws -> PrimedState {
         var read = PrimedState()
         var repositories: [Watch.Repository] = []
@@ -232,7 +237,11 @@ struct GitHubAPI {
             var next = 0
             func start(_ group: inout TaskGroup<(String, Result<RepositoryRead, Error>)>) {
                 let repository = repositories[next]
-                group.addTask { (repository.fullName, await Result { try await prime(repository, now: now) }) }
+                group.addTask {
+                    (repository.fullName, await Result {
+                        try await prime(repository, missing: missing[repository.fullName] ?? [], now: now)
+                    })
+                }
                 next += 1
             }
             while next < min(4, repositories.count) {
@@ -252,6 +261,7 @@ struct GitHubAPI {
             switch result {
             case .success(let part):
                 read.primed += part.primed
+                read.runs += part.runs
                 read.problems += part.problems
                 read.coverage[name] = part.coverage
             case .failure(let error as RateLimited):
@@ -265,11 +275,12 @@ struct GitHubAPI {
 
     private struct RepositoryRead {
         var primed: [Primed] = []
+        var runs: [WatchState.RunRecord] = []
         var coverage = PrimedState.Coverage()
         var problems: [String] = []
     }
 
-    private func prime(_ repository: Watch.Repository, now: Date) async throws -> RepositoryRead {
+    private func prime(_ repository: Watch.Repository, missing: Set<Int64>, now: Date) async throws -> RepositoryRead {
         let name = repository.fullName
         var read = RepositoryRead()
         // Runs of workflows whose files are gone, or that are disabled, and
@@ -336,6 +347,21 @@ struct GitHubAPI {
                 case .failure(let error as RateLimited): throw error
                 case .failure(let error): read.problems.append("\(name): \(error)")
                 }
+            }
+        }
+        for id in missing.subtracting(runs.keys).sorted() {
+            do {
+                let run = try await get(Watch.Run.self, "/repos/\(name)/actions/runs/\(id)").value
+                let jobs = try await all(JobsPage.self, "/repos/\(name)/actions/runs/\(id)/jobs?per_page=100", \.jobs)
+                if let record = Watch.runRecord(of: run, jobs: jobs, in: repository, at: time(of: run, now: now)) {
+                    read.runs.append(record)
+                }
+            } catch let error as RateLimited {
+                throw error
+            } catch is NotFound {
+                // The run has been deleted, so there is nothing to read.
+            } catch {
+                read.problems.append("\(name): \(error)")
             }
         }
         return read

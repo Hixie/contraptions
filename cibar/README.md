@@ -111,18 +111,22 @@ Default Branches**: every workflow on a default branch that is red, with its
 failing jobs, the branch going without saying, each of which opens its page
 on GitHub, and beside each, what cibar did about it: how long ago it sent
 the job to Codex, which the system keeps up to date, opening the session in
-the Codex app; or, in brackets, why it did not, such as "Codex paused", or
-"cibar missed it" for a job that failed while cibar was not listening; and,
-when a later run of the job is under way, which will replace its failure,
-"running again", which opens that run's job. Then
+the Codex app; "sending to Codex…" while a session is starting for it;
+"send to Codex", which starts a session for it, when cibar did not send it,
+for example because Codex sessions were paused or it failed while cibar was
+not listening; or, in brackets, why it cannot be sent, such as "from a
+fork". When a later run of the job is under way, which will replace its
+failure, the job's symbol from the Running column follows, a play sign if
+the job is running and a clock if it is queued, which opens that run's job.
+Then
 **Default Branches**: each repository whose default branch is red, or that
 a workflow finished on in the last day, the busiest first:
 the one most workflows have finished on, each counting half as much for
 every five days since it finished, which changes little from one finish to
-the next, each opening the branch's runs on GitHub. Under them, **Send
-default-branch failures to Codex**, which says whether each job that fails
-on a default branch starts a Codex session, and turns that on or off; cibar
-remembers it from one run to the next.
+the next, each opening the branch's runs on GitHub. Under them,
+**Automatically send main failures to Codex**, which says whether each job
+that fails on a default branch starts a Codex session as it fails, and turns
+that on or off; cibar remembers it from one run to the next.
 
 On the right, **Running**: every run with jobs queued or running, the newest
 first, each named by its repository, its branch's open pull request if it
@@ -398,9 +402,13 @@ often. Of those, it keeps the runs of active workflows, on the default
 branch or the branch of an open pull request, or on any branch while they
 are under way. Then it reads the jobs of each run that is under way, and of
 the latest run of each workflow on each branch to pass or fail, when it
-failed. It reads four repositories at a time, starting another as each is
+failed. Last, it reads each run that a job still failing on a default
+branch failed in, with its jobs, when cibar knows nothing of the run and the
+runs it read do not include it, so that the failure can be sent to Codex by
+hand. It reads four repositories at a time, starting another as each is
 done, and six runs' jobs at a time. That is four or five requests for each
-repository, and one for each such run. It keeps GitHub's answers in
+repository, one for each run whose jobs it reads, and two for each run it
+reads on its own. It keeps GitHub's answers in
 `~/Library/Caches/cibar/github`, so that asking again is a conditional
 request, which GitHub does not count against the token when the answer has
 not changed.
@@ -463,6 +471,11 @@ limit on how many run at once; the sessions are left to notice each other
 and not do the same work twice. A failure that does not count, because a
 later run has already passed the job, or because GitHub delivered it again,
 starts none.
+
+A failing job that did not start a session can be sent to Codex by hand
+from the dashboard, whether or not sessions are paused, which starts one as
+the failure would have, with the same request. For that, cibar saves, with
+each job that last failed on a default branch, what its run said.
 
 Only runs started by a push, a pull request, a merge queue, a schedule, a
 person starting the workflow by hand, another workflow, or a repository
@@ -545,7 +558,8 @@ second. Nothing tells cibar when the relay is back, so it has to try. Once
 it is connected again, it reads what it missed from GitHub's API, as
 described above.
 
-What cibar knows about how jobs last finished is kept, and saved to
+What cibar knows about how jobs last finished, and what the runs that jobs
+last failed in said, is kept, and saved to
 `~/Library/Application Support/cibar/state.json`, so it survives cibar
 quitting. A file there that cannot be read is moved aside, with
 `.unreadable` added to its name, and cibar starts afresh; an entry in it
